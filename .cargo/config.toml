@@ -1,0 +1,8 @@
+[registries.forgejo]
+index = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot/cargo/"
+
+[net]
+git-fetch-with-cli = true
+
+[registry]
+global-credential-providers = ["cargo:token"]

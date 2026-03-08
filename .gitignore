@@ -1,0 +1,21 @@
+# Build
+target/
+
+# Environment and config (if ever used)
+.env
+.env.*
+config*.json
+*.db
+*.sqlite
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+# Ignore all markdown files
+*.md
+
+# But keep any README.md
+!README.md

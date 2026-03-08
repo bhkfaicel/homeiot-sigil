@@ -1,0 +1,52 @@
+# On push of tag v*: run tests, then create a Forgejo release for that tag.
+# Requires: RUNNER_TOKEN secret (PAT with read repo + write for releases).
+#
+# Adapt API_URL and owner/repo if your Forgejo instance or repo path differ.
+
+name: Create Forgejo release on tag
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release_on_tag:
+    runs-on: docker
+    env:
+      CARGO_REGISTRIES_FORGEJO_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.RUNNER_TOKEN }}
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run tests
+        run: bash scripts/test.sh
+
+      - name: Create Forgejo release
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+        run: |
+          VERSION=$(sed -n 's/^version\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          TAG_NAME="${GITHUB_REF_NAME:-v${VERSION}}"
+          CRATE_NAME=$(sed -n 's/^name\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "Creating Forgejo release $TAG_NAME for crate $CRATE_NAME $VERSION"
+          API_URL="https://code.bhk-itsolutions.com/api/v1/repos/homeiot/sigil/releases"
+          curl -X POST "$API_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: token $REPO_ACCESS_TOKEN" \
+            -d "{
+              \"tag_name\": \"$TAG_NAME\",
+              \"name\": \"Release $TAG_NAME\",
+              \"body\": \"Automated release for crate $CRATE_NAME $VERSION.\",
+              \"draft\": false,
+              \"prerelease\": false
+            }"
