@@ -131,7 +131,7 @@ impl Validate {
                     delay.delay_ms(5000u32);
                     continue;
                 };
-            let mut recv_vec = match Vec::<u8, { crate::com::init::INIT_MESSAGE_MAX }>::from_slice(&recv_buffer[..receive_result.size])
+            let recv_vec = match Vec::<u8, { crate::com::init::INIT_MESSAGE_MAX }>::from_slice(&recv_buffer[..receive_result.size])
             {
                 Ok(v) => v,
                 Err(_) => continue,

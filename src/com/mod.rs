@@ -84,7 +84,7 @@ impl Sigil {
         }
 
         // Encrypted path: decode `EncryptedSchema` then decrypt body with the selected key.
-        let mut recv_vec = match Vec::<u8, RECV_BUFFER_SIZE>::from_slice(received) {
+        let recv_vec = match Vec::<u8, RECV_BUFFER_SIZE>::from_slice(received) {
             Ok(v) => v,
             Err(_) => {
                 return Err(ComError::BufferTooSmall {
