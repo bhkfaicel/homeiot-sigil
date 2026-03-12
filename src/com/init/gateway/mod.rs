@@ -136,7 +136,7 @@ impl Validate {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let mut msg = match deserialize::<{ crate::com::init::INIT_MESSAGE_MAX }>(&mut recv_vec) {
+            let mut msg = match deserialize::<{ crate::com::init::INIT_MESSAGE_MAX }>(&recv_vec) {
                 Ok(m) => m,
                 Err(_) => continue,
             };

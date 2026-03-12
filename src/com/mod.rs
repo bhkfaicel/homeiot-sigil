@@ -93,7 +93,7 @@ impl Sigil {
                 });
             }
         };
-        let mut msg = match deserialize::<RECV_BUFFER_SIZE>(&mut recv_vec) {
+        let mut msg = match deserialize::<RECV_BUFFER_SIZE>(&recv_vec) {
             Ok(m) => m,
             Err(_) => return Err(ComError::WrongDistination),
         };
