@@ -69,6 +69,7 @@ impl Install {
     /// - Waits for a response addressed to the device,
     /// - Verifies the message type,
     /// - Decrypts and parses the response body.
+    #[allow(clippy::too_many_arguments)]
     pub fn request<SPI, CS, RST, SpiErr>(
         lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
         mut delay: &mut impl DelayNs,
@@ -127,6 +128,7 @@ impl Install {
     ///
     /// This is an internal helper used by the gateway-side init logic and is not part of the
     /// public API surface of the `sigil` crate.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn response<SPI, CS, RST, SpiErr>(
         &self,
         lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
@@ -181,6 +183,7 @@ impl Install {
 /// Verifies the gateway's public key and signature via `verify_gateway`; if valid,
 /// sends ValidateResponse (encrypted with the new key from Validate) and returns `Ok(())`.
 /// If verification fails, returns `Err(ComError::VerificationFailed)`.
+#[allow(clippy::too_many_arguments)]
 pub fn respond_to_validate<SPI, CS, RST, SpiErr, F>(
     validate: &Validate,
     verify_gateway: F,

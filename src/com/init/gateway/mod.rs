@@ -83,6 +83,7 @@ impl Validate {
         &self.gateway_mac
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn request<SPI, CS, RST, SpiErr>(
         &self,
         lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
@@ -219,6 +220,7 @@ impl Validate {
 /// sends Validate (key, expire_at, gateway_public_key, gateway_signature) to the sensor
 /// and returns the sensor's ValidateResponse. If verification fails, returns
 /// `Err(ComError::VerificationFailed)`.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_sensor_and_send_validate<SPI, CS, RST, SpiErr, F>(
     install: &Install,
     verify_sensor: F,

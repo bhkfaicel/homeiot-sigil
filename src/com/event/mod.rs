@@ -41,6 +41,7 @@ use lora;
 /// - `ComError::Timeout`: TX did not complete.
 /// - `ComError::CrcMismatch`: LoRa reported CRC failure.
 /// - Other variants depending on your `ComError` implementation.
+#[allow(clippy::too_many_arguments)]
 pub fn send<SPI, CS, RST, SpiErr>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     mut delay: &mut impl DelayNs,
@@ -112,6 +113,7 @@ where
 /// - `ComError::Timeout`: TX did not complete.
 /// - `ComError::CrcMismatch`: LoRa reported CRC failure.
 /// - Other variants depending on your `ComError` implementation.
+#[allow(clippy::too_many_arguments)]
 pub fn response<SPI, CS, RST, SpiErr>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     mut delay: &mut impl DelayNs,

@@ -15,7 +15,6 @@ use chacha20poly1305::{
 /// # Returns
 /// - `Ok(())` if encryption succeeds.
 /// - `Err(&str)` if encryption fails or buffer capacity is insufficient.
-
 pub fn encrypt<const N: usize>(
     buffer: &mut Vec<u8, N>,
     key: &[u8; 32],
