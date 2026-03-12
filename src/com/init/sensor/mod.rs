@@ -50,7 +50,6 @@ impl Install {
     }
     /// Maximum encoded message size allowed over LoRa.
     // const MAX_MSG_SIZE: usize = 200;
-
     /// Sends an `InitSensorRequest` message over LoRa and waits for the corresponding `InitResponse`.
     ///
     /// # Arguments

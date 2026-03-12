@@ -2,6 +2,7 @@ use crate::models::common::{
     Ack, Destination::OneDestination, HeaderSchema, MessageSchema, MessageType, RSSI_NOT_AVAILABLE,
     ResponseType, SNR_NOT_AVAILABLE, Status,
 };
+#[allow(deprecated)]
 use crate::{
     com::error::model::ComError,
     com::init::DEFAULT_KEY,
