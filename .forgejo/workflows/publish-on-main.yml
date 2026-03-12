@@ -26,7 +26,7 @@ jobs:
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable
+            | sh -s -- -y --default-toolchain 1.94.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Show Rust and Cargo versions
@@ -37,6 +37,15 @@ jobs:
       - name: Run tests
         run: bash scripts/test.sh
 
+      - name: Lint (clippy)
+        run: cargo clippy -- -D warnings
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete
+
+      - name: Unused dependencies (cargo machete)
+        run: cargo machete
+      
       - name: Create and push tag from Cargo.toml version
         env:
           REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}

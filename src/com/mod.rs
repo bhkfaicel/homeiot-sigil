@@ -2,6 +2,7 @@ use crate::models::common::{
     Ack, Destination::OneDestination, HeaderSchema, MessageSchema, MessageType, RSSI_NOT_AVAILABLE,
     ResponseType, SNR_NOT_AVAILABLE, Status,
 };
+#[allow(deprecated)]
 use crate::{
     com::error::model::ComError,
     com::init::DEFAULT_KEY,
@@ -22,12 +23,12 @@ impl Sigil {
     /// - `lora`: The LoRa controller used for communication.
     /// - `delay`: Delay implementation for timing.
     /// - `validate_header`: A function that validates if the message header should be accepted.
-    ///                     Returns `true` if the message should be processed, `false` otherwise.
-    ///                     This allows flexible validation (e.g., check destination, message type, source, etc.).
+    ///   Returns `true` if the message should be processed, `false` otherwise.
+    ///   This allows flexible validation (e.g., check destination, message type, source, etc.).
     /// - `get_key`: A function that returns the appropriate decryption key based on the message type and source.
-    ///              Returns `Some(key)` if a key is available, `None` otherwise.
-    ///              This allows flexible key selection (e.g., installation key for init messages,
-    ///              session key for regular messages, different keys per source, etc.).
+    ///   Returns `Some(key)` if a key is available, `None` otherwise.
+    ///   This allows flexible key selection (e.g., installation key for init messages,
+    ///   session key for regular messages, different keys per source, etc.).
     ///
     /// # Returns
     /// - `Ok(MessageSchema)` if a valid message was received and decrypted.
@@ -84,7 +85,7 @@ impl Sigil {
         }
 
         // Encrypted path: decode `EncryptedSchema` then decrypt body with the selected key.
-        let mut recv_vec = match Vec::<u8, RECV_BUFFER_SIZE>::from_slice(received) {
+        let recv_vec = match Vec::<u8, RECV_BUFFER_SIZE>::from_slice(received) {
             Ok(v) => v,
             Err(_) => {
                 return Err(ComError::BufferTooSmall {
@@ -93,7 +94,7 @@ impl Sigil {
                 });
             }
         };
-        let mut msg = match deserialize::<RECV_BUFFER_SIZE>(&mut recv_vec) {
+        let mut msg = match deserialize::<RECV_BUFFER_SIZE>(&recv_vec) {
             Ok(m) => m,
             Err(_) => return Err(ComError::WrongDistination),
         };
@@ -160,6 +161,7 @@ impl Sigil {
                 // Send the Ack message via LoRa to inform the sender
                 let mode = lora.get_mode();
                 let nonce = [0u8; 12]; // Use zero nonce for unauthenticated response
+                #[allow(deprecated)]
                 let buffer = ack_message
                     .serialize::<256>(&DEFAULT_KEY, &nonce, None)
                     .map_err(ComError::Custom)?;
