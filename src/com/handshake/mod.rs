@@ -46,3 +46,6 @@ pub(crate) fn derive_session_key(
         .expect("valid length");
     session_key
 }
+
+#[cfg(test)]
+mod tests;
