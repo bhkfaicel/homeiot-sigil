@@ -1,6 +1,6 @@
 use crate::com::event::message::Event;
-use crate::com::init::gateway::{Validate, ValidateResponse};
-use crate::com::init::sensor::Install;
+use crate::com::handshake::gateway::HandshakeChallenge;
+use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
 use crate::crypto::{decrypt, encrypt};
 use crate::models::common::Destination::OneDestination;
 use bincode::{Decode, Encode};
@@ -92,15 +92,15 @@ pub struct HeaderSchema {
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
 pub enum MessageType {
-    InstallSensorRequest,
-    ValidateRequest,
-    ValidateResponse,
-    InstallResponse,
     Event,
     EventResponse,
-    Data,
     Ack,
-    Error,
+    /// Secure handshake Step 1: sensor broadcasts nonce + public key.
+    HandshakeRequest,
+    /// Secure handshake Step 2: gateway sends ECIES-encrypted challenge.
+    HandshakeChallenge,
+    /// Secure handshake Step 3: sensor confirms by signing the gateway nonce.
+    HandshakeConfirm,
 }
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
@@ -111,16 +111,13 @@ pub enum Destination {
     OneDestination([u8; 17]),
 }
 
-#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
-pub enum ProductType {
-    ContactSensor,
-}
-
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum RequestType {
-    Install(Install),
-    Validate(Validate),
     Event(Event),
+    /// Secure handshake Step 1: sensor broadcasts nonce + public key.
+    HandshakeRequest(HandshakeRequest),
+    /// Secure handshake Step 3: sensor confirms by signing the gateway nonce.
+    HandshakeConfirm(HandshakeConfirm),
 }
 
 /// Acknowledgment structure for confirming receipt and processing of messages.
@@ -140,9 +137,9 @@ pub struct Ack {
 
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum ResponseType {
-    SensorValidate(ValidateResponse),
-    Validate(Validate),
     Event(Ack),
+    /// Secure handshake Step 2: gateway sends ECIES-encrypted challenge.
+    HandshakeChallenge(HandshakeChallenge),
 }
 
 #[derive(Encode, Decode, Debug, Clone)]

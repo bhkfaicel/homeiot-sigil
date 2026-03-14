@@ -4,7 +4,7 @@ mod tests {
 
     use crate::com::event::message::Event;
     use crate::com::event::{response, send};
-    use crate::com::init::sensor::tests::helpers::create_controller;
+    use crate::com::handshake::sensor::tests::helpers::create_controller;
     use crate::com::keys::KeyManager;
     use crate::models::common::Destination::OneDestination;
     use crate::models::common::TIMESTAMP_NOT_AVAILABLE;
