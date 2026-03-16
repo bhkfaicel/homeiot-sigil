@@ -150,6 +150,7 @@ impl KeyManager {
 /// 5. Automatic renewal (when 1/4 of time remains):
 ///    - Renewal threshold: `elapsed_seconds >= duration_seconds * 3/4`
 ///    - Triggers proactive renewal to avoid service interruption
+///
 /// Session key with expiry metadata, as returned by the handshake.
 ///
 /// `expire_at` is the Unix timestamp when the key expires (0 = never expires).

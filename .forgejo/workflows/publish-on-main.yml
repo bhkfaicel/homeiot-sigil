@@ -1,4 +1,5 @@
-# On push to main: run tests, create tag from Cargo.toml version, publish to Forgejo registry.
+# On push to main: create tag from Cargo.toml version, publish to Forgejo registry.
+# Lint and tests are run on pull_request (enforce-branch-flow workflow).
 # Requires: RUNNER_TOKEN secret (PAT with read repo + write:package, and push for tags).
 # Configure .cargo/config.toml or Cargo.toml [package] publish = ["forgejo"] and registry config.
 #
@@ -29,23 +30,6 @@ jobs:
             | sh -s -- -y --default-toolchain 1.94.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Show Rust and Cargo versions
-        run: |
-          rustc --version
-          cargo --version
-
-      - name: Run tests
-        run: bash scripts/test.sh
-
-      - name: Lint (clippy)
-        run: cargo clippy -- -D warnings
-
-      - name: Install cargo-machete
-        run: cargo install cargo-machete
-
-      - name: Unused dependencies (cargo machete)
-        run: cargo machete
-      
       - name: Create and push tag from Cargo.toml version
         env:
           REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
