@@ -19,3 +19,4 @@ config*.json
 
 # But keep any README.md
 !README.md
+!CHANGELOG.md

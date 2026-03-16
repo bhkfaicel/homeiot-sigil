@@ -4,7 +4,6 @@ use crate::models::common::{
 };
 use crate::{
     com::error::model::ComError,
-    com::init::DEFAULT_KEY,
     models::common::{deserialize, deserialize_body, deserialize_clear},
 };
 use embedded_hal::{delay::DelayNs, digital::OutputPin, spi::SpiBus};
@@ -12,7 +11,7 @@ use heapless::Vec;
 
 pub mod error;
 pub mod event;
-pub mod init;
+pub mod handshake;
 pub mod keys;
 pub struct Sigil {}
 impl Sigil {
@@ -22,12 +21,12 @@ impl Sigil {
     /// - `lora`: The LoRa controller used for communication.
     /// - `delay`: Delay implementation for timing.
     /// - `validate_header`: A function that validates if the message header should be accepted.
-    ///                     Returns `true` if the message should be processed, `false` otherwise.
-    ///                     This allows flexible validation (e.g., check destination, message type, source, etc.).
+    ///   Returns `true` if the message should be processed, `false` otherwise.
+    ///   This allows flexible validation (e.g., check destination, message type, source, etc.).
     /// - `get_key`: A function that returns the appropriate decryption key based on the message type and source.
-    ///              Returns `Some(key)` if a key is available, `None` otherwise.
-    ///              This allows flexible key selection (e.g., installation key for init messages,
-    ///              session key for regular messages, different keys per source, etc.).
+    ///   Returns `Some(key)` if a key is available, `None` otherwise.
+    ///   This allows flexible key selection (e.g., installation key for init messages,
+    ///   session key for regular messages, different keys per source, etc.).
     ///
     /// # Returns
     /// - `Ok(MessageSchema)` if a valid message was received and decrypted.
@@ -67,9 +66,11 @@ impl Sigil {
             clear_msg.header.rssi = receive_result.rssi;
             clear_msg.header.snr = receive_result.snr;
 
-            // Only treat clear-text messages as valid for init types
+            // Only treat clear-text messages as valid for handshake types
             match clear_msg.header.message_type {
-                MessageType::InstallSensorRequest | MessageType::ValidateRequest => {
+                MessageType::HandshakeRequest
+                | MessageType::HandshakeChallenge
+                | MessageType::HandshakeConfirm => {
                     // Validate header using the provided validation function
                     if !validate_header(&clear_msg.header) {
                         return Err(ComError::DeserializeFailed);
@@ -84,7 +85,7 @@ impl Sigil {
         }
 
         // Encrypted path: decode `EncryptedSchema` then decrypt body with the selected key.
-        let mut recv_vec = match Vec::<u8, RECV_BUFFER_SIZE>::from_slice(received) {
+        let recv_vec = match Vec::<u8, RECV_BUFFER_SIZE>::from_slice(received) {
             Ok(v) => v,
             Err(_) => {
                 return Err(ComError::BufferTooSmall {
@@ -93,7 +94,7 @@ impl Sigil {
                 });
             }
         };
-        let mut msg = match deserialize::<RECV_BUFFER_SIZE>(&mut recv_vec) {
+        let mut msg = match deserialize::<RECV_BUFFER_SIZE>(&recv_vec) {
             Ok(m) => m,
             Err(_) => return Err(ComError::WrongDistination),
         };
@@ -159,9 +160,11 @@ impl Sigil {
 
                 // Send the Ack message via LoRa to inform the sender
                 let mode = lora.get_mode();
-                let nonce = [0u8; 12]; // Use zero nonce for unauthenticated response
+                // Fallback key used only for unauthenticated ACK responses (not a session key)
+                const FALLBACK_ACK_KEY: [u8; 32] = [0x26; 32];
+                let nonce = [0u8; 12];
                 let buffer = ack_message
-                    .serialize::<256>(&DEFAULT_KEY, &nonce, None)
+                    .serialize::<256>(&FALLBACK_ACK_KEY, &nonce, None)
                     .map_err(ComError::Custom)?;
 
                 lora.set_mode(lora::sx1278::Mode::Manual, delay);

@@ -1,10 +1,19 @@
 use crate::{
-    com::init::{sensor::Install, test_helpers::dummy_pubkey, test_helpers::dummy_sig, INIT_MESSAGE_MAX},
+    com::handshake::{PUBLIC_KEY_LEN, SIGNATURE_LEN, HANDSHAKE_MESSAGE_MAX},
     models::common::{
-        BodySchema, Destination::AllGateways, MessageSchema, MessageType, ProductType,
+        BodySchema, Destination::AllGateways, MessageSchema, MessageType,
         RequestType, Status, TIMESTAMP_NOT_AVAILABLE, ENCRYPTED_BODY_MAX, deserialize_body,
     },
+    com::handshake::sensor::HandshakeRequest,
 };
+
+fn dummy_pubkey() -> [u8; PUBLIC_KEY_LEN] {
+    [0u8; PUBLIC_KEY_LEN]
+}
+
+fn dummy_sig() -> [u8; SIGNATURE_LEN] {
+    [0u8; SIGNATURE_LEN]
+}
 
 #[test]
 fn test_message_serialize_deserialize() {
@@ -16,8 +25,12 @@ fn test_message_serialize_deserialize() {
         src,
         100,
         AllGateways,
-        MessageType::InstallSensorRequest,
-        RequestType::Install(Install::new(src, ProductType::ContactSensor, dummy_pubkey(), dummy_sig())),
+        MessageType::HandshakeRequest,
+        RequestType::HandshakeRequest(HandshakeRequest::new(
+            [0xAA; 32],
+            dummy_pubkey(),
+            dummy_sig(),
+        )),
         TIMESTAMP_NOT_AVAILABLE,
     );
 
@@ -25,11 +38,12 @@ fn test_message_serialize_deserialize() {
 
     // Serialize
     let buffer = msg
-        .serialize::<{ INIT_MESSAGE_MAX }>(&key, &nonce, None)
+        .serialize::<{ HANDSHAKE_MESSAGE_MAX }>(&key, &nonce, None)
         .expect("Serialization failed");
 
     // Deserialize
-    let parsed_msg = super::deserialize::<{ INIT_MESSAGE_MAX }>(&buffer).expect("Deserialization failed");
+    let parsed_msg =
+        super::deserialize::<{ HANDSHAKE_MESSAGE_MAX }>(&buffer).expect("Deserialization failed");
 
     // Assert header fields
     assert_eq!(parsed_msg.header.src, original_msg.header.src);
@@ -40,14 +54,20 @@ fn test_message_serialize_deserialize() {
     );
     assert_eq!(parsed_msg.header.status, original_msg.header.status);
     assert_eq!(parsed_msg.header.timestamp, original_msg.header.timestamp);
-    let message = deserialize_body::<{ ENCRYPTED_BODY_MAX }>(parsed_msg.header, &parsed_msg.body, &key, None).unwrap();
+    let message = deserialize_body::<{ ENCRYPTED_BODY_MAX }>(
+        parsed_msg.header,
+        &parsed_msg.body,
+        &key,
+        None,
+    )
+    .unwrap();
     // Assert body content
     match (message.body, &original_msg.body) {
         (
-            BodySchema::RequestType(RequestType::Install(a)),
-            BodySchema::RequestType(RequestType::Install(b)),
+            BodySchema::RequestType(RequestType::HandshakeRequest(a)),
+            BodySchema::RequestType(RequestType::HandshakeRequest(b)),
         ) => {
-            assert_eq!(a.get_mac(), b.get_mac())
+            assert_eq!(a.sensor_nonce(), b.sensor_nonce())
         }
         _ => {}
     }
@@ -55,7 +75,6 @@ fn test_message_serialize_deserialize() {
 
 #[test]
 fn test_status_enum_values() {
-    // Verify that Status enum values match the expected numeric values
     assert_eq!(Status::Ok as u8, 0);
     assert_eq!(Status::Cancelled as u8, 1);
     assert_eq!(Status::UnknownStatus as u8, 2);
@@ -77,30 +96,36 @@ fn test_status_serialize_deserialize() {
     let nonce: [u8; 12] = [1u8; 12];
     let src: [u8; 17] = *b"26:06:91:67:89:AB";
 
-    // Test with different status values
     let mut msg = MessageSchema::create_body_request(
         src,
         100,
         AllGateways,
-        MessageType::InstallSensorRequest,
-        RequestType::Install(Install::new(src, ProductType::ContactSensor, dummy_pubkey(), dummy_sig())),
+        MessageType::HandshakeRequest,
+        RequestType::HandshakeRequest(HandshakeRequest::new(
+            [0xAA; 32],
+            dummy_pubkey(),
+            dummy_sig(),
+        )),
         TIMESTAMP_NOT_AVAILABLE,
     );
 
-    // Set status to Cancelled
     msg.header.status = Status::Cancelled;
 
-    // Serialize
     let buffer = msg
-        .serialize::<{ INIT_MESSAGE_MAX }>(&key, &nonce, None)
+        .serialize::<{ HANDSHAKE_MESSAGE_MAX }>(&key, &nonce, None)
         .expect("Serialization failed");
 
-    // Deserialize
-    let parsed_msg = super::deserialize::<{ INIT_MESSAGE_MAX }>(&buffer).expect("Deserialization failed");
+    let parsed_msg =
+        super::deserialize::<{ HANDSHAKE_MESSAGE_MAX }>(&buffer).expect("Deserialization failed");
 
-    // Verify status is preserved
     assert_eq!(parsed_msg.header.status, Status::Cancelled);
 
-    let message = deserialize_body::<{ ENCRYPTED_BODY_MAX }>(parsed_msg.header, &parsed_msg.body, &key, None).unwrap();
+    let message = deserialize_body::<{ ENCRYPTED_BODY_MAX }>(
+        parsed_msg.header,
+        &parsed_msg.body,
+        &key,
+        None,
+    )
+    .unwrap();
     assert_eq!(message.header.status, Status::Cancelled);
 }
