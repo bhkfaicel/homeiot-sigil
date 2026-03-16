@@ -38,3 +38,32 @@ jobs:
           fi
 
           echo "Merge allowed: ${HEAD} -> ${BASE}"
+
+  lint-and-test:
+    runs-on: docker
+    env:
+      CARGO_REGISTRIES_FORGEJO_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ forgejo.event.pull_request.head.sha }}
+          token: ${{ secrets.RUNNER_TOKEN }}
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.94.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Lint (clippy)
+        run: cargo clippy -- -D warnings
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete
+
+      - name: Unused dependencies (cargo machete)
+        run: cargo machete
+
+      - name: Run tests
+        run: bash scripts/test.sh

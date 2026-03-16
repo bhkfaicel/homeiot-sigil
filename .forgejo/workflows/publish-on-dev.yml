@@ -1,4 +1,5 @@
-# On push to dev: run tests, create and push prerelease tag vX.Y.Z-rc.N.
+# On push to dev: create and push prerelease tag vX.Y.Z-rc.N.
+# Lint and tests are run on pull_request (enforce-branch-flow workflow).
 # Does not publish the crate. The tag push triggers publish-on-tag which creates a Forgejo release with prerelease: true.
 # Requires: RUNNER_TOKEN secret (PAT with read repo and push for tags).
 #
@@ -14,29 +15,12 @@ on:
 jobs:
   tag_prerelease:
     runs-on: docker
-    env:
-      CARGO_REGISTRIES_FORGEJO_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.RUNNER_TOKEN }}
           fetch-depth: 0
-
-      - name: Install Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Show Rust and Cargo versions
-        run: |
-          rustc --version
-          cargo --version
-
-      - name: Run tests
-        run: bash scripts/test.sh
 
       - name: Create and push prerelease tag
         env:
