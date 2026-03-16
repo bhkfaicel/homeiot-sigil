@@ -1,0 +1,9 @@
+# CODEOWNERS for CI and workflows
+# Protect Forgejo workflows and CI scripts. Changes to these files require review
+# from the designated owner.
+
+# Forgejo workflows for this repository
+/.forgejo/workflows/*  @homeiot/Owners
+
+# CI scripts
+/scripts/*             @homeiot/Owners
