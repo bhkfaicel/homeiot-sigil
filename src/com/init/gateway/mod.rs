@@ -83,6 +83,7 @@ impl Validate {
         &self.gateway_mac
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn request<SPI, CS, RST, SpiErr>(
         &self,
         lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
@@ -131,12 +132,12 @@ impl Validate {
                     delay.delay_ms(5000u32);
                     continue;
                 };
-            let mut recv_vec = match Vec::<u8, { crate::com::init::INIT_MESSAGE_MAX }>::from_slice(&recv_buffer[..receive_result.size])
+            let recv_vec = match Vec::<u8, { crate::com::init::INIT_MESSAGE_MAX }>::from_slice(&recv_buffer[..receive_result.size])
             {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let mut msg = match deserialize::<{ crate::com::init::INIT_MESSAGE_MAX }>(&mut recv_vec) {
+            let mut msg = match deserialize::<{ crate::com::init::INIT_MESSAGE_MAX }>(&recv_vec) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -219,6 +220,7 @@ impl Validate {
 /// sends Validate (key, expire_at, gateway_public_key, gateway_signature) to the sensor
 /// and returns the sensor's ValidateResponse. If verification fails, returns
 /// `Err(ComError::VerificationFailed)`.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_sensor_and_send_validate<SPI, CS, RST, SpiErr, F>(
     install: &Install,
     verify_sensor: F,

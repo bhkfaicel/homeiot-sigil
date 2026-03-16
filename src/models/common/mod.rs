@@ -171,15 +171,15 @@ impl MessageSchema {
         MessageSchema {
             header: HeaderSchema {
                 src,
-                dist: dist,
-                message_type: message_type,
+                dist,
+                message_type,
                 size: 0,
                 version: 0,
-                battery_level: battery_level,
+                battery_level,
                 rssi: RSSI_NOT_AVAILABLE,
                 snr: SNR_NOT_AVAILABLE,
                 status: Status::Ok,
-                timestamp: timestamp,
+                timestamp,
             },
             body: BodySchema::RequestType(body),
         }
@@ -196,14 +196,14 @@ impl MessageSchema {
             header: HeaderSchema {
                 src,
                 dist: OneDestination(dist),
-                message_type: message_type,
+                message_type,
                 size: 0,
                 version: 0,
                 battery_level: 0,
                 rssi: RSSI_NOT_AVAILABLE,
                 snr: SNR_NOT_AVAILABLE,
                 status: Status::Ok,
-                timestamp: timestamp,
+                timestamp,
             },
             body: BodySchema::ResponseType(body),
         }
@@ -231,10 +231,10 @@ impl MessageSchema {
         body[..data.len()].copy_from_slice(data);
         let result = EncryptedSchema {
             header: self.header,
-            body: body,
+            body,
         };
         let mut slice: [u8; N] = [0u8; N];
-        bincode::encode_into_slice(&result, &mut slice, bincode::config::standard())
+        bincode::encode_into_slice(result, &mut slice, bincode::config::standard())
             .map_err(|_| "Envelope serialization failed")?;
         Ok(slice)
     }
@@ -272,7 +272,7 @@ pub fn deserialize<const N: usize>(
     )
     .map_err(|_| "Bad body")?;
     Ok(EncryptedSchema {
-        header: header,
+        header,
         body,
     })
 }
@@ -300,7 +300,7 @@ pub fn deserialize_body<const N: usize>(
             .map_err(|_| "Decryption decode failed")?;
 
     Ok(MessageSchema {
-        header: header,
+        header,
         body,
     })
 }
