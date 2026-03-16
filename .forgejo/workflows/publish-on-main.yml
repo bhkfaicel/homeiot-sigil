@@ -1,6 +1,6 @@
-# On push to main: create tag from Cargo.toml version, publish to Forgejo registry.
+# On push to main: create and push tag from Cargo.toml version. Crate is published by publish-on-tag.
 # Lint and tests are run on pull_request (enforce-branch-flow workflow).
-# Requires: RUNNER_TOKEN secret (PAT with read repo + write:package, and push for tags).
+# Requires: RUNNER_TOKEN secret (PAT with read repo and push for tags).
 # Configure .cargo/config.toml or Cargo.toml [package] publish = ["forgejo"] and registry config.
 #
 # Adapt REPO_OWNER/REPO_NAME and API_URL if your Forgejo instance or repo path differ.
@@ -15,20 +15,11 @@ on:
 jobs:
   publish:
     runs-on: docker
-    env:
-      CARGO_REGISTRIES_FORGEJO_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.RUNNER_TOKEN }}
-
-      - name: Install Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.94.0
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Create and push tag from Cargo.toml version
         env:
@@ -42,6 +33,3 @@ jobs:
           git tag "$TAG_NAME" 2>/dev/null || echo "Tag $TAG_NAME already exists locally, skipping creation"
           git remote set-url origin "https://${REPO_ACCESS_TOKEN}@code.bhk-itsolutions.com/homeiot/sigil.git"
           git push origin "$TAG_NAME"
-
-      - name: Publish crate to Forgejo registry
-        run: cargo publish --registry forgejo
