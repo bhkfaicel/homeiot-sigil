@@ -1,5 +1,5 @@
-# On push of tag v*: run tests, then create a Forgejo release for that tag.
-# Requires: RUNNER_TOKEN secret (PAT with read repo + write for releases).
+# On push of tag v*: run tests, create Forgejo release, and publish crate (stable tags only).
+# Requires: RUNNER_TOKEN secret (PAT with read repo + write for releases + write:package).
 #
 # Adapt API_URL and owner/repo if your Forgejo instance or repo path differ.
 
@@ -65,3 +65,9 @@ jobs:
               \"draft\": false,
               \"prerelease\": $PRERELEASE
             }"
+          echo "PRERELEASE=$PRERELEASE" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+
+      - name: Publish crate to Forgejo registry
+        if: env.PRERELEASE != 'true'
+        run: cargo publish --registry forgejo
