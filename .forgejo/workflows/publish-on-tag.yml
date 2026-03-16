@@ -47,8 +47,13 @@ jobs:
         run: |
           VERSION=$(sed -n 's/^version\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
           TAG_NAME="${GITHUB_REF_NAME:-v${VERSION}}"
+          if [[ "$TAG_NAME" == *-rc* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
           CRATE_NAME=$(sed -n 's/^name\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          echo "Creating Forgejo release $TAG_NAME for crate $CRATE_NAME $VERSION"
+          echo "Creating Forgejo release $TAG_NAME for crate $CRATE_NAME (prerelease=$PRERELEASE)"
           API_URL="https://code.bhk-itsolutions.com/api/v1/repos/homeiot/sigil/releases"
           curl -X POST "$API_URL" \
             -H "Content-Type: application/json" \
@@ -58,5 +63,5 @@ jobs:
               \"name\": \"Release $TAG_NAME\",
               \"body\": \"Automated release for crate $CRATE_NAME $VERSION.\",
               \"draft\": false,
-              \"prerelease\": false
+              \"prerelease\": $PRERELEASE
             }"
