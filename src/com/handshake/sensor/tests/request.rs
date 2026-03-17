@@ -56,6 +56,7 @@ fn ok() {
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
+        0u32,
         timestamp,
     );
     // sign_gateway_nonce returns [0u8; SIGNATURE_LEN], so confirm contains all-zero sig
@@ -95,6 +96,9 @@ fn ok() {
     );
 
     assert!(result.is_ok());
+    let keys = result.unwrap();
+    assert_eq!(keys.expire_at, 0u32);
+    assert_eq!(keys.timestamp, timestamp);
     spi.done();
     cs.done();
     rst.done();
@@ -171,6 +175,7 @@ fn verification_failed_sig_sensor_nonce() {
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
+        0u32,
         timestamp,
     );
 

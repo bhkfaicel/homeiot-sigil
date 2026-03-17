@@ -34,6 +34,10 @@ pub struct HandshakeResult {
     pub session_key: [u8; 32],
     /// Sensor's P-256 compressed public key (for future message verification).
     pub sensor_pubkey: [u8; PUBLIC_KEY_LEN],
+    /// Unix timestamp when the session key expires (0 = never expires).
+    ///
+    /// Set by the gateway caller and transmitted to the sensor inside the ECIES ciphertext.
+    pub key_expire_at: u32,
 }
 
 /// Gateway-side handshake handler (Steps 2 + 3).
@@ -49,9 +53,13 @@ pub struct HandshakeResult {
 /// # Callbacks
 /// - `verify_sensor`: verifies `(sensor_pubkey, sig_sensor_pubkey)`. Called before any LoRa
 ///   traffic — returns `false` to silently reject unknown sensors.
-/// - `ecies_encrypt`: encrypts the 129-byte challenge plaintext using the sensor's public key.
-///   Writes the 190-byte ECIES ciphertext to `out`. Returns the ECDH shared secret.
+/// - `ecies_encrypt`: encrypts the 133-byte challenge plaintext using the sensor's public key.
+///   Writes the 194-byte ECIES ciphertext to `out`. Returns the ECDH shared secret.
 /// - `verify_sig_gateway_nonce`: verifies `(sensor_pubkey, sig_gateway_nonce)`.
+///
+/// `key_expire_at` is the Unix timestamp when the session key expires (0 = never expires).
+/// It is packed into the ECIES plaintext so the sensor can construct a [`Keys`] struct with
+/// the correct expiry without any additional round-trip.
 ///
 /// # Errors
 /// - `Err(ComError::VerificationFailed)` if any signature check fails.
@@ -66,6 +74,7 @@ pub fn handle_handshake_request<SPI, CS, RST, SpiErr, FV, FE, FVN>(
     gateway_pubkey: [u8; PUBLIC_KEY_LEN],
     sig_sensor_nonce: [u8; SIGNATURE_LEN],
     gateway_nonce: [u8; 32],
+    key_expire_at: u32,
     verify_sig_gateway_nonce: FVN,
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     delay: &mut impl DelayNs,
@@ -90,11 +99,14 @@ where
         return Err(ComError::VerificationFailed);
     }
 
-    // Build ECIES plaintext: sig_sensor_nonce[64] | gateway_pubkey[33] | gateway_nonce[32]
+    // Build ECIES plaintext: sig_sensor_nonce[64] | gateway_pubkey[33] | gateway_nonce[32] | key_expire_at[4]
     let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
     plaintext[..SIGNATURE_LEN].copy_from_slice(&sig_sensor_nonce);
     plaintext[SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN].copy_from_slice(&gateway_pubkey);
-    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..].copy_from_slice(&gateway_nonce);
+    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN + 32]
+        .copy_from_slice(&gateway_nonce);
+    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN + 32..]
+        .copy_from_slice(&key_expire_at.to_be_bytes());
 
     // Encrypt via ECIES callback; shared_secret is used later for session key derivation
     let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
@@ -149,6 +161,7 @@ where
             return Ok(HandshakeResult {
                 session_key,
                 sensor_pubkey: *request.sensor_pubkey(),
+                key_expire_at,
             });
         }
     }

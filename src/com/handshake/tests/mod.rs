@@ -69,6 +69,7 @@ fn session_keys_match() {
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
+        0u32,
         timestamp,
     );
     // sig_gateway_nonce is all-zero because sign_gateway_nonce callback returns [0; SIGNATURE_LEN]
@@ -132,6 +133,7 @@ fn session_keys_match() {
         [0u8; PUBLIC_KEY_LEN],
         [0u8; SIGNATURE_LEN],
         gateway_nonce,
+        0u32,
         |_pk, _sig| true,
         &mut gateway_ctrl,
         &mut g_delay,
@@ -140,7 +142,10 @@ fn session_keys_match() {
 
     assert!(sensor_result.is_ok());
     assert!(gateway_result.is_ok());
-    assert_eq!(sensor_result.unwrap(), gateway_result.unwrap().session_key);
+    let sensor_keys = sensor_result.unwrap();
+    let gateway_hr = gateway_result.unwrap();
+    assert_eq!(sensor_keys.key, gateway_hr.session_key);
+    assert_eq!(sensor_keys.expire_at, gateway_hr.key_expire_at);
     s_spi.done();
     s_cs.done();
     s_rst.done();
@@ -209,6 +214,7 @@ fn gateway_rejects_sensor() {
         [0u8; PUBLIC_KEY_LEN],
         [0u8; SIGNATURE_LEN],
         gateway_nonce,
+        0u32,
         |_pk, _sig| true,
         &mut gateway_ctrl,
         &mut g_delay,
@@ -250,6 +256,7 @@ fn sensor_rejects_gateway() {
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
+        0u32,
         timestamp,
     );
     let confirm_buffer = build_handshake_confirm_buffer(
@@ -311,6 +318,7 @@ fn sensor_rejects_gateway() {
         [0u8; PUBLIC_KEY_LEN],
         [0u8; SIGNATURE_LEN],
         gateway_nonce,
+        0u32,
         |_pk, _sig| true,
         &mut gateway_ctrl,
         &mut g_delay,

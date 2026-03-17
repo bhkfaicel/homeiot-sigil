@@ -26,16 +26,14 @@ jobs:
         env:
           REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
         run: |
+          set -e
           VERSION=$(sed -n 's/^version\s*=\s*"\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          RC_TAGS=$(git tag -l "v${VERSION}-rc.*" 2>/dev/null || true)
-          if [ -z "$RC_TAGS" ]; then
-            N=1
-          else
-            MAX=$(echo "$RC_TAGS" | sed 's/.*-rc\.//' | sort -n | tail -n 1)
-            N=$((MAX + 1))
+          if [[ "$VERSION" != *-rc* ]]; then
+            echo "Error: version '$VERSION' does not contain '-rc'. Set a prerelease version (e.g. 0.2.1-rc.1) before pushing to dev."
+            exit 1
           fi
-          TAG_NAME="v${VERSION}-rc.${N}"
-          echo "Creating prerelease tag $TAG_NAME (version $VERSION, rc $N)"
+          TAG_NAME="v${VERSION}"
+          echo "Creating prerelease tag $TAG_NAME (version $VERSION)"
           git config user.name "CI"
           git config user.email "ci@forgejo"
           git tag "$TAG_NAME" 2>/dev/null || echo "Tag $TAG_NAME already exists locally, skipping creation"

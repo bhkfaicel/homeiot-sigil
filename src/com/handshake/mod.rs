@@ -10,15 +10,18 @@ pub const SIGNATURE_LEN: usize = 64;
 pub const HANDSHAKE_MESSAGE_MAX: usize = 250;
 
 /// Plaintext inside the ECIES ciphertext:
-/// `sig_sensor_nonce[64] || gateway_pubkey[33] || gateway_nonce[32]` = 129 bytes.
-pub const CHALLENGE_PLAINTEXT_LEN: usize = SIGNATURE_LEN + PUBLIC_KEY_LEN + 32;
+/// `sig_sensor_nonce[64] || gateway_pubkey[33] || gateway_nonce[32] || key_expire_at[4]` = 133 bytes.
+///
+/// `key_expire_at` is a big-endian `u32` Unix timestamp indicating when the session key expires
+/// (0 = never expires). It is set by the gateway and read by the sensor.
+pub const CHALLENGE_PLAINTEXT_LEN: usize = SIGNATURE_LEN + PUBLIC_KEY_LEN + 32 + 4;
 
 /// ECIES ciphertext overhead: `ephemeral_pubkey[33] || chacha_nonce[12] || poly1305_tag[16]`
 /// = 61 bytes.
 pub const ECIES_OVERHEAD: usize = PUBLIC_KEY_LEN + 12 + 16;
 
 /// Total ECIES ciphertext size:
-/// `ephemeral_pubkey[33] || chacha_nonce[12] || ciphertext[129] || poly1305_tag[16]` = 190 bytes.
+/// `ephemeral_pubkey[33] || chacha_nonce[12] || ciphertext[133] || poly1305_tag[16]` = 194 bytes.
 ///
 /// This is the fixed size of the `HandshakeChallenge::data` field and the `out` buffer
 /// expected by the `ecies_encrypt` callback in `handle_handshake_request`.
