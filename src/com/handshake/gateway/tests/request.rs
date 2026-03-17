@@ -52,11 +52,14 @@ fn test_encrypt(
 }
 
 /// Builds the expected `HandshakeChallenge` wire buffer using the test ECIES format.
-fn build_challenge_buffer(timestamp: u32) -> [u8; HANDSHAKE_MESSAGE_MAX] {
+fn build_challenge_buffer(timestamp: u32, key_expire_at: u32) -> [u8; HANDSHAKE_MESSAGE_MAX] {
     let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
     plaintext[..SIGNATURE_LEN].copy_from_slice(&dummy_sig()); // sig_sensor_nonce
     plaintext[SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN].copy_from_slice(&dummy_pubkey()); // gateway_pubkey
-    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..].copy_from_slice(&dummy_gateway_nonce()); // gateway_nonce
+    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN + 32]
+        .copy_from_slice(&dummy_gateway_nonce()); // gateway_nonce
+    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN + 32..]
+        .copy_from_slice(&key_expire_at.to_be_bytes()); // key_expire_at
 
     let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
     ciphertext[..CHALLENGE_PLAINTEXT_LEN].copy_from_slice(&plaintext);
@@ -113,9 +116,10 @@ fn create_controller(
 #[test]
 fn ok() {
     let timestamp = 260691u32;
+    let key_expire_at = 0u32;
     let mode = Mode::Manual;
 
-    let challenge_buffer = build_challenge_buffer(timestamp);
+    let challenge_buffer = build_challenge_buffer(timestamp, key_expire_at);
     let confirm_buffer = build_confirm_buffer(timestamp);
 
     let mut expectations = expectations_for_new(mode);
@@ -141,6 +145,7 @@ fn ok() {
         dummy_pubkey(),
         dummy_sig(),
         dummy_gateway_nonce(),
+        key_expire_at,
         |_pk, _sig| true,
         &mut controller,
         &mut delay,
@@ -150,6 +155,7 @@ fn ok() {
     assert!(result.is_ok());
     let hr = result.unwrap();
     assert_eq!(hr.sensor_pubkey, dummy_pubkey());
+    assert_eq!(hr.key_expire_at, key_expire_at);
     spi.done();
     cs.done();
     rst.done();
@@ -160,7 +166,7 @@ fn timeout() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let challenge_buffer = build_challenge_buffer(timestamp);
+    let challenge_buffer = build_challenge_buffer(timestamp, 0u32);
 
     let mut expectations = expectations_for_new(mode);
     expectations.extend(expectations_for_send(&challenge_buffer, mode));
@@ -181,6 +187,7 @@ fn timeout() {
         dummy_pubkey(),
         dummy_sig(),
         dummy_gateway_nonce(),
+        0u32,
         |_pk, _sig| true,
         &mut controller,
         &mut delay,
@@ -214,6 +221,7 @@ fn verification_failed_verify_sensor() {
         dummy_pubkey(),
         dummy_sig(),
         dummy_gateway_nonce(),
+        0u32,
         |_pk, _sig| true,
         &mut controller,
         &mut delay,
@@ -231,7 +239,7 @@ fn verification_failed_sig_gateway_nonce() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let challenge_buffer = build_challenge_buffer(timestamp);
+    let challenge_buffer = build_challenge_buffer(timestamp, 0u32);
     let confirm_buffer = build_confirm_buffer(timestamp);
 
     let mut expectations = expectations_for_new(mode);
@@ -257,6 +265,7 @@ fn verification_failed_sig_gateway_nonce() {
         dummy_pubkey(),
         dummy_sig(),
         dummy_gateway_nonce(),
+        0u32,
         |_pk, _sig| false, // reject sig_gateway_nonce
         &mut controller,
         &mut delay,

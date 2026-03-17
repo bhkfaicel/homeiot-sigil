@@ -1,4 +1,5 @@
 use crate::com::error::model::ComError;
+use crate::com::keys::Keys;
 use crate::com::handshake::{
     derive_session_key, CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX,
     PUBLIC_KEY_LEN, SIGNATURE_LEN,
@@ -84,11 +85,12 @@ impl HandshakeConfirm {
 /// 5. Sends `HandshakeConfirm` (sig_gateway_nonce) back to the gateway.
 /// 6. Derives `session_key = HKDF-SHA256(ecdh_shared_secret, sensor_nonce || gateway_nonce)`.
 ///
-/// Returns the 32-byte session key on success.
+/// Returns a [`Keys`] struct containing the session key, the Unix timestamp from the gateway's
+/// challenge header, and the `key_expire_at` value transmitted inside the ECIES ciphertext.
 ///
 /// # Callbacks
-/// - `ecies_decrypt`: decrypts the 190-byte ECIES ciphertext using the sensor's private key.
-///   Writes the 129-byte plaintext to `out`. Returns the ECDH shared secret, or `Err(())` on failure.
+/// - `ecies_decrypt`: decrypts the 194-byte ECIES ciphertext using the sensor's private key.
+///   Writes the 133-byte plaintext to `out`. Returns the ECDH shared secret, or `Err(())` on failure.
 /// - `verify_sig_sensor_nonce`: verifies `(gateway_pubkey, sig_sensor_nonce)`. Returns `false`
 ///   to reject the challenge (causes `Err(ComError::VerificationFailed)`).
 /// - `sign_gateway_nonce`: signs the 32-byte gateway nonce with the sensor's private key.
@@ -110,7 +112,7 @@ pub fn initiate_handshake<SPI, CS, RST, SpiErr, FD, FV, FS>(
     verify_sig_sensor_nonce: FV,
     sign_gateway_nonce: FS,
     timestamp: u32,
-) -> Result<[u8; 32], ComError<SpiErr>>
+) -> Result<Keys, ComError<SpiErr>>
 where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
@@ -184,15 +186,23 @@ where
             Err(_) => continue,
         };
 
-        // Parse plaintext: sig_sensor_nonce[64] | gateway_pubkey[33] | gateway_nonce[32]
+        // Parse plaintext: sig_sensor_nonce[64] | gateway_pubkey[33] | gateway_nonce[32] | key_expire_at[4]
         let sig_sensor_nonce: [u8; SIGNATURE_LEN] =
             plaintext[..SIGNATURE_LEN].try_into().unwrap();
         let gateway_pubkey: [u8; PUBLIC_KEY_LEN] = plaintext
             [SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN]
             .try_into()
             .unwrap();
-        let gateway_nonce: [u8; 32] =
-            plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..].try_into().unwrap();
+        let gateway_nonce: [u8; 32] = plaintext
+            [SIGNATURE_LEN + PUBLIC_KEY_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN + 32]
+            .try_into()
+            .unwrap();
+        let key_expire_at = u32::from_be_bytes(
+            plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN + 32..]
+                .try_into()
+                .unwrap(),
+        );
+        let challenge_timestamp = clear_msg.header.timestamp;
 
         // Verify gateway signed our nonce
         if !verify_sig_sensor_nonce(&gateway_pubkey, &sig_sensor_nonce) {
@@ -220,7 +230,12 @@ where
         lora.send(&confirm_buffer, delay)?;
 
         // Derive session key from ECDH shared secret + both nonces
-        return Ok(derive_session_key(&shared_secret, &sensor_nonce, &gateway_nonce));
+        let session_key = derive_session_key(&shared_secret, &sensor_nonce, &gateway_nonce);
+        return Ok(Keys {
+            key: session_key,
+            expire_at: key_expire_at,
+            timestamp: challenge_timestamp,
+        });
     }
 
     Err(ComError::Timeout)
