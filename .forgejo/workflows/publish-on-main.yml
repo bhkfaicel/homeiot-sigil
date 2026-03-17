@@ -21,11 +21,27 @@ jobs:
         with:
           token: ${{ secrets.RUNNER_TOKEN }}
 
-      - name: Create and push tag from Cargo.toml version
+      - name: Bump rc version to stable and create tag
         env:
           REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
         run: |
+          set -e
           VERSION=$(sed -n 's/^version\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "Current version in Cargo.toml: $VERSION"
+          if [[ "$VERSION" == *-rc* ]]; then
+            STABLE_VERSION="${VERSION%%-rc*}"
+            echo "Detected rc version, bumping to stable: $STABLE_VERSION"
+            # Update version in Cargo.toml
+            sed -i 's/^version\s*=.*/version = "'"$STABLE_VERSION"'"/' Cargo.toml
+            git config user.name "CI"
+            git config user.email "ci@forgejo"
+            git add Cargo.toml
+            git commit -m "chore: bump sigil to $STABLE_VERSION (stable release)" || echo "No changes to commit"
+            git remote set-url origin "https://${REPO_ACCESS_TOKEN}@code.bhk-itsolutions.com/homeiot/sigil.git"
+            git push origin HEAD:main
+            VERSION="$STABLE_VERSION"
+          fi
+
           TAG_NAME="v${VERSION}"
           echo "Creating tag $TAG_NAME from Cargo.toml version $VERSION"
           git config user.name "CI"

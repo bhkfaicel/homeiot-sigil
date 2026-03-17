@@ -68,6 +68,10 @@ jobs:
           echo "PRERELEASE=$PRERELEASE" >> "$GITHUB_ENV"
           echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
 
-      - name: Publish crate to Forgejo registry
+      - name: Publish crate to Forgejo RC registry
+        if: env.PRERELEASE == 'true'
+        run: cargo publish --registry forgejorc
+
+      - name: Publish crate to Forgejo stable registry
         if: env.PRERELEASE != 'true'
         run: cargo publish --registry forgejo
