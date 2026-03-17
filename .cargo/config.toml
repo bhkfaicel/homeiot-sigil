@@ -1,6 +1,9 @@
 [registries.forgejo]
 index = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot/cargo/"
 
+[registries.forgejorc]
+index = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot-rc/cargo/"
+
 [net]
 git-fetch-with-cli = true
 
