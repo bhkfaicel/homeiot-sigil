@@ -1,12 +1,13 @@
 use crate::com::error::model::ComError;
-use crate::com::keys::Keys;
 use crate::com::handshake::{
-    derive_session_key, CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX,
-    PUBLIC_KEY_LEN, SIGNATURE_LEN,
+    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN,
+    SIGNATURE_LEN, derive_session_key,
 };
+use crate::com::keys::Keys;
 use crate::models::common::{
-    BodySchema, Destination::{AllGateways, OneDestination}, MessageSchema, MessageType,
-    RequestType, ResponseType, deserialize_clear,
+    BodySchema,
+    Destination::{AllGateways, OneDestination},
+    MessageSchema, MessageType, RequestType, ResponseType, deserialize_clear,
 };
 use bincode::{Decode, Encode};
 use embedded_hal::delay::DelayNs;
@@ -108,21 +109,21 @@ pub fn initiate_handshake<SPI, CS, RST, SpiErr, FD, FV, FS>(
     sensor_nonce: [u8; 32],
     sensor_pubkey: [u8; PUBLIC_KEY_LEN],
     sig_sensor_pubkey: [u8; SIGNATURE_LEN],
-    ecies_decrypt: FD,
-    verify_sig_sensor_nonce: FV,
-    sign_gateway_nonce: FS,
+    mut ecies_decrypt: FD,
+    mut verify_sig_sensor_nonce: FV,
+    mut sign_gateway_nonce: FS,
     timestamp: u32,
 ) -> Result<Keys, ComError<SpiErr>>
 where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
     RST: OutputPin,
-    FD: Fn(
+    FD: FnMut(
         &[u8; ECIES_CIPHERTEXT_LEN],
         &mut [u8; CHALLENGE_PLAINTEXT_LEN],
     ) -> Result<[u8; 32], ()>,
-    FV: Fn(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
-    FS: Fn(&[u8; 32]) -> [u8; SIGNATURE_LEN],
+    FV: FnMut(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
+    FS: FnMut(&[u8; 32]) -> [u8; SIGNATURE_LEN],
 {
     let rx_timeout = 4;
 
@@ -149,20 +150,18 @@ where
     // Step 2: wait for HandshakeChallenge
     let mut recv_buffer = [0u8; HANDSHAKE_MESSAGE_MAX];
     for _ in 0..rx_timeout {
-        let receive_result =
-            if let Ok(r) = lora.receive::<SpiErr, _>(&mut recv_buffer, delay) {
-                r
-            } else {
-                delay.delay_ms(5000u32);
-                continue;
-            };
-
-        let clear_msg = match deserialize_clear::<HANDSHAKE_MESSAGE_MAX>(
-            &recv_buffer[..receive_result.size],
-        ) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let receive_result = if let Ok(r) = lora.receive::<SpiErr, _>(&mut recv_buffer, delay) {
+            r
+        } else {
+            delay.delay_ms(5000u32);
+            continue;
         };
+
+        let clear_msg =
+            match deserialize_clear::<HANDSHAKE_MESSAGE_MAX>(&recv_buffer[..receive_result.size]) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
 
         if clear_msg.header.message_type != MessageType::HandshakeChallenge {
             continue;
@@ -171,13 +170,13 @@ where
             continue;
         }
 
-        let ciphertext =
-            if let BodySchema::ResponseType(ResponseType::HandshakeChallenge(c)) = &clear_msg.body
-            {
-                c.data
-            } else {
-                continue;
-            };
+        let ciphertext = if let BodySchema::ResponseType(ResponseType::HandshakeChallenge(c)) =
+            &clear_msg.body
+        {
+            c.data
+        } else {
+            continue;
+        };
 
         // ECIES decrypt: caller uses own private key
         let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
@@ -187,8 +186,7 @@ where
         };
 
         // Parse plaintext: sig_sensor_nonce[64] | gateway_pubkey[33] | gateway_nonce[32] | key_expire_at[4]
-        let sig_sensor_nonce: [u8; SIGNATURE_LEN] =
-            plaintext[..SIGNATURE_LEN].try_into().unwrap();
+        let sig_sensor_nonce: [u8; SIGNATURE_LEN] = plaintext[..SIGNATURE_LEN].try_into().unwrap();
         let gateway_pubkey: [u8; PUBLIC_KEY_LEN] = plaintext
             [SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN]
             .try_into()
