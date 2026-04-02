@@ -300,13 +300,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "log"
+version = "0.4.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
 name = "lora"
-version = "0.1.1"
+version = "0.2.0-rc.3"
+source = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot-rc/cargo/"
+checksum = "973efae012be4c4e87310254bef30081e0e1d84ff5091213d9bcf3b48c043214"
 dependencies = [
  "embedded-hal 1.0.0",
- "lzss",
+ "embedded-hal-mock",
  "tools",
- "ufmt",
 ]
 
 [[package]]
@@ -472,6 +479,7 @@ dependencies = [
  "embedded-hal-mock",
  "heapless 0.9.2",
  "hkdf",
+ "log",
  "lora",
  "sha2",
 ]

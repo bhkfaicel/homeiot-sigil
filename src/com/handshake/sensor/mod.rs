@@ -1,7 +1,7 @@
 use crate::com::error::model::ComError;
 use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN,
-    SIGNATURE_LEN, derive_session_key,
+    CHALLENGE_PLAINTEXT_LEN, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN,
+    derive_session_key,
 };
 use crate::com::keys::Keys;
 use crate::models::common::{
@@ -14,6 +14,7 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::SpiBus;
 use lora;
+use lora::error::model::LoRaError;
 
 /// Step 1 message broadcast by the sensor to all gateways.
 ///
@@ -90,8 +91,9 @@ impl HandshakeConfirm {
 /// challenge header, and the `key_expire_at` value transmitted inside the ECIES ciphertext.
 ///
 /// # Callbacks
-/// - `ecies_decrypt`: decrypts the 194-byte ECIES ciphertext using the sensor's private key.
-///   Writes the 133-byte plaintext to `out`. Returns the ECDH shared secret, or `Err(())` on failure.
+/// - `ecdh_shared_secret`: computes the 32-byte ECDH shared secret from the gateway's
+///   ephemeral public key (P-256, compressed SEC1 format). The implementation is
+///   hardware-specific (e.g. ATECC608x) and never exposes the sensor's private key.
 /// - `verify_sig_sensor_nonce`: verifies `(gateway_pubkey, sig_sensor_nonce)`. Returns `false`
 ///   to reject the challenge (causes `Err(ComError::VerificationFailed)`).
 /// - `sign_gateway_nonce`: signs the 32-byte gateway nonce with the sensor's private key.
@@ -101,7 +103,7 @@ impl HandshakeConfirm {
 /// - `Err(ComError::VerificationFailed)` if the gateway's signature check fails.
 /// - `Err(ComError::Timeout)` if no valid `HandshakeChallenge` is received.
 #[allow(clippy::too_many_arguments)]
-pub fn initiate_handshake<SPI, CS, RST, SpiErr, FD, FV, FS>(
+pub fn initiate_handshake<SPI, CS, RST, SpiErr, FECDH, FV, FS>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     delay: &mut impl DelayNs,
     sensor_mac: [u8; 17],
@@ -109,7 +111,7 @@ pub fn initiate_handshake<SPI, CS, RST, SpiErr, FD, FV, FS>(
     sensor_nonce: [u8; 32],
     sensor_pubkey: [u8; PUBLIC_KEY_LEN],
     sig_sensor_pubkey: [u8; SIGNATURE_LEN],
-    mut ecies_decrypt: FD,
+    mut ecdh_shared_secret: FECDH,
     mut verify_sig_sensor_nonce: FV,
     mut sign_gateway_nonce: FS,
     timestamp: u32,
@@ -118,14 +120,12 @@ where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
     RST: OutputPin,
-    FD: FnMut(
-        &[u8; ECIES_CIPHERTEXT_LEN],
-        &mut [u8; CHALLENGE_PLAINTEXT_LEN],
-    ) -> Result<[u8; 32], ()>,
+    FECDH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
     FV: FnMut(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
     FS: FnMut(&[u8; 32]) -> [u8; SIGNATURE_LEN],
 {
-    let rx_timeout = 4;
+    // Keep listening long enough to catch delayed/retried gateway challenges.
+    let rx_timeout = 80;
 
     // Step 1: broadcast HandshakeRequest
     let mut msg = MessageSchema::create_body_request(
@@ -146,27 +146,146 @@ where
     lora.set_mode(lora::sx1278::Mode::Manual, delay);
     lora.send(&buffer, delay)?;
     lora.set_mode(lora::sx1278::Mode::Receiver, delay);
+    // Give the radio a short settle window in RX before first read attempt.
+    delay.delay_ms(120u32);
+    log::debug!("handshake(sensor): HandshakeRequest sent, waiting challenge");
 
     // Step 2: wait for HandshakeChallenge
     let mut recv_buffer = [0u8; HANDSHAKE_MESSAGE_MAX];
-    for _ in 0..rx_timeout {
-        let receive_result = if let Ok(r) = lora.receive::<SpiErr, _>(&mut recv_buffer, delay) {
-            r
-        } else {
-            delay.delay_ms(5000u32);
-            continue;
+    for attempt in 0..rx_timeout {
+        let receive_result = match lora.receive::<SpiErr, _>(&mut recv_buffer, delay) {
+            Ok(r) => r,
+            Err(LoRaError::NoPacket) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: no packet",
+                    attempt + 1,
+                    rx_timeout
+                );
+                // Periodically rebroadcast request to re-trigger gateway challenge
+                // while we are still inside the same handshake session.
+                if attempt > 0 && attempt % 15 == 0 {
+                    lora.set_mode(lora::sx1278::Mode::Manual, delay);
+                    lora.send(&buffer, delay)?;
+                    lora.set_mode(lora::sx1278::Mode::Receiver, delay);
+                    log::debug!(
+                        "handshake(sensor): rebroadcast HandshakeRequest during wait (attempt {}/{})",
+                        attempt + 1,
+                        rx_timeout
+                    );
+                }
+                delay.delay_ms(120u32);
+                continue;
+            }
+            Err(LoRaError::CrcError) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: CRC error",
+                    attempt + 1,
+                    rx_timeout
+                );
+                delay.delay_ms(80u32);
+                continue;
+            }
+            Err(LoRaError::DeCompressionFailed) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: decompression failed",
+                    attempt + 1,
+                    rx_timeout
+                );
+                delay.delay_ms(80u32);
+                continue;
+            }
+            Err(LoRaError::BufferTooSmall { .. }) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: buffer too small",
+                    attempt + 1,
+                    rx_timeout
+                );
+                delay.delay_ms(80u32);
+                continue;
+            }
+            Err(LoRaError::MessageTooLong { .. }) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: message too long",
+                    attempt + 1,
+                    rx_timeout
+                );
+                return Err(ComError::MessageTooLong {
+                    length: HANDSHAKE_MESSAGE_MAX + 1,
+                    max: HANDSHAKE_MESSAGE_MAX,
+                });
+            }
+            Err(LoRaError::Timeout) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: RX timeout",
+                    attempt + 1,
+                    rx_timeout
+                );
+                delay.delay_ms(80u32);
+                continue;
+            }
+            Err(LoRaError::Canceled) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: RX canceled",
+                    attempt + 1,
+                    rx_timeout
+                );
+                return Err(ComError::Canceled);
+            }
+            Err(LoRaError::UnsupportedModule(code)) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: unsupported module code {}",
+                    attempt + 1,
+                    rx_timeout,
+                    code
+                );
+                return Err(ComError::UnsupportedModule(code));
+            }
+            Err(LoRaError::CompressionFailed) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: compression failed",
+                    attempt + 1,
+                    rx_timeout
+                );
+                return Err(ComError::CompressionFailed);
+            }
+            Err(LoRaError::Spi(_)) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: SPI error",
+                    attempt + 1,
+                    rx_timeout
+                );
+                return Err(ComError::Custom("SPI error during challenge receive"));
+            }
         };
 
         let clear_msg =
             match deserialize_clear::<HANDSHAKE_MESSAGE_MAX>(&recv_buffer[..receive_result.size]) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    log::debug!(
+                        "handshake(sensor): wait_challenge attempt {}/{}: deserialize_clear failed",
+                        attempt + 1,
+                        rx_timeout
+                    );
+                    continue;
+                }
             };
 
         if clear_msg.header.message_type != MessageType::HandshakeChallenge {
+            log::debug!(
+                "handshake(sensor): wait_challenge attempt {}/{}: ignoring msg_type={:?}",
+                attempt + 1,
+                rx_timeout,
+                clear_msg.header.message_type
+            );
             continue;
         }
         if clear_msg.header.dist != OneDestination(sensor_mac) {
+            log::debug!(
+                "handshake(sensor): wait_challenge attempt {}/{}: wrong destination",
+                attempt + 1,
+                rx_timeout
+            );
             continue;
         }
 
@@ -178,11 +297,26 @@ where
             continue;
         };
 
-        // ECIES decrypt: caller uses own private key
+        // ECIES decrypt in two steps:
+        // 1) Ask the caller to compute the ECDH shared secret from the gateway's ephemeral key.
+        // 2) Use HKDF-SHA256 + ChaCha20Poly1305 to decrypt the challenge payload.
         let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
-        let shared_secret = match ecies_decrypt(&ciphertext, &mut plaintext) {
+        let shared_secret = match crate::com::handshake::decrypt_challenge(
+            &ciphertext,
+            &mut plaintext,
+            &mut ecdh_shared_secret,
+        ) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                log::debug!(
+                    "handshake(sensor): wait_challenge attempt {}/{}: ECIES decrypt failed",
+                    attempt + 1,
+                    rx_timeout
+                );
+                // Challenge reached the sensor, but decrypt failed:
+                // likely ECDH/key-configuration mismatch or malformed ciphertext.
+                return Err(ComError::VerificationFailed);
+            }
         };
 
         // Parse plaintext: sig_sensor_nonce[64] | gateway_pubkey[33] | gateway_nonce[32] | key_expire_at[4]
@@ -204,6 +338,7 @@ where
 
         // Verify gateway signed our nonce
         if !verify_sig_sensor_nonce(&gateway_pubkey, &sig_sensor_nonce) {
+            log::debug!("handshake(sensor): gateway signature verification failed");
             return Err(ComError::VerificationFailed);
         }
 
@@ -224,8 +359,21 @@ where
         let confirm_buffer = confirm_msg
             .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
             .map_err(ComError::Custom)?;
-        lora.set_mode(lora::sx1278::Mode::Manual, delay);
-        lora.send(&confirm_buffer, delay)?;
+        // Confirm uplink can be lost; send a couple of times for robustness.
+        const CONFIRM_RETRIES: u8 = 3;
+        for tx in 0..CONFIRM_RETRIES {
+            lora.set_mode(lora::sx1278::Mode::Manual, delay);
+            lora.send(&confirm_buffer, delay)?;
+            log::debug!(
+                "handshake(sensor): HandshakeConfirm sent (tx {}/{})",
+                tx + 1,
+                CONFIRM_RETRIES
+            );
+            if tx + 1 < CONFIRM_RETRIES {
+                lora.set_mode(lora::sx1278::Mode::Receiver, delay);
+                delay.delay_ms(150u32);
+            }
+        }
 
         // Derive session key from ECDH shared secret + both nonces
         let session_key = derive_session_key(&shared_secret, &sensor_nonce, &gateway_nonce);

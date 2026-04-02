@@ -1,8 +1,5 @@
 use crate::com::error::model::ComError;
-use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN,
-    SIGNATURE_LEN,
-};
+use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::com::handshake::sensor::initiate_handshake;
 use crate::com::handshake::sensor::tests::helpers::{
     build_handshake_challenge_buffer, build_handshake_confirm_buffer,
@@ -22,13 +19,8 @@ fn gateway_mac() -> [u8; 17] {
     [26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51]
 }
 
-/// Test ECIES decrypt: the first CHALLENGE_PLAINTEXT_LEN bytes of the ciphertext buffer
-/// hold the plaintext (as produced by `build_handshake_challenge_buffer`).
-fn test_decrypt(
-    ciphertext: &[u8; ECIES_CIPHERTEXT_LEN],
-    out: &mut [u8; CHALLENGE_PLAINTEXT_LEN],
-) -> Result<[u8; 32], ()> {
-    out.copy_from_slice(&ciphertext[..CHALLENGE_PLAINTEXT_LEN]);
+/// Test ECDH callback: returns a deterministic shared secret.
+fn test_ecdh_shared_secret(_eph_pubkey_compressed: &[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()> {
     Ok([0xCCu8; 32])
 }
 
@@ -76,6 +68,11 @@ fn ok() {
         0x42,
         Mode::Receiver,
     ));
+    // Confirm is retried a few times for robustness.
+    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_receiver_mode());
+    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
@@ -89,13 +86,13 @@ fn ok() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_decrypt,
+        test_ecdh_shared_secret,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
     );
 
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "initiate_handshake returned: {:?}", result);
     let keys = result.unwrap();
     assert_eq!(keys.expire_at, 0u32);
     assert_eq!(keys.timestamp, timestamp);
@@ -125,6 +122,18 @@ fn timeout() {
     let mut expectations = expectations_for_new(mode);
     expectations.extend(expectations_for_send(&request_buffer, mode));
     expectations.extend(expectations_for_receiver_mode());
+    // Sensor waits up to `rx_timeout` attempts and rebroadcasts every 15 attempts.
+    // Rebroadcasts happen at attempts 15, 30, 45, 60, 75 (0-based).
+    expectations.extend(expectations_for_receive_no_packet(16, Mode::Receiver));
+    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
+    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
+    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
+    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
+    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
     expectations.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
@@ -138,7 +147,7 @@ fn timeout() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_decrypt,
+        test_ecdh_shared_secret,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
@@ -200,7 +209,7 @@ fn verification_failed_sig_sensor_nonce() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_decrypt,
+        test_ecdh_shared_secret,
         |_pk, _sig| false, // reject sig_sensor_nonce
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,

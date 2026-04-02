@@ -38,7 +38,7 @@ mod tests {
             timestamp,
         );
         let buffer = message
-            .serialize::<256>(&event_key, &nonce, None)
+            .serialize::<255>(&event_key, &nonce, None)
             .expect("serialize");
         let mut expectations = expectations_for_new(mode);
         expectations.extend(expectations_for_send(&buffer, mode));
@@ -88,7 +88,7 @@ mod tests {
             timestamp,
         );
         let buffer = message
-            .serialize::<256>(&event_key, &nonce, None)
+            .serialize::<255>(&event_key, &nonce, None)
             .expect("serialize");
         let mut expectations = expectations_for_new(mode);
         expectations.extend(expectations_for_send(&buffer, mode));
@@ -136,7 +136,7 @@ mod tests {
             TIMESTAMP_NOT_AVAILABLE,
         );
         let buffer = message
-            .serialize::<256>(&event_key, &nonce, None)
+            .serialize::<255>(&event_key, &nonce, None)
             .expect("serialize");
         let mut expectations = expectations_for_new(mode);
         expectations.extend(expectations_for_send(&buffer, mode));

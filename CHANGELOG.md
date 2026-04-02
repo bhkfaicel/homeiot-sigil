@@ -7,7 +7,22 @@ and this project adheres to semantic versioning.
 
 ---
 
-## [Unreleased]
+## [0.2.1-rc.6] - 2026-03-08
+
+### Changed
+
+- `lora` mis à jour sur `0.2.0-rc.3` (compilation locale via `path` pendant la préparation/reproductibilité).
+- Ajustement de la taille de sérialisation des messages `Event` de `serialize::<256>` vers `serialize::<255>` pour respecter la contrainte `lora` (1 octet réservé au flag de compression).
+- Alignement des tests de handshake avec la logique réelle de retransmission/rebroadcast (confirm retries, périodes de renvoi).
+
+### Fixed
+
+- Corrections des attentes `embedded-hal-mock` (mode SPI et séquences d’accès) liées aux changements de comportement induits par `lora 0.2.0-rc.3`.
+- Vérification que `cargo test -p sigil --offline` passe pour la suite de tests du crate.
+
+---
+
+## [0.2.1-rc.5]
 
 ### Added
 

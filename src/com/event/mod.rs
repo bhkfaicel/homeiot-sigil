@@ -69,7 +69,7 @@ where
     );
 
     let buffer = message
-        .serialize::<256>(&key, &nonce, None)
+        .serialize::<255>(&key, &nonce, None)
         .map_err(ComError::Custom)?;
 
     // Send the serialized message via LoRa
@@ -144,7 +144,7 @@ where
     );
 
     let buffer = message
-        .serialize::<256>(&key, &nonce, None)
+        .serialize::<255>(&key, &nonce, None)
         .map_err(ComError::Custom)?;
 
     lora.set_mode(lora::sx1278::Mode::Manual, delay);

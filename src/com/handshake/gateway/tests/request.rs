@@ -169,9 +169,11 @@ fn timeout() {
     let challenge_buffer = build_challenge_buffer(timestamp, 0u32);
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&challenge_buffer, mode));
-    expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
+    // Gateway sends challenge every 10 attempts (including attempt 0), for 60 attempts total.
+    for _ in 0..6 {
+        expectations.extend(expectations_for_send(&challenge_buffer, Mode::Receiver));
+        expectations.extend(expectations_for_receive_no_packet(10, Mode::Receiver));
+    }
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();

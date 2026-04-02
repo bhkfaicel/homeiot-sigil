@@ -1,6 +1,6 @@
 use crate::com::handshake::{
     CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX,
-    PUBLIC_KEY_LEN, SIGNATURE_LEN,
+    PUBLIC_KEY_LEN, SIGNATURE_LEN, encrypt_challenge,
 };
 use crate::com::handshake::gateway::HandshakeChallenge;
 use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
@@ -48,9 +48,8 @@ pub fn build_handshake_request_buffer(
 
 /// Builds the serialised `HandshakeChallenge` buffer that the gateway sends (Step 2).
 ///
-/// In tests, the ECIES "ciphertext" is the plaintext padded to `ECIES_CIPHERTEXT_LEN`:
-/// the first 133 bytes hold the actual plaintext, the remaining 61 bytes are zeros.
-/// The test decrypt callback reads the first 133 bytes back as plaintext.
+/// In tests, we generate a deterministic ECIES ciphertext using `encrypt_challenge` so that
+/// the sensor-side `decrypt_challenge` path is exercised.
 pub fn build_handshake_challenge_buffer(
     gateway_mac: [u8; 17],
     sensor_mac: [u8; 17],
@@ -69,7 +68,18 @@ pub fn build_handshake_challenge_buffer(
         .copy_from_slice(&key_expire_at.to_be_bytes());
 
     let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
-    ciphertext[..CHALLENGE_PLAINTEXT_LEN].copy_from_slice(&plaintext);
+    // Deterministic ECIES parameters for tests
+    let eph_pubkey_compressed = [0x11u8; PUBLIC_KEY_LEN];
+    let shared_secret = [0xCCu8; 32];
+    let chacha_nonce = [0x22u8; 12];
+    encrypt_challenge(
+        &eph_pubkey_compressed,
+        &shared_secret,
+        &chacha_nonce,
+        &plaintext,
+        &mut ciphertext,
+    )
+    .expect("encrypt_challenge");
 
     let mut message = MessageSchema::create_body_response(
         sensor_mac,
@@ -155,6 +165,11 @@ pub fn create_expectations_for_initiate_handshake(
         0x42,
         Mode::Receiver,
     ));
+    // Sensor confirm is retried a few times for robustness.
+    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_receiver_mode());
+    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
     expectations
 }
