@@ -33,8 +33,8 @@ pub fn expectations_for_sensor_challenge_listen_timeout(
     for attempt in 0..SENSOR_CHALLENGE_RX_TIMEOUT {
         expectations.extend(expectations_for_receive_no_packet(1, Mode::Receiver));
         if attempt as u16 >= SENSOR_REBROADCAST_FIRST_ATTEMPT
-            && (attempt as u16 - SENSOR_REBROADCAST_FIRST_ATTEMPT) % SENSOR_REBROADCAST_INTERVAL
-                == 0
+            && (attempt as u16 - SENSOR_REBROADCAST_FIRST_ATTEMPT)
+                .is_multiple_of(SENSOR_REBROADCAST_INTERVAL)
         {
             expectations.extend(expectations_for_send(rebroadcast_payload, Mode::Receiver));
         }
