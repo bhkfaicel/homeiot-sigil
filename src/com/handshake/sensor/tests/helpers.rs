@@ -28,7 +28,7 @@ pub fn build_handshake_request_buffer(
     sensor_pubkey: [u8; PUBLIC_KEY_LEN],
     sig_sensor_pubkey: [u8; SIGNATURE_LEN],
     timestamp: u32,
-) -> [u8; HANDSHAKE_MESSAGE_MAX] {
+) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
     let mut message = MessageSchema::create_body_request(
         sensor_mac,
         battery_level,
@@ -42,14 +42,11 @@ pub fn build_handshake_request_buffer(
         timestamp,
     );
     message
-        .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
-        .expect("serialize_clear")
+        .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
+        .expect("serialize_clear_with_len")
 }
 
 /// Builds the serialised `HandshakeChallenge` buffer that the gateway sends (Step 2).
-///
-/// In tests, we generate a deterministic ECIES ciphertext using `encrypt_challenge` so that
-/// the sensor-side `decrypt_challenge` path is exercised.
 pub fn build_handshake_challenge_buffer(
     gateway_mac: [u8; 17],
     sensor_mac: [u8; 17],
@@ -58,7 +55,7 @@ pub fn build_handshake_challenge_buffer(
     gateway_nonce: [u8; 32],
     key_expire_at: u32,
     timestamp: u32,
-) -> [u8; HANDSHAKE_MESSAGE_MAX] {
+) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
     let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
     plaintext[..SIGNATURE_LEN].copy_from_slice(&sig_sensor_nonce);
     plaintext[SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN].copy_from_slice(&gateway_pubkey);
@@ -68,7 +65,6 @@ pub fn build_handshake_challenge_buffer(
         .copy_from_slice(&key_expire_at.to_be_bytes());
 
     let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
-    // Deterministic ECIES parameters for tests
     let eph_pubkey_compressed = [0x11u8; PUBLIC_KEY_LEN];
     let shared_secret = [0xCCu8; 32];
     let chacha_nonce = [0x22u8; 12];
@@ -89,8 +85,8 @@ pub fn build_handshake_challenge_buffer(
         timestamp,
     );
     message
-        .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
-        .expect("serialize_clear")
+        .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
+        .expect("serialize_clear_with_len")
 }
 
 /// Builds the serialised `HandshakeConfirm` buffer that the sensor sends (Step 3).
@@ -100,7 +96,7 @@ pub fn build_handshake_confirm_buffer(
     gateway_mac: [u8; 17],
     sig_gateway_nonce: [u8; SIGNATURE_LEN],
     timestamp: u32,
-) -> [u8; HANDSHAKE_MESSAGE_MAX] {
+) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
     let mut message = MessageSchema::create_body_request(
         sensor_mac,
         battery_level,
@@ -110,12 +106,11 @@ pub fn build_handshake_confirm_buffer(
         timestamp,
     );
     message
-        .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
-        .expect("serialize_clear")
+        .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
+        .expect("serialize_clear_with_len")
 }
 
-/// SPI expectations for `initiate_handshake` (ok path):
-/// new + send(request) + receiver_mode + receive(challenge) + send(confirm).
+/// SPI expectations for `initiate_handshake` (ok path).
 #[allow(clippy::too_many_arguments)]
 pub fn create_expectations_for_initiate_handshake(
     mode: Mode,
@@ -131,7 +126,7 @@ pub fn create_expectations_for_initiate_handshake(
     gateway_mac: [u8; 17],
     timestamp: u32,
 ) -> vec::Vec<SpiTransaction<u8>> {
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac,
         battery_level,
         sensor_nonce,
@@ -139,7 +134,7 @@ pub fn create_expectations_for_initiate_handshake(
         sig_sensor_pubkey,
         timestamp,
     );
-    let challenge_buffer = build_handshake_challenge_buffer(
+    let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac,
         sensor_mac,
         sig_sensor_nonce,
@@ -148,8 +143,7 @@ pub fn create_expectations_for_initiate_handshake(
         key_expire_at,
         timestamp,
     );
-    // sign_gateway_nonce callback returns [0u8; SIGNATURE_LEN] in tests
-    let confirm_buffer = build_handshake_confirm_buffer(
+    let (confirm_buffer, confirm_len) = build_handshake_confirm_buffer(
         sensor_mac,
         battery_level,
         gateway_mac,
@@ -158,19 +152,30 @@ pub fn create_expectations_for_initiate_handshake(
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&request_buffer, mode));
+    expectations.extend(expectations_for_send(
+        &request_buffer[..request_len],
+        mode,
+    ));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &challenge_buffer,
+        &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));
-    // Sensor confirm is retried a few times for robustness.
-    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     expectations
 }
 

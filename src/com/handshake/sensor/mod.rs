@@ -78,6 +78,14 @@ impl HandshakeConfirm {
     }
 }
 
+/// Successful sensor-side handshake: session keys plus the gateway that issued the challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeSession {
+    pub keys: Keys,
+    /// Gateway MAC from the `HandshakeChallenge` packet header (`src`).
+    pub gateway_mac: [u8; 17],
+}
+
 /// Sensor-side handshake: performs the full 3-message ECDH authenticated key exchange.
 ///
 /// 1. Broadcasts `HandshakeRequest` (sensor_nonce + sensor_pubkey + sig_sensor_pubkey).
@@ -115,7 +123,7 @@ pub fn initiate_handshake<SPI, CS, RST, SpiErr, FECDH, FV, FS>(
     mut verify_sig_sensor_nonce: FV,
     mut sign_gateway_nonce: FS,
     timestamp: u32,
-) -> Result<Keys, ComError<SpiErr>>
+) -> Result<HandshakeSession, ComError<SpiErr>>
 where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
@@ -125,7 +133,7 @@ where
     FS: FnMut(&[u8; 32]) -> [u8; SIGNATURE_LEN],
 {
     // Keep listening long enough to catch delayed/retried gateway challenges.
-    let rx_timeout = 80;
+    let rx_timeout = 800;
 
     // Step 1: broadcast HandshakeRequest
     let mut msg = MessageSchema::create_body_request(
@@ -140,11 +148,17 @@ where
         }),
         timestamp,
     );
-    let buffer = msg
-        .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
+    let (buffer, len) = msg
+        .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
         .map_err(ComError::Custom)?;
+    if len > crate::models::common::LORA_USER_PAYLOAD_MAX {
+        return Err(ComError::MessageTooLong {
+            length: len,
+            max: crate::models::common::LORA_USER_PAYLOAD_MAX,
+        });
+    }
     lora.set_mode(lora::sx1278::Mode::Manual, delay);
-    lora.send(&buffer, delay)?;
+    lora.send(&buffer[..len], delay)?;
     lora.set_mode(lora::sx1278::Mode::Receiver, delay);
     // Give the radio a short settle window in RX before first read attempt.
     delay.delay_ms(120u32);
@@ -163,9 +177,15 @@ where
                 );
                 // Periodically rebroadcast request to re-trigger gateway challenge
                 // while we are still inside the same handshake session.
-                if attempt > 0 && attempt % 15 == 0 {
+                // Wait ≥5 s before the first rebroadcast so the gateway has time to
+                // finish ATECC verification/ECDH and TX the challenge (avoids half-duplex collision).
+                const REBROADCAST_FIRST_ATTEMPT: u16 = 50;
+                const REBROADCAST_INTERVAL: u16 = 50;
+                if attempt >= REBROADCAST_FIRST_ATTEMPT
+                    && (attempt - REBROADCAST_FIRST_ATTEMPT) % REBROADCAST_INTERVAL == 0
+                {
                     lora.set_mode(lora::sx1278::Mode::Manual, delay);
-                    lora.send(&buffer, delay)?;
+                    lora.send(&buffer[..len], delay)?;
                     lora.set_mode(lora::sx1278::Mode::Receiver, delay);
                     log::debug!(
                         "handshake(sensor): rebroadcast HandshakeRequest during wait (attempt {}/{})",
@@ -356,14 +376,20 @@ where
             }),
             timestamp,
         );
-        let confirm_buffer = confirm_msg
-            .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
+        let (confirm_buffer, confirm_len) = confirm_msg
+            .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
             .map_err(ComError::Custom)?;
+        if confirm_len > crate::models::common::LORA_USER_PAYLOAD_MAX {
+            return Err(ComError::MessageTooLong {
+                length: confirm_len,
+                max: crate::models::common::LORA_USER_PAYLOAD_MAX,
+            });
+        }
         // Confirm uplink can be lost; send a couple of times for robustness.
         const CONFIRM_RETRIES: u8 = 3;
         for tx in 0..CONFIRM_RETRIES {
             lora.set_mode(lora::sx1278::Mode::Manual, delay);
-            lora.send(&confirm_buffer, delay)?;
+            lora.send(&confirm_buffer[..confirm_len], delay)?;
             log::debug!(
                 "handshake(sensor): HandshakeConfirm sent (tx {}/{})",
                 tx + 1,
@@ -377,10 +403,13 @@ where
 
         // Derive session key from ECDH shared secret + both nonces
         let session_key = derive_session_key(&shared_secret, &sensor_nonce, &gateway_nonce);
-        return Ok(Keys {
-            key: session_key,
-            expire_at: key_expire_at,
-            timestamp: challenge_timestamp,
+        return Ok(HandshakeSession {
+            keys: Keys {
+                key: session_key,
+                expire_at: key_expire_at,
+                timestamp: challenge_timestamp,
+            },
+            gateway_mac,
         });
     }
 

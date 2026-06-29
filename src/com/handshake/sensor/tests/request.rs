@@ -34,7 +34,7 @@ fn ok() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -42,7 +42,7 @@ fn ok() {
         sig_sensor_pubkey,
         timestamp,
     );
-    let challenge_buffer = build_handshake_challenge_buffer(
+    let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
         [0u8; SIGNATURE_LEN],
@@ -51,8 +51,7 @@ fn ok() {
         0u32,
         timestamp,
     );
-    // sign_gateway_nonce returns [0u8; SIGNATURE_LEN], so confirm contains all-zero sig
-    let confirm_buffer = build_handshake_confirm_buffer(
+    let (confirm_buffer, confirm_len) = build_handshake_confirm_buffer(
         sensor_mac(),
         battery_level,
         gateway_mac(),
@@ -61,19 +60,30 @@ fn ok() {
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&request_buffer, mode));
+    expectations.extend(expectations_for_send(
+        &request_buffer[..request_len],
+        mode,
+    ));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &challenge_buffer,
+        &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));
-    // Confirm is retried a few times for robustness.
-    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
@@ -93,9 +103,10 @@ fn ok() {
     );
 
     assert!(result.is_ok(), "initiate_handshake returned: {:?}", result);
-    let keys = result.unwrap();
-    assert_eq!(keys.expire_at, 0u32);
-    assert_eq!(keys.timestamp, timestamp);
+    let session = result.unwrap();
+    assert_eq!(session.keys.expire_at, 0u32);
+    assert_eq!(session.keys.timestamp, timestamp);
+    assert_eq!(session.gateway_mac, gateway_mac());
     spi.done();
     cs.done();
     rst.done();
@@ -110,7 +121,7 @@ fn timeout() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -118,22 +129,21 @@ fn timeout() {
         sig_sensor_pubkey,
         timestamp,
     );
+    let req = &request_buffer[..request_len];
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&request_buffer, mode));
+    expectations.extend(expectations_for_send(req, mode));
     expectations.extend(expectations_for_receiver_mode());
-    // Sensor waits up to `rx_timeout` attempts and rebroadcasts every 15 attempts.
-    // Rebroadcasts happen at attempts 15, 30, 45, 60, 75 (0-based).
     expectations.extend(expectations_for_receive_no_packet(16, Mode::Receiver));
-    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_send(req, Mode::Receiver));
     expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_send(req, Mode::Receiver));
     expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_send(req, Mode::Receiver));
     expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_send(req, Mode::Receiver));
     expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    expectations.extend(expectations_for_send(req, Mode::Receiver));
     expectations.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
@@ -170,7 +180,7 @@ fn verification_failed_sig_sensor_nonce() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -178,7 +188,7 @@ fn verification_failed_sig_sensor_nonce() {
         sig_sensor_pubkey,
         timestamp,
     );
-    let challenge_buffer = build_handshake_challenge_buffer(
+    let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
         [0u8; SIGNATURE_LEN],
@@ -188,12 +198,14 @@ fn verification_failed_sig_sensor_nonce() {
         timestamp,
     );
 
-    // No confirm send expected — verification fails before step 3
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&request_buffer, mode));
+    expectations.extend(expectations_for_send(
+        &request_buffer[..request_len],
+        mode,
+    ));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &challenge_buffer,
+        &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));

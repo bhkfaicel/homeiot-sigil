@@ -1,11 +1,11 @@
 [package]
 name = "sigil"
-version = "0.2.1-rc.6"
+version = "0.2.1-rc.7"
 edition = "2024"
 
 [dependencies]
-lora = { version = "0.2.0-rc.3", registry = "forgejorc",default-features = false, features = ["sx1278"] }
-#lora = { path = "../lora", default-features = false,  features = ["sx1278"] }
+#lora = { path = "../lora", default-features = false, features = ["sx1278"] }
+lora = { version = "0.2.0-rc.7", registry = "forgejorc",default-features = false, features = ["sx1278"] }
 
 embedded-hal = "1.0.0"
 
@@ -23,6 +23,5 @@ com = []
 
 [dev-dependencies]
 embedded-hal-mock= {version="0.11.1",features=["eh1"]}
-lora = { version = "0.2.0-rc.3", registry = "forgejorc",default-features = false, features = ["test-support"] }
-#lora = { path = "../lora", default-features = false,  features = ["sx1278"] }
-
+#lora = { path = "../lora", default-features = false, features = ["test-support"] }
+lora = { version = "0.2.0-rc.7", registry = "forgejorc",default-features = false, features = ["test-support"] }

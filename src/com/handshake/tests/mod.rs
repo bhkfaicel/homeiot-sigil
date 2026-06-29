@@ -6,8 +6,9 @@ use crate::com::handshake::sensor::tests::helpers::{
 };
 use crate::com::handshake::sensor::{HandshakeRequest, initiate_handshake};
 use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN,
-    SIGNATURE_LEN, decrypt_challenge, encrypt_challenge,
+    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, GATEWAY_CHALLENGE_RESEND_PERIOD,
+    GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN,
+    decrypt_challenge, encrypt_challenge,
 };
 use lora::sx1278::tests::common::{
     expectations_for_new, expectations_for_receive_no_packet, expectations_for_receive_success,
@@ -25,6 +26,17 @@ fn gateway_mac() -> [u8; 17] {
     [
         26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51,
     ]
+}
+
+#[test]
+fn gateway_confirm_rx_timeout_is_three_times_previous_default() {
+    assert_eq!(GATEWAY_CONFIRM_RX_TIMEOUT, 180);
+    assert_eq!(GATEWAY_CHALLENGE_RESEND_PERIOD, 10);
+    assert_eq!(
+        GATEWAY_CONFIRM_RX_TIMEOUT / GATEWAY_CHALLENGE_RESEND_PERIOD,
+        18,
+        "challenge re-send rounds during a full timeout window"
+    );
 }
 
 /// Fake ECIES encrypt: generates a deterministic ECIES ciphertext via `encrypt_challenge`.
@@ -110,7 +122,7 @@ fn session_keys_match() {
     let gateway_nonce = [0xBB; 32];
     let timestamp = 260691u32;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -118,8 +130,7 @@ fn session_keys_match() {
         sig_sensor_pubkey,
         timestamp,
     );
-    // sig_sensor_nonce and gateway_pubkey are all-zero because the gateway callbacks return [0; _]
-    let challenge_buffer = build_handshake_challenge_buffer(
+    let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
         [0u8; SIGNATURE_LEN],
@@ -128,8 +139,7 @@ fn session_keys_match() {
         0u32,
         timestamp,
     );
-    // sig_gateway_nonce is all-zero because sign_gateway_nonce callback returns [0; SIGNATURE_LEN]
-    let confirm_buffer = build_handshake_confirm_buffer(
+    let (confirm_buffer, confirm_len) = build_handshake_confirm_buffer(
         sensor_mac(),
         battery_level,
         gateway_mac(),
@@ -139,26 +149,40 @@ fn session_keys_match() {
 
     // Sensor: send request → receive challenge → send confirm
     let mut sensor_exp = expectations_for_new(Mode::Manual);
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &request_buffer[..request_len],
+        Mode::Manual,
+    ));
     sensor_exp.extend(expectations_for_receiver_mode());
     sensor_exp.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &challenge_buffer,
+        &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));
-    // Confirm is retried a few times for robustness.
-    sensor_exp.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     sensor_exp.extend(expectations_for_receiver_mode());
-    sensor_exp.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     sensor_exp.extend(expectations_for_receiver_mode());
-    sensor_exp.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
 
     // Gateway: send challenge → receive confirm
     let mut gateway_exp = expectations_for_new(Mode::Manual);
-    gateway_exp.extend(expectations_for_send(&challenge_buffer, Mode::Manual));
+    gateway_exp.extend(expectations_for_send(
+        &challenge_buffer[..challenge_len],
+        Mode::Manual,
+    ));
     gateway_exp.extend(expectations_for_receiver_mode());
     gateway_exp.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &confirm_buffer,
+        &confirm_buffer[..confirm_len],
         0x42,
         Mode::Receiver,
     ));
@@ -219,10 +243,12 @@ fn session_keys_match() {
         sensor_result
     );
     assert!(gateway_result.is_ok());
-    let sensor_keys = sensor_result.unwrap();
+    let sensor_session = sensor_result.unwrap();
+    let sensor_keys = sensor_session.keys;
     let gateway_hr = gateway_result.unwrap();
     assert_eq!(sensor_keys.key, gateway_hr.session_key);
     assert_eq!(sensor_keys.expire_at, gateway_hr.key_expire_at);
+    assert_eq!(sensor_session.gateway_mac, gateway_mac());
     s_spi.done();
     s_cs.done();
     s_rst.done();
@@ -242,7 +268,7 @@ fn gateway_rejects_sensor() {
     let gateway_nonce = [0xBB; 32];
     let timestamp = 260691u32;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -250,23 +276,21 @@ fn gateway_rejects_sensor() {
         sig_sensor_pubkey,
         timestamp,
     );
+    let req = &request_buffer[..request_len];
 
-    // Sensor: sends request, waits, times out (no challenge arrives)
     let mut sensor_exp = expectations_for_new(Mode::Manual);
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Manual));
+    sensor_exp.extend(expectations_for_send(req, Mode::Manual));
     sensor_exp.extend(expectations_for_receiver_mode());
-    // Sensor waits up to `rx_timeout` attempts and rebroadcasts every 15 attempts.
-    // Rebroadcasts happen at attempts 15, 30, 45, 60, 75 (0-based).
     sensor_exp.extend(expectations_for_receive_no_packet(16, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
     sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
     sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
     sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
     sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Receiver));
+    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
     sensor_exp.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
 
     // Gateway: only initialisation — verify_sensor rejects before any LoRa traffic
@@ -343,7 +367,7 @@ fn sensor_rejects_gateway() {
     let gateway_nonce = [0xBB; 32];
     let timestamp = 260691u32;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -351,7 +375,7 @@ fn sensor_rejects_gateway() {
         sig_sensor_pubkey,
         timestamp,
     );
-    let challenge_buffer = build_handshake_challenge_buffer(
+    let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
         [0u8; SIGNATURE_LEN],
@@ -360,7 +384,7 @@ fn sensor_rejects_gateway() {
         0u32,
         timestamp,
     );
-    let confirm_buffer = build_handshake_confirm_buffer(
+    let (confirm_buffer, confirm_len) = build_handshake_confirm_buffer(
         sensor_mac(),
         battery_level,
         gateway_mac(),
@@ -368,27 +392,28 @@ fn sensor_rejects_gateway() {
         timestamp,
     );
 
-    // Sensor: sends request, receives challenge, then rejects it (no confirm sent)
     let mut sensor_exp = expectations_for_new(Mode::Manual);
-    sensor_exp.extend(expectations_for_send(&request_buffer, Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &request_buffer[..request_len],
+        Mode::Manual,
+    ));
     sensor_exp.extend(expectations_for_receiver_mode());
     sensor_exp.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &challenge_buffer,
+        &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));
 
-    // Gateway: sends challenge, waits for confirm, times out
     let mut gateway_exp = expectations_for_new(Mode::Manual);
-    // Gateway sends challenge every 10 attempts (including attempt 0), for 60 attempts total.
     for _ in 0..6 {
-        gateway_exp.extend(expectations_for_send(&challenge_buffer, Mode::Receiver));
+        gateway_exp.extend(expectations_for_send(
+            &challenge_buffer[..challenge_len],
+            Mode::Receiver,
+        ));
         gateway_exp.extend(expectations_for_receive_no_packet(10, Mode::Receiver));
     }
 
-    // confirm_buffer is only used to ensure the gateway expectations are consistent —
-    // it is never actually received here.
-    let _ = confirm_buffer;
+    let _ = (confirm_buffer, confirm_len);
 
     let (mut s_spi, mut s_cs, mut s_rst, mut s_delay) = create_controller(&sensor_exp);
     let (mut g_spi, mut g_cs, mut g_rst, mut g_delay) = create_controller(&gateway_exp);

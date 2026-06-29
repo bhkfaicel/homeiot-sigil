@@ -27,6 +27,18 @@ pub const ECIES_OVERHEAD: usize = PUBLIC_KEY_LEN + 12 + 16;
 /// expected by the `ecies_encrypt` callback in `handle_handshake_request`.
 pub const ECIES_CIPHERTEXT_LEN: usize = CHALLENGE_PLAINTEXT_LEN + ECIES_OVERHEAD;
 
+/// Gateway listen iterations while waiting for `HandshakeConfirm` after the challenge is sent.
+///
+/// The gateway re-sends the **same** challenge every [`GATEWAY_CHALLENGE_RESEND_PERIOD`] attempts.
+/// On `NoPacket`, each iteration waits ~200 ms before retrying. With the default of 180 attempts,
+/// the gateway listens for roughly **36 s** before returning `ComError::Timeout`. This reduces
+/// premature timeouts when the sensor is slow (ATECC608A ECDH + LoRa retries) and avoids starting
+/// a new handshake (new ephemeral key / session key) while the sensor is still processing.
+pub const GATEWAY_CONFIRM_RX_TIMEOUT: usize = 180;
+
+/// Re-send the identical `HandshakeChallenge` buffer every N receive attempts (packet loss recovery).
+pub const GATEWAY_CHALLENGE_RESEND_PERIOD: usize = 10;
+
 /// Encrypts a handshake challenge using HKDF-SHA256 + ChaCha20Poly1305.
 ///
 /// The caller provides:
