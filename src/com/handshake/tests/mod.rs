@@ -3,6 +3,7 @@ use crate::com::handshake::gateway::handle_handshake_request;
 use crate::com::handshake::sensor::tests::helpers::{
     build_handshake_challenge_buffer, build_handshake_confirm_buffer,
     build_handshake_request_buffer, create_controller,
+    expectations_for_sensor_challenge_listen_timeout,
 };
 use crate::com::handshake::sensor::{HandshakeRequest, initiate_handshake};
 use crate::com::handshake::{
@@ -281,17 +282,7 @@ fn gateway_rejects_sensor() {
     let mut sensor_exp = expectations_for_new(Mode::Manual);
     sensor_exp.extend(expectations_for_send(req, Mode::Manual));
     sensor_exp.extend(expectations_for_receiver_mode());
-    sensor_exp.extend(expectations_for_receive_no_packet(16, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
-    sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
-    sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
-    sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
-    sensor_exp.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    sensor_exp.extend(expectations_for_send(req, Mode::Receiver));
-    sensor_exp.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
+    sensor_exp.extend(expectations_for_sensor_challenge_listen_timeout(req));
 
     // Gateway: only initialisation — verify_sensor rejects before any LoRa traffic
     let gateway_exp = expectations_for_new(Mode::Manual);
@@ -405,12 +396,16 @@ fn sensor_rejects_gateway() {
     ));
 
     let mut gateway_exp = expectations_for_new(Mode::Manual);
-    for _ in 0..6 {
+    let challenge_rounds = GATEWAY_CONFIRM_RX_TIMEOUT / GATEWAY_CHALLENGE_RESEND_PERIOD;
+    for _ in 0..challenge_rounds {
         gateway_exp.extend(expectations_for_send(
             &challenge_buffer[..challenge_len],
             Mode::Receiver,
         ));
-        gateway_exp.extend(expectations_for_receive_no_packet(10, Mode::Receiver));
+        gateway_exp.extend(expectations_for_receive_no_packet(
+            GATEWAY_CHALLENGE_RESEND_PERIOD,
+            Mode::Receiver,
+        ));
     }
 
     let _ = (confirm_buffer, confirm_len);

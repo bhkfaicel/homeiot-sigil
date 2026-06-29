@@ -16,9 +16,31 @@ use embedded_hal_mock::eh1::digital::{
 use embedded_hal_mock::eh1::spi::{Mock as SpiMock, Transaction as SpiTransaction};
 use lora::sx1278::Mode;
 use lora::sx1278::tests::common::{
-    expectations_for_new, expectations_for_receive_success, expectations_for_receiver_mode,
-    expectations_for_send,
+    expectations_for_new, expectations_for_receive_no_packet, expectations_for_receive_success,
+    expectations_for_receiver_mode, expectations_for_send,
 };
+
+/// Must match `initiate_handshake` challenge listen loop in `sensor/mod.rs`.
+const SENSOR_CHALLENGE_RX_TIMEOUT: usize = 800;
+const SENSOR_REBROADCAST_FIRST_ATTEMPT: u16 = 50;
+const SENSOR_REBROADCAST_INTERVAL: u16 = 50;
+
+/// SPI expectations for the sensor waiting until `ComError::Timeout` (no challenge received).
+pub fn expectations_for_sensor_challenge_listen_timeout(
+    rebroadcast_payload: &[u8],
+) -> vec::Vec<SpiTransaction<u8>> {
+    let mut expectations = vec![];
+    for attempt in 0..SENSOR_CHALLENGE_RX_TIMEOUT {
+        expectations.extend(expectations_for_receive_no_packet(1, Mode::Receiver));
+        if attempt as u16 >= SENSOR_REBROADCAST_FIRST_ATTEMPT
+            && (attempt as u16 - SENSOR_REBROADCAST_FIRST_ATTEMPT) % SENSOR_REBROADCAST_INTERVAL
+                == 0
+        {
+            expectations.extend(expectations_for_send(rebroadcast_payload, Mode::Receiver));
+        }
+    }
+    expectations
+}
 
 /// Builds the serialised `HandshakeRequest` buffer that the sensor broadcasts (Step 1).
 pub fn build_handshake_request_buffer(

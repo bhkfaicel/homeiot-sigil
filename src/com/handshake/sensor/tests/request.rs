@@ -4,10 +4,11 @@ use crate::com::handshake::sensor::initiate_handshake;
 use crate::com::handshake::sensor::tests::helpers::{
     build_handshake_challenge_buffer, build_handshake_confirm_buffer,
     build_handshake_request_buffer, create_controller,
+    expectations_for_sensor_challenge_listen_timeout,
 };
 use lora::sx1278::tests::common::{
-    expectations_for_new, expectations_for_receive_no_packet, expectations_for_receive_success,
-    expectations_for_receiver_mode, expectations_for_send,
+    expectations_for_new, expectations_for_receive_success, expectations_for_receiver_mode,
+    expectations_for_send,
 };
 use lora::sx1278::{Controller, Mode};
 
@@ -134,17 +135,7 @@ fn timeout() {
     let mut expectations = expectations_for_new(mode);
     expectations.extend(expectations_for_send(req, mode));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_receive_no_packet(16, Mode::Receiver));
-    expectations.extend(expectations_for_send(req, Mode::Receiver));
-    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(req, Mode::Receiver));
-    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(req, Mode::Receiver));
-    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(req, Mode::Receiver));
-    expectations.extend(expectations_for_receive_no_packet(15, Mode::Receiver));
-    expectations.extend(expectations_for_send(req, Mode::Receiver));
-    expectations.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
+    expectations.extend(expectations_for_sensor_challenge_listen_timeout(req));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
