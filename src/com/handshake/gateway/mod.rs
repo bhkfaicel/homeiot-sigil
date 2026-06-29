@@ -1,12 +1,13 @@
 use crate::com::error::model::ComError;
-use crate::com::handshake::{
-    derive_session_key, CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX,
-    PUBLIC_KEY_LEN, SIGNATURE_LEN,
-};
 use crate::com::handshake::sensor::HandshakeRequest;
+use crate::com::handshake::{
+    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, GATEWAY_CHALLENGE_RESEND_PERIOD,
+    GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN,
+    derive_session_key,
+};
 use crate::models::common::{
-    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType,
-    ResponseType, deserialize_clear,
+    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
+    deserialize_clear,
 };
 use bincode::{Decode, Encode};
 use embedded_hal::delay::DelayNs;
@@ -84,6 +85,7 @@ where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
     RST: OutputPin,
+    SpiErr: core::fmt::Debug,
     FV: Fn(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
     FE: Fn(
         &[u8; PUBLIC_KEY_LEN],
@@ -92,7 +94,8 @@ where
     ) -> [u8; 32],
     FVN: Fn(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
 {
-    let rx_timeout = 4;
+    // See `GATEWAY_CONFIRM_RX_TIMEOUT` (~36 s with 200 ms per NoPacket retry).
+    let rx_timeout = GATEWAY_CONFIRM_RX_TIMEOUT;
 
     // Step 1: verify sensor identity before sending anything
     if !verify_sensor(request.sensor_pubkey(), request.sig_sensor_pubkey()) {
@@ -105,14 +108,25 @@ where
     plaintext[SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN].copy_from_slice(&gateway_pubkey);
     plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN + 32]
         .copy_from_slice(&gateway_nonce);
-    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN + 32..]
-        .copy_from_slice(&key_expire_at.to_be_bytes());
+    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN + 32..].copy_from_slice(&key_expire_at.to_be_bytes());
 
     // Encrypt via ECIES callback; shared_secret is used later for session key derivation
     let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
     let shared_secret = ecies_encrypt(request.sensor_pubkey(), &plaintext, &mut ciphertext);
 
-    // Step 2: send HandshakeChallenge (ECIES ciphertext), then listen for HandshakeConfirm
+    // Reject failed encryption (callback leaves ciphertext zeroed on error).
+    if shared_secret.iter().all(|&b| b == 0)
+        || ciphertext[..PUBLIC_KEY_LEN].iter().all(|&b| b == 0)
+    {
+        log::debug!(
+            "handshake: ecies_encrypt failed (shared_zero={}, eph_all_zero={})",
+            shared_secret.iter().all(|&b| b == 0),
+            ciphertext[..PUBLIC_KEY_LEN].iter().all(|&b| b == 0)
+        );
+        return Err(ComError::VerificationFailed);
+    }
+
+    // Step 2: prepare HandshakeChallenge (ECIES ciphertext)
     let mut challenge_msg = MessageSchema::create_body_response(
         sensor_mac,
         gateway_mac,
@@ -120,40 +134,102 @@ where
         ResponseType::HandshakeChallenge(HandshakeChallenge { data: ciphertext }),
         timestamp,
     );
-    let buffer = challenge_msg
-        .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
+    let (buffer, len) = challenge_msg
+        .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
         .map_err(ComError::Custom)?;
-    lora.set_mode(lora::sx1278::Mode::Manual, delay);
-    lora.send(&buffer, delay)?;
-    lora.set_mode(lora::sx1278::Mode::Receiver, delay);
+    if len > crate::models::common::LORA_USER_PAYLOAD_MAX {
+        return Err(ComError::MessageTooLong {
+            length: len,
+            max: crate::models::common::LORA_USER_PAYLOAD_MAX,
+        });
+    }
 
     // Step 3: wait for HandshakeConfirm
+    // Re-send challenge periodically to handle packet loss, but avoid burst sends
+    // that can collide with the sensor's confirm uplink.
     let mut recv_buffer = [0u8; HANDSHAKE_MESSAGE_MAX];
-    for _ in 0..rx_timeout {
-        let receive_result =
-            if let Ok(r) = lora.receive::<SpiErr, _>(&mut recv_buffer, delay) {
-                r
-            } else {
-                delay.delay_ms(5000u32);
+    for attempt in 0..rx_timeout {
+        if attempt % GATEWAY_CHALLENGE_RESEND_PERIOD == 0 {
+            lora.set_mode(lora::sx1278::Mode::Manual, delay);
+            lora.send(&buffer[..len], delay)?;
+            lora.set_mode(lora::sx1278::Mode::Receiver, delay);
+            log::debug!(
+                "handshake: challenge sent (round {}), waiting confirm",
+                (attempt / GATEWAY_CHALLENGE_RESEND_PERIOD) + 1
+            );
+        }
+
+        let receive_result = match lora.receive::<SpiErr, _>(&mut recv_buffer, delay) {
+            Ok(r) => r,
+            Err(e) => {
+                log::debug!(
+                    "handshake: wait_confirm attempt {}/{}: receive error: {:?}",
+                    attempt + 1,
+                    rx_timeout,
+                    e
+                );
+                // Retry sooner; long sleeps can miss the confirm if the sensor retransmits quickly.
+                delay.delay_ms(200u32);
                 continue;
-            };
+            }
+        };
 
         let clear_msg = match deserialize_clear::<HANDSHAKE_MESSAGE_MAX>(
             &recv_buffer[..receive_result.size],
         ) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                log::debug!(
+                    "handshake: wait_confirm attempt {}/{}: deserialize_clear failed (size={}, first16={:02x?})",
+                    attempt + 1,
+                    rx_timeout,
+                    receive_result.size,
+                    &recv_buffer[..core::cmp::min(16, receive_result.size)]
+                );
+                continue;
+            }
         };
 
         if clear_msg.header.message_type != MessageType::HandshakeConfirm {
+            // Recovery path: if the same sensor re-sends HandshakeRequest while we are
+            // waiting for confirm, it likely missed/failed the challenge processing.
+            // Re-send the exact same challenge and keep waiting for confirm.
+            if clear_msg.header.message_type == MessageType::HandshakeRequest
+                && clear_msg.header.src == sensor_mac
+            {
+                log::debug!(
+                    "handshake: wait_confirm attempt {}/{}: got HandshakeRequest again from sensor, resending challenge",
+                    attempt + 1,
+                    rx_timeout
+                );
+                lora.set_mode(lora::sx1278::Mode::Manual, delay);
+                lora.send(&buffer[..len], delay)?;
+                lora.set_mode(lora::sx1278::Mode::Receiver, delay);
+                continue;
+            }
+            log::debug!(
+                "handshake: wait_confirm attempt {}/{}: ignoring msg_type={:?}, src={:02x?}, dist={:?}",
+                attempt + 1,
+                rx_timeout,
+                clear_msg.header.message_type,
+                clear_msg.header.src,
+                clear_msg.header.dist
+            );
             continue;
         }
         if clear_msg.header.dist != OneDestination(gateway_mac) {
+            log::debug!(
+                "handshake: wait_confirm attempt {}/{}: wrong destination (dist={:?})",
+                attempt + 1,
+                rx_timeout,
+                clear_msg.header.dist
+            );
             continue;
         }
 
         if let BodySchema::RequestType(RequestType::HandshakeConfirm(confirm)) = clear_msg.body {
             if !verify_sig_gateway_nonce(request.sensor_pubkey(), confirm.sig_gateway_nonce()) {
+                log::debug!("handshake: wait_confirm: verify_sig_gateway_nonce failed");
                 return Err(ComError::VerificationFailed);
             }
             let session_key =
@@ -163,6 +239,8 @@ where
                 sensor_pubkey: *request.sensor_pubkey(),
                 key_expire_at,
             });
+        } else {
+            log::debug!("handshake: wait_confirm: unexpected body for HandshakeConfirm");
         }
     }
 

@@ -238,16 +238,6 @@ dependencies = [
 
 [[package]]
 name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32 0.3.1",
- "stable_deref_trait",
-]
-
-[[package]]
-name = "heapless"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af2455f757db2b292a9b1768c4b70186d443bcb3b316252d6b540aec1cd89ed"
@@ -300,16 +290,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "log"
+version = "0.4.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
 name = "lora"
-version = "0.1.1"
-source = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot/cargo/"
-checksum = "0a6b329d06b0f2922d6f836595c4a0b3d4c2f92f57d3442ee49903b0139bbbe6"
+version = "0.2.0-rc.7"
+source = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot-rc/cargo/"
+checksum = "375f6f1020a24e260755795c60b51cb4a37d043ed72de466eb592f670959c46a"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-mock",
- "lzss",
+ "log",
  "tools",
- "ufmt",
 ]
 
 [[package]]
@@ -416,24 +411,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proc-macro2"
-version = "1.0.95"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
-dependencies = [
- "unicode-ident",
-]
-
-[[package]]
-name = "quote"
-version = "1.0.40"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
-dependencies = [
- "proc-macro2",
-]
-
-[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -467,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "sigil"
-version = "0.2.1-rc.5"
+version = "0.2.1-rc.7"
 dependencies = [
  "bincode",
  "chacha20poly1305",
@@ -475,6 +452,7 @@ dependencies = [
  "embedded-hal-mock",
  "heapless 0.9.2",
  "hkdf",
+ "log",
  "lora",
  "sha2",
 ]
@@ -501,27 +479,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "syn"
-version = "1.0.109"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
 name = "tools"
-version = "0.1.0"
-source = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot/cargo/"
-checksum = "9e4ece2fd953b09c7ed41a21872c972e460d3a62bf82c0555f2bf43fbe542e74"
+version = "0.2.0-rc.1"
+source = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot-rc/cargo/"
+checksum = "650d573796fb0cdc99e2f28ef4d0eee3c64d9bc470a85bcdc6601d67436636d7"
 dependencies = [
  "chacha20poly1305",
  "embedded-hal 1.0.0",
- "heapless 0.8.0",
+ "heapless 0.9.2",
  "lzss",
- "ufmt",
 ]
 
 [[package]]
@@ -529,39 +495,6 @@ name = "typenum"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
-
-[[package]]
-name = "ufmt"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a64846ec02b57e9108d6469d98d1648782ad6bb150a95a9baac26900bbeab9d"
-dependencies = [
- "ufmt-macros",
- "ufmt-write",
-]
-
-[[package]]
-name = "ufmt-macros"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d337d3be617449165cb4633c8dece429afd83f84051024079f97ad32a9663716"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "ufmt-write"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e87a2ed6b42ec5e28cc3b94c09982969e9227600b2e3dcbc1db927a84c06bd69"
-
-[[package]]
-name = "unicode-ident"
-version = "1.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 
 [[package]]
 name = "universal-hash"

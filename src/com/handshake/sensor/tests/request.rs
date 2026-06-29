@@ -1,16 +1,14 @@
 use crate::com::error::model::ComError;
-use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN,
-    SIGNATURE_LEN,
-};
+use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::com::handshake::sensor::initiate_handshake;
 use crate::com::handshake::sensor::tests::helpers::{
     build_handshake_challenge_buffer, build_handshake_confirm_buffer,
     build_handshake_request_buffer, create_controller,
+    expectations_for_sensor_challenge_listen_timeout,
 };
 use lora::sx1278::tests::common::{
-    expectations_for_new, expectations_for_receive_no_packet, expectations_for_receive_success,
-    expectations_for_receiver_mode, expectations_for_send,
+    expectations_for_new, expectations_for_receive_success, expectations_for_receiver_mode,
+    expectations_for_send,
 };
 use lora::sx1278::{Controller, Mode};
 
@@ -22,13 +20,8 @@ fn gateway_mac() -> [u8; 17] {
     [26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51]
 }
 
-/// Test ECIES decrypt: the first CHALLENGE_PLAINTEXT_LEN bytes of the ciphertext buffer
-/// hold the plaintext (as produced by `build_handshake_challenge_buffer`).
-fn test_decrypt(
-    ciphertext: &[u8; ECIES_CIPHERTEXT_LEN],
-    out: &mut [u8; CHALLENGE_PLAINTEXT_LEN],
-) -> Result<[u8; 32], ()> {
-    out.copy_from_slice(&ciphertext[..CHALLENGE_PLAINTEXT_LEN]);
+/// Test ECDH callback: returns a deterministic shared secret.
+fn test_ecdh_shared_secret(_eph_pubkey_compressed: &[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()> {
     Ok([0xCCu8; 32])
 }
 
@@ -42,7 +35,7 @@ fn ok() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -50,7 +43,7 @@ fn ok() {
         sig_sensor_pubkey,
         timestamp,
     );
-    let challenge_buffer = build_handshake_challenge_buffer(
+    let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
         [0u8; SIGNATURE_LEN],
@@ -59,8 +52,7 @@ fn ok() {
         0u32,
         timestamp,
     );
-    // sign_gateway_nonce returns [0u8; SIGNATURE_LEN], so confirm contains all-zero sig
-    let confirm_buffer = build_handshake_confirm_buffer(
+    let (confirm_buffer, confirm_len) = build_handshake_confirm_buffer(
         sensor_mac(),
         battery_level,
         gateway_mac(),
@@ -69,14 +61,30 @@ fn ok() {
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&request_buffer, mode));
+    expectations.extend(expectations_for_send(
+        &request_buffer[..request_len],
+        mode,
+    ));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &challenge_buffer,
+        &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));
-    expectations.extend(expectations_for_send(&confirm_buffer, Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
+    expectations.extend(expectations_for_receiver_mode());
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
+    expectations.extend(expectations_for_receiver_mode());
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
@@ -89,16 +97,17 @@ fn ok() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_decrypt,
+        test_ecdh_shared_secret,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
     );
 
-    assert!(result.is_ok());
-    let keys = result.unwrap();
-    assert_eq!(keys.expire_at, 0u32);
-    assert_eq!(keys.timestamp, timestamp);
+    assert!(result.is_ok(), "initiate_handshake returned: {:?}", result);
+    let session = result.unwrap();
+    assert_eq!(session.keys.expire_at, 0u32);
+    assert_eq!(session.keys.timestamp, timestamp);
+    assert_eq!(session.gateway_mac, gateway_mac());
     spi.done();
     cs.done();
     rst.done();
@@ -113,7 +122,7 @@ fn timeout() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -121,11 +130,12 @@ fn timeout() {
         sig_sensor_pubkey,
         timestamp,
     );
+    let req = &request_buffer[..request_len];
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&request_buffer, mode));
+    expectations.extend(expectations_for_send(req, mode));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
+    expectations.extend(expectations_for_sensor_challenge_listen_timeout(req));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
@@ -138,7 +148,7 @@ fn timeout() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_decrypt,
+        test_ecdh_shared_secret,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
@@ -161,7 +171,7 @@ fn verification_failed_sig_sensor_nonce() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let request_buffer = build_handshake_request_buffer(
+    let (request_buffer, request_len) = build_handshake_request_buffer(
         sensor_mac(),
         battery_level,
         sensor_nonce,
@@ -169,7 +179,7 @@ fn verification_failed_sig_sensor_nonce() {
         sig_sensor_pubkey,
         timestamp,
     );
-    let challenge_buffer = build_handshake_challenge_buffer(
+    let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
         [0u8; SIGNATURE_LEN],
@@ -179,12 +189,14 @@ fn verification_failed_sig_sensor_nonce() {
         timestamp,
     );
 
-    // No confirm send expected — verification fails before step 3
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&request_buffer, mode));
+    expectations.extend(expectations_for_send(
+        &request_buffer[..request_len],
+        mode,
+    ));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &challenge_buffer,
+        &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));
@@ -200,7 +212,7 @@ fn verification_failed_sig_sensor_nonce() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_decrypt,
+        test_ecdh_shared_secret,
         |_pk, _sig| false, // reject sig_sensor_nonce
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,

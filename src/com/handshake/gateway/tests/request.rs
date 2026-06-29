@@ -1,7 +1,7 @@
 use crate::com::error::model::ComError;
 use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN,
-    SIGNATURE_LEN,
+    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, GATEWAY_CHALLENGE_RESEND_PERIOD,
+    GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN,
 };
 use crate::com::handshake::gateway::{handle_handshake_request, HandshakeChallenge};
 use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
@@ -40,19 +40,22 @@ fn dummy_gateway_nonce() -> [u8; 32] {
     [0xBB; 32]
 }
 
-/// Test ECIES encrypt: writes plaintext into first CHALLENGE_PLAINTEXT_LEN bytes of out.
-/// Returns dummy shared secret [0xCC; 32].
+/// Test ECIES encrypt: lays out `eph_pubkey[33] || plaintext[133] || …` with non-zero ephemeral prefix.
+/// Returns dummy shared secret `[0xCC; 32]`.
 fn test_encrypt(
     _sensor_pubkey: &[u8; PUBLIC_KEY_LEN],
     plaintext: &[u8; CHALLENGE_PLAINTEXT_LEN],
     out: &mut [u8; ECIES_CIPHERTEXT_LEN],
 ) -> [u8; 32] {
-    out[..CHALLENGE_PLAINTEXT_LEN].copy_from_slice(plaintext);
+    out.fill(0);
+    out[0] = 0x02;
+    out[1..PUBLIC_KEY_LEN].fill(0x33);
+    out[PUBLIC_KEY_LEN..PUBLIC_KEY_LEN + CHALLENGE_PLAINTEXT_LEN].copy_from_slice(plaintext);
     [0xCCu8; 32]
 }
 
 /// Builds the expected `HandshakeChallenge` wire buffer using the test ECIES format.
-fn build_challenge_buffer(timestamp: u32, key_expire_at: u32) -> [u8; HANDSHAKE_MESSAGE_MAX] {
+fn build_challenge_buffer(timestamp: u32, key_expire_at: u32) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
     let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
     plaintext[..SIGNATURE_LEN].copy_from_slice(&dummy_sig()); // sig_sensor_nonce
     plaintext[SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN].copy_from_slice(&dummy_pubkey()); // gateway_pubkey
@@ -62,7 +65,9 @@ fn build_challenge_buffer(timestamp: u32, key_expire_at: u32) -> [u8; HANDSHAKE_
         .copy_from_slice(&key_expire_at.to_be_bytes()); // key_expire_at
 
     let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
-    ciphertext[..CHALLENGE_PLAINTEXT_LEN].copy_from_slice(&plaintext);
+    ciphertext[0] = 0x02;
+    ciphertext[1..PUBLIC_KEY_LEN].fill(0x33);
+    ciphertext[PUBLIC_KEY_LEN..PUBLIC_KEY_LEN + CHALLENGE_PLAINTEXT_LEN].copy_from_slice(&plaintext);
 
     let mut message = MessageSchema::create_body_response(
         sensor_mac(),
@@ -72,12 +77,12 @@ fn build_challenge_buffer(timestamp: u32, key_expire_at: u32) -> [u8; HANDSHAKE_
         timestamp,
     );
     message
-        .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
-        .expect("serialize_clear")
+        .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
+        .expect("serialize_clear_with_len")
 }
 
 /// Builds the `HandshakeConfirm` buffer that the sensor would send back.
-fn build_confirm_buffer(timestamp: u32) -> [u8; HANDSHAKE_MESSAGE_MAX] {
+fn build_confirm_buffer(timestamp: u32) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
     let mut message = MessageSchema::create_body_request(
         sensor_mac(),
         80,
@@ -87,8 +92,8 @@ fn build_confirm_buffer(timestamp: u32) -> [u8; HANDSHAKE_MESSAGE_MAX] {
         timestamp,
     );
     message
-        .serialize_clear::<HANDSHAKE_MESSAGE_MAX>()
-        .expect("serialize_clear")
+        .serialize_clear_with_len::<HANDSHAKE_MESSAGE_MAX>()
+        .expect("serialize_clear_with_len")
 }
 
 fn create_controller(
@@ -119,14 +124,17 @@ fn ok() {
     let key_expire_at = 0u32;
     let mode = Mode::Manual;
 
-    let challenge_buffer = build_challenge_buffer(timestamp, key_expire_at);
-    let confirm_buffer = build_confirm_buffer(timestamp);
+    let (challenge_buffer, challenge_len) = build_challenge_buffer(timestamp, key_expire_at);
+    let (confirm_buffer, confirm_len) = build_confirm_buffer(timestamp);
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&challenge_buffer, mode));
+    expectations.extend(expectations_for_send(
+        &challenge_buffer[..challenge_len],
+        mode,
+    ));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &confirm_buffer,
+        &confirm_buffer[..confirm_len],
         0x42,
         Mode::Receiver,
     ));
@@ -166,12 +174,20 @@ fn timeout() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let challenge_buffer = build_challenge_buffer(timestamp, 0u32);
+    let (challenge_buffer, challenge_len) = build_challenge_buffer(timestamp, 0u32);
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&challenge_buffer, mode));
-    expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_receive_no_packet(4, Mode::Receiver));
+    let challenge_rounds = GATEWAY_CONFIRM_RX_TIMEOUT / GATEWAY_CHALLENGE_RESEND_PERIOD;
+    for _ in 0..challenge_rounds {
+        expectations.extend(expectations_for_send(
+            &challenge_buffer[..challenge_len],
+            Mode::Receiver,
+        ));
+        expectations.extend(expectations_for_receive_no_packet(
+            GATEWAY_CHALLENGE_RESEND_PERIOD,
+            Mode::Receiver,
+        ));
+    }
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
@@ -239,14 +255,17 @@ fn verification_failed_sig_gateway_nonce() {
     let timestamp = 260691u32;
     let mode = Mode::Manual;
 
-    let challenge_buffer = build_challenge_buffer(timestamp, 0u32);
-    let confirm_buffer = build_confirm_buffer(timestamp);
+    let (challenge_buffer, challenge_len) = build_challenge_buffer(timestamp, 0u32);
+    let (confirm_buffer, confirm_len) = build_confirm_buffer(timestamp);
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(&challenge_buffer, mode));
+    expectations.extend(expectations_for_send(
+        &challenge_buffer[..challenge_len],
+        mode,
+    ));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
-        &confirm_buffer,
+        &confirm_buffer[..confirm_len],
         0x42,
         Mode::Receiver,
     ));

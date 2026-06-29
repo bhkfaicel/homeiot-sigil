@@ -163,12 +163,18 @@ impl Sigil {
                 // Fallback key used only for unauthenticated ACK responses (not a session key)
                 const FALLBACK_ACK_KEY: [u8; 32] = [0x26; 32];
                 let nonce = [0u8; 12];
-                let buffer = ack_message
-                    .serialize::<256>(&FALLBACK_ACK_KEY, &nonce, None)
+                let (buffer, len) = ack_message
+                    .serialize_with_len::<256>(&FALLBACK_ACK_KEY, &nonce, None)
                     .map_err(ComError::Custom)?;
+                if len > crate::models::common::LORA_USER_PAYLOAD_MAX {
+                    return Err(ComError::MessageTooLong {
+                        length: len,
+                        max: crate::models::common::LORA_USER_PAYLOAD_MAX,
+                    });
+                }
 
                 lora.set_mode(lora::sx1278::Mode::Manual, delay);
-                lora.send(&buffer, &mut delay)?;
+                lora.send(&buffer[..len], &mut delay)?;
                 lora.set_mode(mode, delay);
                 return Err(ComError::Custom(
                     "No key available for this message type and destination",

@@ -20,6 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.RUNNER_TOKEN }}
+          fetch-depth: 0
 
       - name: Bump rc version to stable and create tag
         env:

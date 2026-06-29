@@ -12,6 +12,9 @@ use chacha20poly1305::aead::heapless::Vec;
 /// into the envelope used by `serialize::<N>()` (e.g. init uses 256). Header is ~47 bytes.
 pub const ENCRYPTED_BODY_MAX: usize = 200;
 
+/// Maximum user bytes passed to `lora::Controller::send` (254: one FIFO byte for compression flag).
+pub const LORA_USER_PAYLOAD_MAX: usize = 254;
+
 #[derive(Decode, Encode, Debug, Clone, Copy, PartialEq)]
 pub struct EncryptedSchema {
     pub header: HeaderSchema,
@@ -212,14 +215,22 @@ impl MessageSchema {
         nonce: &[u8; 12],
         aad: Option<&[u8]>,
     ) -> Result<[u8; N], &'static str> {
-        // ) -> Result<[u8; N], CommonModelsError> {
+        Ok(self.serialize_with_len::<N>(key, nonce, aad)?.0)
+    }
+
+    /// Serializes an encrypted envelope and returns `(buffer, encoded_len)`.
+    pub fn serialize_with_len<const N: usize>(
+        &mut self,
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: Option<&[u8]>,
+    ) -> Result<([u8; N], usize), &'static str> {
         let mut body_slice: [u8; N] = [0u8; N];
         let length =
             bincode::encode_into_slice(&self.body, &mut body_slice, bincode::config::standard())
                 .map_err(|_| "Body serialization failed")?;
         let mut encrypted_body_buffer =
             Vec::<u8, N>::from_slice(&body_slice[..length]).map_err(|_| "buffer too small")?;
-        // .map_err(|_| CommonModelsError::BufferTooSmall)?;
 
         let size = encrypt(&mut encrypted_body_buffer, key, nonce, aad)?;
         self.header.size = size as u8;
@@ -231,9 +242,9 @@ impl MessageSchema {
             body,
         };
         let mut slice: [u8; N] = [0u8; N];
-        bincode::encode_into_slice(result, &mut slice, bincode::config::standard())
+        let len = bincode::encode_into_slice(result, &mut slice, bincode::config::standard())
             .map_err(|_| "Envelope serialization failed")?;
-        Ok(slice)
+        Ok((slice, len))
     }
 
     /// Serialize the full `MessageSchema` in **clear text**, without encryption
@@ -248,10 +259,18 @@ impl MessageSchema {
     /// - Integrity/authenticity: expected to be provided by a signature
     ///   checked at application level.
     pub fn serialize_clear<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
+        Ok(self.serialize_clear_with_len::<N>()?.0)
+    }
+
+    /// Serializes a clear-text message and returns `(buffer, encoded_len)`.
+    ///
+    /// Callers must pass only `&buffer[..encoded_len]` to LoRa TX — trailing zeros break
+    /// `deserialize_clear` on the receiver and can exceed the SX1278 user payload limit.
+    pub fn serialize_clear_with_len<const N: usize>(&mut self) -> Result<([u8; N], usize), &'static str> {
         let mut slice: [u8; N] = [0u8; N];
-        bincode::encode_into_slice(&*self, &mut slice, bincode::config::standard())
+        let len = bincode::encode_into_slice(&*self, &mut slice, bincode::config::standard())
             .map_err(|_| "Envelope serialization failed")?;
-        Ok(slice)
+        Ok((slice, len))
     }
 }
 

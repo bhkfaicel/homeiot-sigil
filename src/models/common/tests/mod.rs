@@ -2,7 +2,8 @@ use crate::{
     com::handshake::{PUBLIC_KEY_LEN, SIGNATURE_LEN, HANDSHAKE_MESSAGE_MAX},
     models::common::{
         BodySchema, Destination::AllGateways, MessageSchema, MessageType,
-        RequestType, Status, TIMESTAMP_NOT_AVAILABLE, ENCRYPTED_BODY_MAX, deserialize_body,
+        RequestType, Status, TIMESTAMP_NOT_AVAILABLE, ENCRYPTED_BODY_MAX, LORA_USER_PAYLOAD_MAX,
+        deserialize_body,
     },
     com::handshake::sensor::HandshakeRequest,
 };
@@ -13,6 +14,31 @@ fn dummy_pubkey() -> [u8; PUBLIC_KEY_LEN] {
 
 fn dummy_sig() -> [u8; SIGNATURE_LEN] {
     [0u8; SIGNATURE_LEN]
+}
+
+#[test]
+fn clear_handshake_request_fits_lora_and_deserializes_without_padding() {
+    use crate::models::common::deserialize_clear;
+
+    let src: [u8; 17] = *b"26:06:91:67:89:AB";
+    let mut message = MessageSchema::create_body_request(
+        src,
+        100,
+        AllGateways,
+        MessageType::HandshakeRequest,
+        RequestType::HandshakeRequest(HandshakeRequest::new(
+            [0xAA; 32],
+            dummy_pubkey(),
+            dummy_sig(),
+        )),
+        TIMESTAMP_NOT_AVAILABLE,
+    );
+    let (buffer, len) = message
+        .serialize_clear_with_len::<{ HANDSHAKE_MESSAGE_MAX }>()
+        .expect("serialize_clear_with_len");
+    assert!(len <= LORA_USER_PAYLOAD_MAX);
+    assert!(len < HANDSHAKE_MESSAGE_MAX);
+    assert!(deserialize_clear::<HANDSHAKE_MESSAGE_MAX>(&buffer[..len]).is_ok());
 }
 
 #[test]
@@ -36,16 +62,13 @@ fn test_message_serialize_deserialize() {
 
     let mut msg = original_msg.clone();
 
-    // Serialize
     let buffer = msg
         .serialize::<{ HANDSHAKE_MESSAGE_MAX }>(&key, &nonce, None)
         .expect("Serialization failed");
 
-    // Deserialize
     let parsed_msg =
         super::deserialize::<{ HANDSHAKE_MESSAGE_MAX }>(&buffer).expect("Deserialization failed");
 
-    // Assert header fields
     assert_eq!(parsed_msg.header.src, original_msg.header.src);
     assert_eq!(parsed_msg.header.dist, original_msg.header.dist);
     assert_eq!(
@@ -61,7 +84,6 @@ fn test_message_serialize_deserialize() {
         None,
     )
     .unwrap();
-    // Assert body content
     match (message.body, &original_msg.body) {
         (
             BodySchema::RequestType(RequestType::HandshakeRequest(a)),

@@ -8,7 +8,7 @@ mod tests {
     use crate::com::keys::KeyManager;
     use crate::models::common::Destination::OneDestination;
     use crate::models::common::TIMESTAMP_NOT_AVAILABLE;
-    use crate::models::common::{MessageSchema, MessageType, RequestType, ResponseType, Status};
+    use crate::models::common::{MessageSchema, MessageType, RequestType, ResponseType, Status, LORA_USER_PAYLOAD_MAX};
 
     use lora::sx1278::tests::common::{expectations_for_new, expectations_for_send};
     use lora::sx1278::{Controller, Mode};
@@ -37,11 +37,12 @@ mod tests {
             RequestType::Event(event),
             timestamp,
         );
-        let buffer = message
-            .serialize::<256>(&event_key, &nonce, None)
+        let (buffer, len) = message
+            .serialize_with_len::<255>(&event_key, &nonce, None)
             .expect("serialize");
+        assert!(len <= LORA_USER_PAYLOAD_MAX);
         let mut expectations = expectations_for_new(mode);
-        expectations.extend(expectations_for_send(&buffer, mode));
+        expectations.extend(expectations_for_send(&buffer[..len], mode));
         let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
         let mut controller =
             Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
@@ -87,11 +88,12 @@ mod tests {
             }),
             timestamp,
         );
-        let buffer = message
-            .serialize::<256>(&event_key, &nonce, None)
+        let (buffer, len) = message
+            .serialize_with_len::<255>(&event_key, &nonce, None)
             .expect("serialize");
+        assert!(len <= LORA_USER_PAYLOAD_MAX);
         let mut expectations = expectations_for_new(mode);
-        expectations.extend(expectations_for_send(&buffer, mode));
+        expectations.extend(expectations_for_send(&buffer[..len], mode));
         let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
         let mut controller =
             Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
@@ -135,11 +137,12 @@ mod tests {
             RequestType::Event(event),
             TIMESTAMP_NOT_AVAILABLE,
         );
-        let buffer = message
-            .serialize::<256>(&event_key, &nonce, None)
+        let (buffer, len) = message
+            .serialize_with_len::<255>(&event_key, &nonce, None)
             .expect("serialize");
+        assert!(len <= LORA_USER_PAYLOAD_MAX);
         let mut expectations = expectations_for_new(mode);
-        expectations.extend(expectations_for_send(&buffer, mode));
+        expectations.extend(expectations_for_send(&buffer[..len], mode));
         let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
         let mut controller =
             Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
