@@ -1,6 +1,39 @@
 pub mod gateway;
 pub mod sensor;
 
+use core::fmt;
+
+/// Failure modes for ECIES challenge encryption / decryption ([`encrypt_challenge`], [`decrypt_challenge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeCryptoError {
+    /// HKDF-SHA256 expand failed (unexpected for fixed output lengths used here).
+    HkdfExpandFailed,
+    /// Fixed-size heapless buffer could not accept the payload.
+    BufferCapacity,
+    /// ChaCha20-Poly1305 encryption failed.
+    AeadEncryptFailed,
+    /// ChaCha20-Poly1305 decryption failed (bad key, truncated ciphertext, or auth tag mismatch).
+    AeadDecryptFailed,
+    /// The ECDH callback returned `Err` (hardware / key slot error).
+    EcdhFailed,
+    /// Ciphertext layout was not the expected fixed size.
+    InvalidCiphertextLayout,
+}
+
+impl fmt::Display for ChallengeCryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::HkdfExpandFailed => "HKDF expand failed",
+            Self::BufferCapacity => "buffer capacity exceeded",
+            Self::AeadEncryptFailed => "AEAD encrypt failed",
+            Self::AeadDecryptFailed => "AEAD decrypt failed",
+            Self::EcdhFailed => "ECDH shared secret failed",
+            Self::InvalidCiphertextLayout => "invalid ECIES ciphertext layout",
+        };
+        f.write_str(s)
+    }
+}
+
 /// P-256 compressed public key size (1-byte prefix + 32-byte X coordinate).
 pub const PUBLIC_KEY_LEN: usize = 33;
 /// ECDSA P-256 signature size (r || s, 32 + 32 bytes).
@@ -49,13 +82,17 @@ pub const GATEWAY_CHALLENGE_RESEND_PERIOD: usize = 10;
 ///
 /// On success, this function fills `out` with:
 /// `ephemeral_pubkey[33] || chacha_nonce[12] || ciphertext[133] || poly1305_tag[16]`.
+///
+/// # Errors
+///
+/// Returns [`ChallengeCryptoError`] if HKDF expansion, buffering, or AEAD encryption fails.
 pub fn encrypt_challenge(
     eph_pubkey_compressed: &[u8; PUBLIC_KEY_LEN],
     shared_secret: &[u8; 32],
     chacha_nonce: &[u8; 12],
     plaintext: &[u8; CHALLENGE_PLAINTEXT_LEN],
     out: &mut [u8; ECIES_CIPHERTEXT_LEN],
-) -> Result<(), ()> {
+) -> Result<(), ChallengeCryptoError> {
     use chacha20poly1305::aead::heapless::Vec as HVec;
     use chacha20poly1305::aead::AeadInPlace;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
@@ -65,15 +102,17 @@ pub fn encrypt_challenge(
     // Derive encryption key via HKDF-SHA256 (same salt/info as decrypt_challenge).
     let hkdf = Hkdf::<Sha256>::new(Some(eph_pubkey_compressed), shared_secret);
     let mut enc_key = [0u8; 32];
-    hkdf.expand(b"ecies-enc", &mut enc_key).map_err(|_| ())?;
+    hkdf.expand(b"ecies-enc", &mut enc_key)
+        .map_err(|_| ChallengeCryptoError::HkdfExpandFailed)?;
 
     // Encrypt plaintext in-place with ChaCha20Poly1305 (appends 16-byte tag).
     let mut buf: HVec<u8, { CHALLENGE_PLAINTEXT_LEN + 16 }> = HVec::new();
-    buf.extend_from_slice(plaintext).map_err(|_| ())?;
+    buf.extend_from_slice(plaintext)
+        .map_err(|_| ChallengeCryptoError::BufferCapacity)?;
     let cipher = ChaCha20Poly1305::new((&enc_key).into());
     cipher
-        .encrypt_in_place((&(*chacha_nonce)).into(), b"", &mut buf)
-        .map_err(|_| ())?;
+        .encrypt_in_place(chacha_nonce.into(), b"", &mut buf)
+        .map_err(|_| ChallengeCryptoError::AeadEncryptFailed)?;
 
     // Layout: eph_pubkey[33] || chacha_nonce[12] || ciphertext+tag[145]
     out[0..PUBLIC_KEY_LEN].copy_from_slice(eph_pubkey_compressed);
@@ -95,11 +134,16 @@ pub fn encrypt_challenge(
 /// the 32-byte ECDH shared secret from the gateway's ephemeral public key
 /// (P-256, compressed SEC1). On success, this function writes the 133-byte plaintext
 /// into `out` and returns the shared secret.
+///
+/// # Errors
+///
+/// Returns [`ChallengeCryptoError`] on ECDH failure, HKDF/AEAD failure, or authentication failure.
+/// The ECDH callback keeps `Result<_, ()>` so embedded callers need not name this type.
 pub fn decrypt_challenge<FECDH>(
     ciphertext: &[u8; ECIES_CIPHERTEXT_LEN],
     out: &mut [u8; CHALLENGE_PLAINTEXT_LEN],
     ecdh_shared_secret: &mut FECDH,
-) -> Result<[u8; 32], ()>
+) -> Result<[u8; 32], ChallengeCryptoError>
 where
     FECDH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
 {
@@ -111,28 +155,32 @@ where
     use sha2::Sha256;
 
     // Parse ECIES layout
-    let eph_pubkey_compressed: [u8; PUBLIC_KEY_LEN] =
-        ciphertext[0..PUBLIC_KEY_LEN].try_into().map_err(|_| ())?;
+    let eph_pubkey_compressed: [u8; PUBLIC_KEY_LEN] = ciphertext[0..PUBLIC_KEY_LEN]
+        .try_into()
+        .map_err(|_| ChallengeCryptoError::InvalidCiphertextLayout)?;
     let chacha_nonce: [u8; 12] = ciphertext[PUBLIC_KEY_LEN..PUBLIC_KEY_LEN + 12]
         .try_into()
-        .map_err(|_| ())?;
+        .map_err(|_| ChallengeCryptoError::InvalidCiphertextLayout)?;
     let ct_and_tag = &ciphertext[PUBLIC_KEY_LEN + 12..];
 
     // Step 1: compute ECDH shared secret via caller callback
-    let shared_secret = ecdh_shared_secret(&eph_pubkey_compressed)?;
+    let shared_secret = ecdh_shared_secret(&eph_pubkey_compressed)
+        .map_err(|_| ChallengeCryptoError::EcdhFailed)?;
 
     // Step 2: derive encryption key via HKDF-SHA256 (same salt/info as gateway).
     let hkdf = Hkdf::<Sha256>::new(Some(&eph_pubkey_compressed), &shared_secret);
     let mut enc_key = [0u8; 32];
-    hkdf.expand(b"ecies-enc", &mut enc_key).map_err(|_| ())?;
+    hkdf.expand(b"ecies-enc", &mut enc_key)
+        .map_err(|_| ChallengeCryptoError::HkdfExpandFailed)?;
 
     // Step 3: decrypt ChaCha20Poly1305 in-place into a heapless buffer.
     let mut buf: HVec<u8, { CHALLENGE_PLAINTEXT_LEN + 16 }> = HVec::new();
-    buf.extend_from_slice(ct_and_tag).map_err(|_| ())?;
+    buf.extend_from_slice(ct_and_tag)
+        .map_err(|_| ChallengeCryptoError::BufferCapacity)?;
     let cipher = ChaCha20Poly1305::new((&enc_key).into());
     cipher
         .decrypt_in_place((&chacha_nonce).into(), b"", &mut buf)
-        .map_err(|_| ())?;
+        .map_err(|_| ChallengeCryptoError::AeadDecryptFailed)?;
 
     out.copy_from_slice(&buf.as_slice()[..CHALLENGE_PLAINTEXT_LEN]);
     Ok(shared_secret)

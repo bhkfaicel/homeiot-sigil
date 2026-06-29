@@ -181,8 +181,9 @@ where
                 // finish ATECC verification/ECDH and TX the challenge (avoids half-duplex collision).
                 const REBROADCAST_FIRST_ATTEMPT: u16 = 50;
                 const REBROADCAST_INTERVAL: u16 = 50;
-                if attempt >= REBROADCAST_FIRST_ATTEMPT
-                    && (attempt - REBROADCAST_FIRST_ATTEMPT) % REBROADCAST_INTERVAL == 0
+                if attempt >= REBROADCAST_FIRST_ATTEMPT as usize
+                    && (attempt - REBROADCAST_FIRST_ATTEMPT as usize)
+                        .is_multiple_of(REBROADCAST_INTERVAL as usize)
                 {
                     lora.set_mode(lora::sx1278::Mode::Manual, delay);
                     lora.send(&buffer[..len], delay)?;
@@ -327,11 +328,12 @@ where
             &mut ecdh_shared_secret,
         ) {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
                 log::debug!(
-                    "handshake(sensor): wait_challenge attempt {}/{}: ECIES decrypt failed",
+                    "handshake(sensor): wait_challenge attempt {}/{}: ECIES error: {}",
                     attempt + 1,
-                    rx_timeout
+                    rx_timeout,
+                    e
                 );
                 // Challenge reached the sensor, but decrypt failed:
                 // likely ECDH/key-configuration mismatch or malformed ciphertext.

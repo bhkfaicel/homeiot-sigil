@@ -7,9 +7,9 @@ use crate::com::handshake::sensor::tests::helpers::{
 };
 use crate::com::handshake::sensor::{HandshakeRequest, initiate_handshake};
 use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, GATEWAY_CHALLENGE_RESEND_PERIOD,
-    GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN,
-    decrypt_challenge, encrypt_challenge,
+    CHALLENGE_PLAINTEXT_LEN, ChallengeCryptoError, ECIES_CIPHERTEXT_LEN,
+    GATEWAY_CHALLENGE_RESEND_PERIOD, GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX,
+    PUBLIC_KEY_LEN, SIGNATURE_LEN, decrypt_challenge, encrypt_challenge,
 };
 use lora::sx1278::tests::common::{
     expectations_for_new, expectations_for_receive_no_packet, expectations_for_receive_success,
@@ -111,6 +111,25 @@ fn decrypt_challenge_roundtrip() {
 
     assert_eq!(out, plaintext);
     assert_eq!(returned_secret, shared_secret);
+}
+
+#[test]
+fn decrypt_challenge_fails_when_ecdh_returns_wrong_secret() {
+    let plaintext = [0xABu8; CHALLENGE_PLAINTEXT_LEN];
+    let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
+    encrypt_challenge(
+        &[0x11u8; PUBLIC_KEY_LEN],
+        &[0x22u8; 32],
+        &[0x33u8; 12],
+        &plaintext,
+        &mut ciphertext,
+    )
+    .expect("encrypt");
+
+    let mut out = [0u8; CHALLENGE_PLAINTEXT_LEN];
+    let mut ecdh = |_pk: &[u8; PUBLIC_KEY_LEN]| -> Result<[u8; 32], ()> { Ok([0xFFu8; 32]) };
+    let err = decrypt_challenge(&ciphertext, &mut out, &mut ecdh).unwrap_err();
+    assert_eq!(err, ChallengeCryptoError::AeadDecryptFailed);
 }
 
 /// Both sides complete the full 3-step exchange and independently derive the same session key.
