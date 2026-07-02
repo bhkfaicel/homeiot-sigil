@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to semantic versioning.
 
----
+## [0.2.2-rc.0] - 2026-07-02
+
+### Changed
+
+- `lora` dependency updated to **`0.3.0-rc.0`** (registry `forgejorc`).
 
 ## [0.2.1-rc.7] - 2026-06-29
 

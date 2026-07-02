@@ -181,7 +181,9 @@ impl ValidatedKey {
     pub fn new(key: Keys, received_at_ticks: u64) -> Self {
         let duration_seconds = if key.expire_at == 0 {
             u32::MAX // Never expires
-        } else { key.expire_at.saturating_sub(key.timestamp) };
+        } else {
+            key.expire_at.saturating_sub(key.timestamp)
+        };
 
         Self {
             key,
