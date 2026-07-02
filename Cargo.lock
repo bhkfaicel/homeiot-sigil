@@ -297,9 +297,9 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lora"
-version = "0.2.0-rc.7"
+version = "0.3.0-rc.0"
 source = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot-rc/cargo/"
-checksum = "375f6f1020a24e260755795c60b51cb4a37d043ed72de466eb592f670959c46a"
+checksum = "0c46f36cc60c475921c142714ee0f571757c196b60990837272588ff15064750"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-mock",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "sigil"
-version = "0.2.1-rc.7"
+version = "0.2.2-rc.0"
 dependencies = [
  "bincode",
  "chacha20poly1305",
