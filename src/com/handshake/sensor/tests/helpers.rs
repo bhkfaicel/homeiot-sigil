@@ -2,8 +2,11 @@ use crate::com::handshake::{
     CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX,
     PUBLIC_KEY_LEN, SIGNATURE_LEN, encrypt_challenge,
 };
-use crate::com::handshake::gateway::HandshakeChallenge;
-use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
+use crate::com::handshake::install_core::{
+    HandshakeChallenge, HandshakeConfirm, SENSOR_CHALLENGE_RX_TIMEOUT,
+    SENSOR_REBROADCAST_FIRST_ATTEMPT, SENSOR_REBROADCAST_INTERVAL,
+};
+use crate::com::handshake::install::sensor::HandshakeRequest;
 use crate::models::common::{
     Destination::{AllGateways, OneDestination},
     MessageSchema, MessageType, RequestType, ResponseType,
@@ -20,21 +23,21 @@ use lora::sx1278::tests::common::{
     expectations_for_receiver_mode, expectations_for_send,
 };
 
-/// Must match `initiate_handshake` challenge listen loop in `sensor/mod.rs`.
-const SENSOR_CHALLENGE_RX_TIMEOUT: usize = 800;
-const SENSOR_REBROADCAST_FIRST_ATTEMPT: u16 = 50;
-const SENSOR_REBROADCAST_INTERVAL: u16 = 50;
+/// Must match `complete_session_as_sensor` challenge listen loop in `core/sensor.rs`.
+const SENSOR_CHALLENGE_RX_TIMEOUT_LOCAL: usize = SENSOR_CHALLENGE_RX_TIMEOUT;
+const SENSOR_REBROADCAST_FIRST_ATTEMPT_LOCAL: u16 = SENSOR_REBROADCAST_FIRST_ATTEMPT;
+const SENSOR_REBROADCAST_INTERVAL_LOCAL: u16 = SENSOR_REBROADCAST_INTERVAL;
 
 /// SPI expectations for the sensor waiting until `ComError::Timeout` (no challenge received).
 pub fn expectations_for_sensor_challenge_listen_timeout(
     rebroadcast_payload: &[u8],
 ) -> vec::Vec<SpiTransaction<u8>> {
     let mut expectations = vec![];
-    for attempt in 0..SENSOR_CHALLENGE_RX_TIMEOUT {
+    for attempt in 0..SENSOR_CHALLENGE_RX_TIMEOUT_LOCAL {
         expectations.extend(expectations_for_receive_no_packet(1, Mode::Receiver));
-        if attempt as u16 >= SENSOR_REBROADCAST_FIRST_ATTEMPT
-            && (attempt as u16 - SENSOR_REBROADCAST_FIRST_ATTEMPT)
-                .is_multiple_of(SENSOR_REBROADCAST_INTERVAL)
+        if attempt as u16 >= SENSOR_REBROADCAST_FIRST_ATTEMPT_LOCAL
+            && (attempt as u16 - SENSOR_REBROADCAST_FIRST_ATTEMPT_LOCAL)
+                .is_multiple_of(SENSOR_REBROADCAST_INTERVAL_LOCAL)
         {
             expectations.extend(expectations_for_send(rebroadcast_payload, Mode::Receiver));
         }
