@@ -114,3 +114,46 @@ fn test_key_manager_usage_separation() {
     assert_ne!(installation_key, control_key);
     assert_ne!(validation_key, control_key);
 }
+
+fn ticks_for_seconds(seconds: u32) -> u64 {
+    seconds as u64 * ValidatedKey::RTC_FREQ
+}
+
+fn keys_with_100s_lifetime() -> Keys {
+    Keys {
+        key: [0xAB; 32],
+        timestamp: 1_000,
+        expire_at: 1_100,
+    }
+}
+
+#[test]
+fn validated_key_never_expires_when_expire_at_is_zero() {
+    let keys = Keys {
+        key: [0xCD; 32],
+        timestamp: 1_000,
+        expire_at: 0,
+    };
+    let validated = ValidatedKey::new(keys, 0);
+    let far_future = ticks_for_seconds(u32::MAX / ValidatedKey::RTC_FREQ as u32);
+
+    assert!(validated.is_valid(far_future));
+    assert!(!validated.should_renew(far_future));
+}
+
+#[test]
+fn validated_key_should_renew_at_seventy_five_percent_elapsed() {
+    let validated = ValidatedKey::new(keys_with_100s_lifetime(), 0);
+    let at_threshold = ticks_for_seconds(75);
+
+    assert!(validated.is_valid(at_threshold));
+    assert!(validated.should_renew(at_threshold));
+}
+
+#[test]
+fn validated_key_is_invalid_after_duration_elapsed() {
+    let validated = ValidatedKey::new(keys_with_100s_lifetime(), 0);
+
+    assert!(!validated.is_valid(ticks_for_seconds(100)));
+    assert!(validated.should_renew(ticks_for_seconds(100)));
+}

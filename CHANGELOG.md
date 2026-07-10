@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to semantic versioning.
 
+## [0.3.0-rc.0] 2026-07-10
+
+### Added
+
+- **Lightweight session key renew** (`com::handshake::renew`): `renew_session()` (sensor) and
+  `handle_renew_request()` (gateway) using encrypted `KeyRenewRequest` → `KeyRenewChallenge` →
+  `KeyRenewAck` — **ECDH only**, no ECDSA signatures and no ECIES 194B challenge on the renew path.
+- New `MessageType` values: `KeyRenewRequest`, `KeyRenewChallenge`, `KeyRenewAck`.
+- `ValidatedKey` expiry helpers (`is_valid`, `should_renew`) with unit tests.
+- Handshake module layout: `primitives/`, `lora_helpers/`, `install_core/`, `renew_core/`.
+- Sequence diagrams: `diagramme/install.mermaid`, `diagramme/renew.mermaid`.
+
+### Changed
+
+- **Breaking (renew API):** `renew_session()` no longer accepts ECDSA callbacks
+  (`verify_sig_sensor_nonce`, `sign_gateway_nonce`). Only `ecdh_shared_secret` is required.
+- **Breaking (renew API):** `handle_renew_request()` no longer accepts `ecies_encrypt`,
+  `verify_sig_gateway_nonce`, or gateway identity fields for signing. It takes
+  `session_key`, `chacha_nonce`, and `ecdh_ephemeral` instead.
+- Install flow unchanged: `initiate_handshake()` / `handle_handshake_request()` still use
+  ECIES + ECDSA for first-time pairing.
+
+### Migration
+
+- Deploy **sensor and gateway firmware together** when upgrading renew: the lightweight renew
+  protocol is not wire-compatible with re-running the full install handshake for renewal.
+
+---
+
 ## [0.2.2-rc.0] - 2026-07-02
 
 ### Changed

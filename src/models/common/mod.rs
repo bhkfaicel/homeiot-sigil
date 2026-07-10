@@ -1,6 +1,8 @@
 use crate::com::event::message::Event;
-use crate::com::handshake::gateway::HandshakeChallenge;
-use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
+use crate::com::handshake::install_core::{HandshakeChallenge, HandshakeConfirm};
+use crate::com::handshake::install::sensor::HandshakeRequest;
+use crate::com::handshake::renew::sensor::KeyRenewRequest;
+use crate::com::handshake::renew_core::{KeyRenewAck, KeyRenewChallenge};
 use crate::crypto::{decrypt, encrypt};
 use crate::models::common::Destination::OneDestination;
 use bincode::{Decode, Encode};
@@ -104,6 +106,12 @@ pub enum MessageType {
     HandshakeChallenge,
     /// Secure handshake Step 3: sensor confirms by signing the gateway nonce.
     HandshakeConfirm,
+    /// Session key renewal trigger (encrypted with the current session key).
+    KeyRenewRequest,
+    /// Lightweight renew challenge (encrypted with the current session key).
+    KeyRenewChallenge,
+    /// Lightweight renew acknowledgment (encrypted with the current session key).
+    KeyRenewAck,
 }
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
@@ -121,6 +129,10 @@ pub enum RequestType {
     HandshakeRequest(HandshakeRequest),
     /// Secure handshake Step 3: sensor confirms by signing the gateway nonce.
     HandshakeConfirm(HandshakeConfirm),
+    /// Session key renewal trigger (encrypted with the current session key).
+    KeyRenewRequest(KeyRenewRequest),
+    /// Lightweight renew acknowledgment (encrypted with the current session key).
+    KeyRenewAck(KeyRenewAck),
 }
 
 /// Acknowledgment structure for confirming receipt and processing of messages.
@@ -143,6 +155,8 @@ pub enum ResponseType {
     Event(Ack),
     /// Secure handshake Step 2: gateway sends ECIES-encrypted challenge.
     HandshakeChallenge(HandshakeChallenge),
+    /// Lightweight renew challenge (encrypted with the current session key).
+    KeyRenewChallenge(KeyRenewChallenge),
 }
 
 #[derive(Encode, Decode, Debug, Clone)]
