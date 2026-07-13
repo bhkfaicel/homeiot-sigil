@@ -47,15 +47,14 @@ where
         let receive_result = match lora.receive::<SpiErr, _>(&mut recv_buffer, delay) {
             Ok(r) => r,
             Err(LoRaError::NoPacket) => {
-                if let Some((payload, payload_len)) = rebroadcast_payload {
-                    if attempt >= SENSOR_REBROADCAST_FIRST_ATTEMPT as usize
-                        && (attempt - SENSOR_REBROADCAST_FIRST_ATTEMPT as usize)
-                            .is_multiple_of(SENSOR_REBROADCAST_INTERVAL as usize)
-                    {
-                        lora.set_mode(lora::sx1278::Mode::Manual, delay);
-                        lora.send(&payload[..payload_len], delay)?;
-                        lora.set_mode(lora::sx1278::Mode::Receiver, delay);
-                    }
+                if let Some((payload, payload_len)) = rebroadcast_payload
+                    && attempt >= SENSOR_REBROADCAST_FIRST_ATTEMPT as usize
+                    && (attempt - SENSOR_REBROADCAST_FIRST_ATTEMPT as usize)
+                        .is_multiple_of(SENSOR_REBROADCAST_INTERVAL as usize)
+                {
+                    lora.set_mode(lora::sx1278::Mode::Manual, delay);
+                    lora.send(&payload[..payload_len], delay)?;
+                    lora.set_mode(lora::sx1278::Mode::Receiver, delay);
                 }
                 delay.delay_ms(120u32);
                 continue;
