@@ -3,7 +3,9 @@ use crate::com::handshake::gateway::handle_handshake_request;
 use crate::com::handshake::sensor::tests::helpers::{
     build_handshake_challenge_buffer, build_handshake_confirm_buffer,
     build_handshake_request_buffer, create_controller,
-    expectations_for_sensor_challenge_listen_timeout,
+    expectations_for_sensor_challenge_listen_timeout, test_ecdh_ephemeral_with_peer,
+    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY,
+    TEST_SENSOR_EPH_PUBKEY,
 };
 use crate::com::handshake::sensor::{HandshakeRequest, initiate_handshake};
 use crate::com::handshake::{
@@ -38,33 +40,6 @@ fn gateway_confirm_rx_timeout_is_three_times_previous_default() {
         18,
         "challenge re-send rounds during a full timeout window"
     );
-}
-
-/// Fake ECIES encrypt: generates a deterministic ECIES ciphertext via `encrypt_challenge`.
-/// Returns a dummy shared secret [0xCC; 32] that matches `test_ecdh_shared_secret`.
-fn test_encrypt(
-    _sensor_pubkey: &[u8; PUBLIC_KEY_LEN],
-    plaintext: &[u8; CHALLENGE_PLAINTEXT_LEN],
-    out: &mut [u8; ECIES_CIPHERTEXT_LEN],
-) -> [u8; 32] {
-    let eph_pubkey_compressed = [0x11u8; PUBLIC_KEY_LEN];
-    let shared_secret = [0xCCu8; 32];
-    let chacha_nonce = [0x22u8; 12];
-    encrypt_challenge(
-        &eph_pubkey_compressed,
-        &shared_secret,
-        &chacha_nonce,
-        plaintext,
-        out,
-    )
-    .expect("encrypt_challenge");
-    shared_secret
-}
-
-/// Fake ECIES decrypt: reads the first CHALLENGE_PLAINTEXT_LEN bytes of ciphertext as plaintext.
-/// Returns the same dummy shared secret [0xCC; 32] so both sides derive the same session key.
-fn test_ecdh_shared_secret(_eph_pubkey_compressed: &[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()> {
-    Ok([0xCCu8; 32])
 }
 
 /// Unit test for `decrypt_challenge`: encrypts a plaintext with the same layout and
@@ -153,6 +128,7 @@ fn session_keys_match() {
     let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
+        TEST_GW_EPH_PUBKEY,
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
@@ -164,6 +140,7 @@ fn session_keys_match() {
         battery_level,
         gateway_mac(),
         [0u8; SIGNATURE_LEN],
+        TEST_SENSOR_EPH_PUBKEY,
         timestamp,
     );
 
@@ -234,7 +211,7 @@ fn session_keys_match() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
@@ -244,7 +221,8 @@ fn session_keys_match() {
     let gateway_result = handle_handshake_request(
         &request,
         |_pk, _sig| true,
-        test_encrypt,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         sensor_mac(),
         gateway_mac(),
         [0u8; PUBLIC_KEY_LEN],
@@ -333,7 +311,7 @@ fn gateway_rejects_sensor() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
@@ -343,7 +321,8 @@ fn gateway_rejects_sensor() {
     let gateway_result = handle_handshake_request(
         &request,
         |_pk, _sig| false, // reject sensor identity
-        test_encrypt,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         sensor_mac(),
         gateway_mac(),
         [0u8; PUBLIC_KEY_LEN],
@@ -388,6 +367,7 @@ fn sensor_rejects_gateway() {
     let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
+        TEST_GW_EPH_PUBKEY,
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
@@ -399,6 +379,7 @@ fn sensor_rejects_gateway() {
         battery_level,
         gateway_mac(),
         [0u8; SIGNATURE_LEN],
+        TEST_SENSOR_EPH_PUBKEY,
         timestamp,
     );
 
@@ -456,7 +437,7 @@ fn sensor_rejects_gateway() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         |_pk, _sig| false, // reject gateway signature
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
@@ -466,7 +447,8 @@ fn sensor_rejects_gateway() {
     let gateway_result = handle_handshake_request(
         &request,
         |_pk, _sig| true,
-        test_encrypt,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         sensor_mac(),
         gateway_mac(),
         [0u8; PUBLIC_KEY_LEN],

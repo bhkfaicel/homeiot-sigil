@@ -1,9 +1,13 @@
 use crate::com::error::model::ComError;
 use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, GATEWAY_CHALLENGE_RESEND_PERIOD,
-    GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN,
+    GATEWAY_CHALLENGE_RESEND_PERIOD, GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX,
+    PUBLIC_KEY_LEN, SIGNATURE_LEN,
 };
 use crate::com::handshake::gateway::{handle_handshake_request, HandshakeChallenge};
+use crate::com::handshake::sensor::tests::helpers::{
+    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY,
+    TEST_SENSOR_EPH_PUBKEY,
+};
 use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
 use crate::models::common::{
     Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
@@ -40,40 +44,19 @@ fn dummy_gateway_nonce() -> [u8; 32] {
     [0xBB; 32]
 }
 
-/// Test ECIES encrypt: lays out `eph_pubkey[33] || plaintext[133] || …` with non-zero ephemeral prefix.
-/// Returns dummy shared secret `[0xCC; 32]`.
-fn test_encrypt(
-    _sensor_pubkey: &[u8; PUBLIC_KEY_LEN],
-    plaintext: &[u8; CHALLENGE_PLAINTEXT_LEN],
-    out: &mut [u8; ECIES_CIPHERTEXT_LEN],
-) -> [u8; 32] {
-    out.fill(0);
-    out[0] = 0x02;
-    out[1..PUBLIC_KEY_LEN].fill(0x33);
-    out[PUBLIC_KEY_LEN..PUBLIC_KEY_LEN + CHALLENGE_PLAINTEXT_LEN].copy_from_slice(plaintext);
-    [0xCCu8; 32]
-}
-
-/// Builds the expected `HandshakeChallenge` wire buffer using the test ECIES format.
+/// Builds the expected structured `HandshakeChallenge` wire buffer.
 fn build_challenge_buffer(timestamp: u32, key_expire_at: u32) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
-    let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
-    plaintext[..SIGNATURE_LEN].copy_from_slice(&dummy_sig()); // sig_sensor_nonce
-    plaintext[SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN].copy_from_slice(&dummy_pubkey()); // gateway_pubkey
-    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN + 32]
-        .copy_from_slice(&dummy_gateway_nonce()); // gateway_nonce
-    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN + 32..]
-        .copy_from_slice(&key_expire_at.to_be_bytes()); // key_expire_at
-
-    let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
-    ciphertext[0] = 0x02;
-    ciphertext[1..PUBLIC_KEY_LEN].fill(0x33);
-    ciphertext[PUBLIC_KEY_LEN..PUBLIC_KEY_LEN + CHALLENGE_PLAINTEXT_LEN].copy_from_slice(&plaintext);
-
     let mut message = MessageSchema::create_body_response(
         sensor_mac(),
         gateway_mac(),
         MessageType::HandshakeChallenge,
-        ResponseType::HandshakeChallenge(HandshakeChallenge { data: ciphertext }),
+        ResponseType::HandshakeChallenge(HandshakeChallenge::new(
+            TEST_GW_EPH_PUBKEY,
+            dummy_sig(),
+            dummy_pubkey(),
+            dummy_gateway_nonce(),
+            key_expire_at,
+        )),
         timestamp,
     );
     message
@@ -88,7 +71,10 @@ fn build_confirm_buffer(timestamp: u32) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) 
         80,
         OneDestination(gateway_mac()),
         MessageType::HandshakeConfirm,
-        RequestType::HandshakeConfirm(HandshakeConfirm::new(dummy_sig())),
+        RequestType::HandshakeConfirm(HandshakeConfirm::new(
+            dummy_sig(),
+            TEST_SENSOR_EPH_PUBKEY,
+        )),
         timestamp,
     );
     message
@@ -147,7 +133,8 @@ fn ok() {
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| true,
-        test_encrypt,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         sensor_mac(),
         gateway_mac(),
         dummy_pubkey(),
@@ -197,7 +184,8 @@ fn timeout() {
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| true,
-        test_encrypt,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         sensor_mac(),
         gateway_mac(),
         dummy_pubkey(),
@@ -231,7 +219,8 @@ fn verification_failed_verify_sensor() {
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| false, // reject sensor identity
-        test_encrypt,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         sensor_mac(),
         gateway_mac(),
         dummy_pubkey(),
@@ -278,7 +267,8 @@ fn verification_failed_sig_gateway_nonce() {
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| true,
-        test_encrypt,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         sensor_mac(),
         gateway_mac(),
         dummy_pubkey(),

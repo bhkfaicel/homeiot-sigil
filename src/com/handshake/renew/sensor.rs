@@ -27,11 +27,15 @@ impl KeyRenewRequest {
     }
 }
 
-/// Session key renewal for an already-paired sensor (lightweight: ECDH only, no ECDSA/ECIES).
+/// Session key renewal for an already-paired sensor (ephemeral-to-ephemeral ECDH).
 ///
 /// Sends an encrypted `KeyRenewRequest`, then runs [`complete_renew_as_sensor`].
+///
+/// `ecdh_ephemeral_with_peer` must generate a sensor ephemeral keypair, perform ECDH with the
+/// gateway ephemeral pubkey from `KeyRenewChallenge`, and return
+/// `(sensor_eph_pubkey_compressed, shared_secret)`.
 #[allow(clippy::too_many_arguments)]
-pub fn renew_session<SPI, CS, RST, SpiErr, FECDH>(
+pub fn renew_session<SPI, CS, RST, SpiErr, FEPH>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     delay: &mut impl DelayNs,
     sensor_mac: [u8; 17],
@@ -40,14 +44,17 @@ pub fn renew_session<SPI, CS, RST, SpiErr, FECDH>(
     session_key: &[u8; 32],
     chacha_nonce: &[u8; 12],
     sensor_nonce: [u8; 32],
-    ecdh_shared_secret: FECDH,
+    ecdh_ephemeral_with_peer: FEPH,
     timestamp: u32,
 ) -> Result<HandshakeSession, ComError<SpiErr>>
 where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
     RST: OutputPin,
-    FECDH: FnMut(&[u8; crate::com::handshake::PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
+    FEPH: FnMut(&[u8; crate::com::handshake::PUBLIC_KEY_LEN]) -> Result<
+        ([u8; crate::com::handshake::PUBLIC_KEY_LEN], [u8; 32]),
+        (),
+    >,
 {
     let mut msg = MessageSchema::create_body_request(
         sensor_mac,
@@ -71,7 +78,7 @@ where
         sensor_nonce,
         session_key,
         chacha_nonce,
-        ecdh_shared_secret,
+        ecdh_ephemeral_with_peer,
         timestamp,
         Some((&buffer, len)),
     )

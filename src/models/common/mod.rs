@@ -3,6 +3,7 @@ use crate::com::handshake::install_core::{HandshakeChallenge, HandshakeConfirm};
 use crate::com::handshake::install::sensor::HandshakeRequest;
 use crate::com::handshake::renew::sensor::KeyRenewRequest;
 use crate::com::handshake::renew_core::{KeyRenewAck, KeyRenewChallenge};
+use crate::com::handshake::resume_core::SessionResumeRequest;
 use crate::crypto::{decrypt, encrypt};
 use crate::models::common::Destination::OneDestination;
 use bincode::{Decode, Encode};
@@ -112,6 +113,10 @@ pub enum MessageType {
     KeyRenewChallenge,
     /// Lightweight renew acknowledgment (encrypted with the current session key).
     KeyRenewAck,
+    /// Session resume for enrolled sensors (clear-text, ECDSA + eph-eph, no old session key).
+    SessionResumeRequest,
+    SessionResumeChallenge,
+    SessionResumeConfirm,
 }
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
@@ -133,6 +138,10 @@ pub enum RequestType {
     KeyRenewRequest(KeyRenewRequest),
     /// Lightweight renew acknowledgment (encrypted with the current session key).
     KeyRenewAck(KeyRenewAck),
+    /// Session resume trigger (clear-text, directed to gateway).
+    SessionResumeRequest(SessionResumeRequest),
+    /// Session resume confirmation (clear-text).
+    SessionResumeConfirm(HandshakeConfirm),
 }
 
 /// Acknowledgment structure for confirming receipt and processing of messages.
@@ -157,6 +166,8 @@ pub enum ResponseType {
     HandshakeChallenge(HandshakeChallenge),
     /// Lightweight renew challenge (encrypted with the current session key).
     KeyRenewChallenge(KeyRenewChallenge),
+    /// Session resume challenge (clear-text, same layout as install challenge).
+    SessionResumeChallenge(HandshakeChallenge),
 }
 
 #[derive(Encode, Decode, Debug, Clone)]

@@ -1,7 +1,4 @@
-use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, HANDSHAKE_MESSAGE_MAX,
-    PUBLIC_KEY_LEN, SIGNATURE_LEN, encrypt_challenge,
-};
+use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::com::handshake::install_core::{
     HandshakeChallenge, HandshakeConfirm, SENSOR_CHALLENGE_RX_TIMEOUT,
     SENSOR_REBROADCAST_FIRST_ATTEMPT, SENSOR_REBROADCAST_INTERVAL,
@@ -23,10 +20,19 @@ use lora::sx1278::tests::common::{
     expectations_for_receiver_mode, expectations_for_send,
 };
 
-/// Must match `complete_session_as_sensor` challenge listen loop in `core/sensor.rs`.
+/// Must match `complete_install_as_sensor` challenge listen loop in `install_core/sensor.rs`.
 const SENSOR_CHALLENGE_RX_TIMEOUT_LOCAL: usize = SENSOR_CHALLENGE_RX_TIMEOUT;
 const SENSOR_REBROADCAST_FIRST_ATTEMPT_LOCAL: u16 = SENSOR_REBROADCAST_FIRST_ATTEMPT;
 const SENSOR_REBROADCAST_INTERVAL_LOCAL: u16 = SENSOR_REBROADCAST_INTERVAL;
+
+/// Gateway ephemeral pubkey used by install test mocks.
+pub const TEST_GW_EPH_PUBKEY: [u8; PUBLIC_KEY_LEN] = [0x11u8; PUBLIC_KEY_LEN];
+
+/// Sensor ephemeral pubkey returned by install test ECDH mocks.
+pub const TEST_SENSOR_EPH_PUBKEY: [u8; PUBLIC_KEY_LEN] = [0x22u8; PUBLIC_KEY_LEN];
+
+/// Shared secret returned by install test ECDH mocks on both sides.
+pub const TEST_EPH_EPH_SHARED_SECRET: [u8; 32] = [0xCCu8; 32];
 
 /// SPI expectations for the sensor waiting until `ComError::Timeout` (no challenge received).
 pub fn expectations_for_sensor_challenge_listen_timeout(
@@ -75,38 +81,24 @@ pub fn build_handshake_request_buffer(
 pub fn build_handshake_challenge_buffer(
     gateway_mac: [u8; 17],
     sensor_mac: [u8; 17],
+    gw_eph_pubkey: [u8; PUBLIC_KEY_LEN],
     sig_sensor_nonce: [u8; SIGNATURE_LEN],
     gateway_pubkey: [u8; PUBLIC_KEY_LEN],
     gateway_nonce: [u8; 32],
     key_expire_at: u32,
     timestamp: u32,
 ) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
-    let mut plaintext = [0u8; CHALLENGE_PLAINTEXT_LEN];
-    plaintext[..SIGNATURE_LEN].copy_from_slice(&sig_sensor_nonce);
-    plaintext[SIGNATURE_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN].copy_from_slice(&gateway_pubkey);
-    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN..SIGNATURE_LEN + PUBLIC_KEY_LEN + 32]
-        .copy_from_slice(&gateway_nonce);
-    plaintext[SIGNATURE_LEN + PUBLIC_KEY_LEN + 32..]
-        .copy_from_slice(&key_expire_at.to_be_bytes());
-
-    let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
-    let eph_pubkey_compressed = [0x11u8; PUBLIC_KEY_LEN];
-    let shared_secret = [0xCCu8; 32];
-    let chacha_nonce = [0x22u8; 12];
-    encrypt_challenge(
-        &eph_pubkey_compressed,
-        &shared_secret,
-        &chacha_nonce,
-        &plaintext,
-        &mut ciphertext,
-    )
-    .expect("encrypt_challenge");
-
     let mut message = MessageSchema::create_body_response(
         sensor_mac,
         gateway_mac,
         MessageType::HandshakeChallenge,
-        ResponseType::HandshakeChallenge(HandshakeChallenge { data: ciphertext }),
+        ResponseType::HandshakeChallenge(HandshakeChallenge::new(
+            gw_eph_pubkey,
+            sig_sensor_nonce,
+            gateway_pubkey,
+            gateway_nonce,
+            key_expire_at,
+        )),
         timestamp,
     );
     message
@@ -120,6 +112,7 @@ pub fn build_handshake_confirm_buffer(
     battery_level: u8,
     gateway_mac: [u8; 17],
     sig_gateway_nonce: [u8; SIGNATURE_LEN],
+    sensor_eph_pubkey: [u8; PUBLIC_KEY_LEN],
     timestamp: u32,
 ) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
     let mut message = MessageSchema::create_body_request(
@@ -127,7 +120,10 @@ pub fn build_handshake_confirm_buffer(
         battery_level,
         OneDestination(gateway_mac),
         MessageType::HandshakeConfirm,
-        RequestType::HandshakeConfirm(HandshakeConfirm::new(sig_gateway_nonce)),
+        RequestType::HandshakeConfirm(HandshakeConfirm::new(
+            sig_gateway_nonce,
+            sensor_eph_pubkey,
+        )),
         timestamp,
     );
     message
@@ -162,6 +158,7 @@ pub fn create_expectations_for_initiate_handshake(
     let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac,
         sensor_mac,
+        TEST_GW_EPH_PUBKEY,
         sig_sensor_nonce,
         gateway_pubkey,
         gateway_nonce,
@@ -173,6 +170,7 @@ pub fn create_expectations_for_initiate_handshake(
         battery_level,
         gateway_mac,
         [0u8; SIGNATURE_LEN],
+        TEST_SENSOR_EPH_PUBKEY,
         timestamp,
     );
 
@@ -225,4 +223,23 @@ pub fn create_controller(
         PinTransaction::set(PinState::High),
     ]);
     (spi, cs, rst, NoopDelay::new())
+}
+
+/// Mock gateway ephemeral key generation for install tests.
+pub fn test_generate_gateway_ephemeral() -> Result<[u8; PUBLIC_KEY_LEN], ()> {
+    Ok(TEST_GW_EPH_PUBKEY)
+}
+
+/// Mock gateway-side eph-eph ECDH for install tests.
+pub fn test_ecdh_with_sensor_ephemeral(
+    _sensor_eph_pubkey: &[u8; PUBLIC_KEY_LEN],
+) -> Result<[u8; 32], ()> {
+    Ok(TEST_EPH_EPH_SHARED_SECRET)
+}
+
+/// Mock sensor-side eph-eph ECDH for install tests.
+pub fn test_ecdh_ephemeral_with_peer(
+    _gw_eph_pubkey: &[u8; PUBLIC_KEY_LEN],
+) -> Result<([u8; PUBLIC_KEY_LEN], [u8; 32]), ()> {
+    Ok((TEST_SENSOR_EPH_PUBKEY, TEST_EPH_EPH_SHARED_SECRET))
 }

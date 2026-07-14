@@ -1,0 +1,36 @@
+sequenceDiagram
+    autonumber
+    participant App_S as Sensor firmware
+    participant RS as resume_session()
+    participant RC as resume_core
+    participant LoRa as LoRa (SX1278)
+    participant GW as handle_resume_request()
+    participant HW as ATECC608x
+
+    Note over App_S,GW: Enrolled sensor, session key lost — no broadcast install
+
+    App_S->>RS: resume_session(gateway_mac, sig_sensor_nonce)
+    RS->>HW: ECDSA(sensor_nonce) → sig_sensor_nonce
+    RS->>LoRa: SessionResumeRequest clear {sensor_nonce, sig_sensor_nonce}<br/>dest: gateway_mac (NOT AllGateways)
+    LoRa->>GW: SessionResumeRequest
+
+    GW->>GW: verify_sig_sensor_nonce(enrolled sensor_pubkey, sig)
+    alt Unknown / bad signature
+        GW-->>App_S: (silent reject)
+    end
+
+    GW->>HW: sig_sensor_nonce = ECDSA(sensor_nonce)
+    GW->>HW: Generate gateway ephemeral → gw_eph_pubkey[33B]
+    GW->>LoRa: SessionResumeChallenge clear<br/>{gw_eph_pubkey, sig_sensor_nonce, gateway_pubkey, gateway_nonce, key_expire_at}
+    LoRa->>RC: SessionResumeChallenge
+
+    RC->>RC: verify_sig_sensor_nonce(gateway_pubkey, sig_sensor_nonce)
+    RC->>HW: Generate sensor ephemeral + ECDH(gw_eph) → shared_secret
+    RC->>HW: sig_gateway_nonce = ECDSA(gateway_nonce)
+    RC->>LoRa: SessionResumeConfirm clear {sig_gateway_nonce, sensor_eph_pubkey} (×3)
+    LoRa->>GW: SessionResumeConfirm
+
+    GW->>GW: verify_sig_gateway_nonce(sensor_pubkey, sig_gateway_nonce)
+    GW->>HW: ECDH(sensor_eph_pubkey) → shared_secret
+    GW->>GW: session_key_new = HKDF(same inputs)
+    RS-->>App_S: HandshakeSession { keys, gateway_mac }
