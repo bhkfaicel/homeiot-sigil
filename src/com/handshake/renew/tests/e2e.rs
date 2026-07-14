@@ -2,8 +2,9 @@
 
 use super::{
     build_key_renew_ack_buffer, build_key_renew_challenge_buffer, build_key_renew_request_buffer,
-    chacha_nonce, gateway_mac, sensor_mac, session_key, test_ecdh_ephemeral,
-    test_ecdh_shared_secret,
+    chacha_nonce, gateway_mac, sensor_mac, session_key, test_ecdh_ephemeral_with_peer,
+    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY,
+    TEST_SENSOR_EPH_PUBKEY,
 };
 use crate::com::handshake::renew::gateway::handle_renew_request;
 use crate::com::handshake::renew::sensor::{KeyRenewRequest, renew_session};
@@ -21,7 +22,7 @@ fn ack_nonce_for_retry(base: [u8; 12], tx_index: u8) -> [u8; 12] {
     nonce
 }
 
-/// Both sides complete the lightweight renew exchange and derive the same session key.
+/// Both sides complete the ephemeral-to-ephemeral renew exchange and derive the same session key.
 #[test]
 fn renew_session_keys_match() {
     let sensor_nonce = [0xAA; 32];
@@ -35,7 +36,7 @@ fn renew_session_keys_match() {
     let (challenge_buffer, challenge_len) = build_key_renew_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
-        [0x11u8; PUBLIC_KEY_LEN],
+        TEST_GW_EPH_PUBKEY,
         gateway_nonce,
         key_expire_at,
         timestamp,
@@ -43,18 +44,21 @@ fn renew_session_keys_match() {
     let (ack0, ack0_len) = build_key_renew_ack_buffer(
         sensor_mac(),
         gateway_mac(),
+        TEST_SENSOR_EPH_PUBKEY,
         ack_nonce_for_retry(base_nonce, 0),
         timestamp,
     );
     let (ack1, ack1_len) = build_key_renew_ack_buffer(
         sensor_mac(),
         gateway_mac(),
+        TEST_SENSOR_EPH_PUBKEY,
         ack_nonce_for_retry(base_nonce, 1),
         timestamp,
     );
     let (ack2, ack2_len) = build_key_renew_ack_buffer(
         sensor_mac(),
         gateway_mac(),
+        TEST_SENSOR_EPH_PUBKEY,
         ack_nonce_for_retry(base_nonce, 2),
         timestamp,
     );
@@ -116,7 +120,7 @@ fn renew_session_keys_match() {
         &session_key(),
         &base_nonce,
         sensor_nonce,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         timestamp,
     );
 
@@ -125,7 +129,8 @@ fn renew_session_keys_match() {
         &request,
         &session_key(),
         &base_nonce,
-        test_ecdh_ephemeral,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         &[0u8; PUBLIC_KEY_LEN],
         sensor_mac(),
         gateway_mac(),

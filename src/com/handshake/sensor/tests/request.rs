@@ -4,7 +4,8 @@ use crate::com::handshake::sensor::initiate_handshake;
 use crate::com::handshake::sensor::tests::helpers::{
     build_handshake_challenge_buffer, build_handshake_confirm_buffer,
     build_handshake_request_buffer, create_controller,
-    expectations_for_sensor_challenge_listen_timeout,
+    expectations_for_sensor_challenge_listen_timeout, test_ecdh_ephemeral_with_peer,
+    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY,
 };
 use lora::sx1278::tests::common::{
     expectations_for_new, expectations_for_receive_success, expectations_for_receiver_mode,
@@ -18,11 +19,6 @@ fn sensor_mac() -> [u8; 17] {
 
 fn gateway_mac() -> [u8; 17] {
     [26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51]
-}
-
-/// Test ECDH callback: returns a deterministic shared secret.
-fn test_ecdh_shared_secret(_eph_pubkey_compressed: &[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()> {
-    Ok([0xCCu8; 32])
 }
 
 #[test]
@@ -46,6 +42,7 @@ fn ok() {
     let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
+        TEST_GW_EPH_PUBKEY,
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
@@ -57,6 +54,7 @@ fn ok() {
         battery_level,
         gateway_mac(),
         [0u8; SIGNATURE_LEN],
+        TEST_SENSOR_EPH_PUBKEY,
         timestamp,
     );
 
@@ -97,7 +95,7 @@ fn ok() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
@@ -148,7 +146,7 @@ fn timeout() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         |_pk, _sig| true,
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,
@@ -182,6 +180,7 @@ fn verification_failed_sig_sensor_nonce() {
     let (challenge_buffer, challenge_len) = build_handshake_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
+        TEST_GW_EPH_PUBKEY,
         [0u8; SIGNATURE_LEN],
         [0u8; PUBLIC_KEY_LEN],
         gateway_nonce,
@@ -212,7 +211,7 @@ fn verification_failed_sig_sensor_nonce() {
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         |_pk, _sig| false, // reject sig_sensor_nonce
         |_nonce| [0u8; SIGNATURE_LEN],
         timestamp,

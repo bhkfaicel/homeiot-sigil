@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to semantic versioning.
 
+## [0.4.0-rc.0] 2026-07-14
+
+### Added
+
+- **Session resume** (`com::handshake::resume`): `resume_session()` (sensor) and
+  `handle_resume_request()` (gateway) for already-enrolled sensors that lost the session key.
+  Clear-text `SessionResumeRequest` → `SessionResumeChallenge` → `SessionResumeConfirm` —
+  ECDSA identity proof + ephemeral-to-ephemeral ECDH, **without** rebroadcast install or the
+  previous session key (unlike renew).
+- New `MessageType` values: `SessionResumeRequest`, `SessionResumeChallenge`,
+  `SessionResumeConfirm`.
+- Sequence diagram: `diagramme/session_resume.mermaid`.
+
+### Changed
+
+- **Breaking (install wire + API):** install now uses **ephemeral-to-ephemeral ECDH** instead of
+  ECIES eph→static. `HandshakeChallenge` is a structured clear-text message
+  `{gw_eph_pubkey, sig_sensor_nonce, gateway_pubkey, gateway_nonce, key_expire_at}` (replaces the
+  194-byte ECIES blob). `HandshakeConfirm` adds `sensor_eph_pubkey_compressed` (33 bytes).
+- **Breaking (install API):** `install_session()` / `initiate_handshake()` callback renamed to
+  `ecdh_ephemeral_with_peer`: `FnMut(&gw_eph_pubkey) -> Result<(sensor_eph_pubkey, shared_secret), ()>`.
+- **Breaking (install API):** `handle_install_request()` / `handle_handshake_request()` replace
+  `ecies_encrypt` with `generate_gateway_ephemeral()` and `ecdh_with_sensor_ephemeral()`.
+- **Breaking (renew wire + API):** renew now uses **ephemeral-to-ephemeral ECDH** instead of
+  ephemeral-to-static. `KeyRenewAck` carries `sensor_eph_pubkey_compressed` (33 bytes) instead of
+  being an empty unit struct.
+- **Breaking (renew API):** `renew_session()` callback renamed to `ecdh_ephemeral_with_peer`:
+  `FnMut(&gw_eph_pubkey) -> Result<(sensor_eph_pubkey, shared_secret), ()>`.
+- **Breaking (renew API):** `handle_renew_request()` takes two callbacks:
+  `generate_gateway_ephemeral() -> gw_eph_pubkey` and
+  `ecdh_with_sensor_ephemeral(&sensor_eph_pubkey) -> shared_secret` (replacing the single
+  `ecdh_ephemeral(&sensor_long_term_pubkey)` callback).
+
+### Migration
+
+- Deploy **sensor and gateway firmware together** when upgrading to 0.4.0-rc.0: install and renew
+  wire formats are not backward-compatible with 0.3.x (ECIES install challenge, empty `KeyRenewAck`).
+
+---
+
 ## [0.3.0-rc.1] 2026-07-13
 
 ### Updated

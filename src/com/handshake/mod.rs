@@ -1,10 +1,12 @@
 pub mod install_core;
 pub mod renew_core;
+pub mod resume_core;
 pub mod lora_helpers;
 pub mod primitives;
 pub mod gateway;
 pub mod install;
 pub mod renew;
+pub mod resume;
 pub mod sensor;
 
 /// Backward-compatible alias for [`install_core`].
@@ -51,7 +53,7 @@ pub const SIGNATURE_LEN: usize = 64;
 /// Maximum handshake message size (256-byte LoRa packet limit).
 pub const HANDSHAKE_MESSAGE_MAX: usize = 250;
 
-/// Plaintext inside the ECIES ciphertext:
+/// Plaintext fields carried in the structured install challenge (after `gw_eph_pubkey`):
 /// `sig_sensor_nonce[64] || gateway_pubkey[33] || gateway_nonce[32] || key_expire_at[4]` = 133 bytes.
 ///
 /// `key_expire_at` is a big-endian `u32` Unix timestamp indicating when the session key expires

@@ -2,11 +2,9 @@ use crate::com::error::model::ComError;
 use crate::com::handshake::install_core::{
     HandshakeChallenge, HandshakeResult, SessionRecovery,
 };
-use crate::com::handshake::primitives::build_install_plaintext;
 use crate::com::handshake::{
-    CHALLENGE_PLAINTEXT_LEN, ECIES_CIPHERTEXT_LEN, GATEWAY_CHALLENGE_RESEND_PERIOD,
-    GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN,
-    derive_session_key,
+    GATEWAY_CHALLENGE_RESEND_PERIOD, GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX,
+    PUBLIC_KEY_LEN, SIGNATURE_LEN, derive_session_key,
 };
 use crate::models::common::{
     BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType,
@@ -17,9 +15,13 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::SpiBus;
 use lora;
 
-/// Install session core: ECIES challenge + ECDSA confirm wait.
+/// Install session core: structured eph-eph challenge + ECDSA confirm wait.
+///
+/// `generate_gateway_ephemeral` creates the gateway ephemeral keypair (private key stays in HW).
+/// After receiving `HandshakeConfirm`, `ecdh_with_sensor_ephemeral` completes ECDH with the
+/// sensor ephemeral pubkey.
 #[allow(clippy::too_many_arguments)]
-pub fn send_install_challenge_and_wait_confirm<SPI, CS, RST, SpiErr, FE, FVN>(
+pub fn send_install_challenge_and_wait_confirm<SPI, CS, RST, SpiErr, FGEN, FECDH, FVN>(
     sensor_mac: [u8; 17],
     gateway_mac: [u8; 17],
     sensor_pubkey: &[u8; PUBLIC_KEY_LEN],
@@ -28,7 +30,8 @@ pub fn send_install_challenge_and_wait_confirm<SPI, CS, RST, SpiErr, FE, FVN>(
     sig_sensor_nonce: &[u8; SIGNATURE_LEN],
     gateway_nonce: &[u8; 32],
     key_expire_at: u32,
-    ecies_encrypt: FE,
+    generate_gateway_ephemeral: FGEN,
+    ecdh_with_sensor_ephemeral: FECDH,
     verify_sig_gateway_nonce: FVN,
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     delay: &mut impl DelayNs,
@@ -39,27 +42,14 @@ where
     CS: OutputPin,
     RST: OutputPin,
     SpiErr: core::fmt::Debug,
-    FE: Fn(
-        &[u8; PUBLIC_KEY_LEN],
-        &[u8; CHALLENGE_PLAINTEXT_LEN],
-        &mut [u8; ECIES_CIPHERTEXT_LEN],
-    ) -> [u8; 32],
+    FGEN: Fn() -> Result<[u8; PUBLIC_KEY_LEN], ()>,
+    FECDH: Fn(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
     FVN: Fn(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
 {
     let rx_timeout = GATEWAY_CONFIRM_RX_TIMEOUT;
-    let plaintext = build_install_plaintext(
-        sig_sensor_nonce,
-        gateway_pubkey,
-        gateway_nonce,
-        key_expire_at,
-    );
 
-    let mut ciphertext = [0u8; ECIES_CIPHERTEXT_LEN];
-    let shared_secret = ecies_encrypt(sensor_pubkey, &plaintext, &mut ciphertext);
-
-    if shared_secret.iter().all(|&b| b == 0)
-        || ciphertext[..PUBLIC_KEY_LEN].iter().all(|&b| b == 0)
-    {
+    let gw_eph_pubkey = generate_gateway_ephemeral().map_err(|_| ComError::VerificationFailed)?;
+    if gw_eph_pubkey.iter().all(|&b| b == 0) {
         return Err(ComError::VerificationFailed);
     }
 
@@ -67,7 +57,13 @@ where
         sensor_mac,
         gateway_mac,
         MessageType::HandshakeChallenge,
-        ResponseType::HandshakeChallenge(HandshakeChallenge { data: ciphertext }),
+        ResponseType::HandshakeChallenge(HandshakeChallenge::new(
+            gw_eph_pubkey,
+            *sig_sensor_nonce,
+            *gateway_pubkey,
+            *gateway_nonce,
+            key_expire_at,
+        )),
         timestamp,
     );
     let (buffer, len) = challenge_msg
@@ -122,6 +118,18 @@ where
             if !verify_sig_gateway_nonce(sensor_pubkey, confirm.sig_gateway_nonce()) {
                 return Err(ComError::VerificationFailed);
             }
+
+            let sensor_eph_pubkey = *confirm.sensor_eph_pubkey_compressed();
+            if sensor_eph_pubkey.iter().all(|&b| b == 0) {
+                continue;
+            }
+
+            let shared_secret = ecdh_with_sensor_ephemeral(&sensor_eph_pubkey)
+                .map_err(|_| ComError::VerificationFailed)?;
+            if shared_secret.iter().all(|&b| b == 0) {
+                continue;
+            }
+
             let session_key = derive_session_key(&shared_secret, sensor_nonce, gateway_nonce);
             return Ok(HandshakeResult {
                 session_key,

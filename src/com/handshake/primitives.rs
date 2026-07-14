@@ -1,4 +1,9 @@
 //! Shared cryptographic primitives for install and renew flows.
+//!
+//! **Renew (ephemeral-to-ephemeral):** both peers generate a fresh P-256 ephemeral keypair.
+//! The gateway sends `gw_eph_pubkey` in `KeyRenewChallenge`; the sensor replies with
+//! `sensor_eph_pubkey` in `KeyRenewAck`. Each side derives
+//! `shared_secret = ECDH(local_eph_priv, peer_eph_pub)` and then `session_key_new` via HKDF.
 
 use crate::com::handshake::{CHALLENGE_PLAINTEXT_LEN, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 

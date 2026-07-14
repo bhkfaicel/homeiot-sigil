@@ -6,7 +6,7 @@ use crate::com::handshake::renew::gateway::handle_renew_request;
 use crate::com::handshake::renew::sensor::{KeyRenewRequest, renew_session};
 use crate::com::handshake::renew_core::{KeyRenewAck, KeyRenewChallenge};
 use crate::com::handshake::sensor::tests::helpers::create_controller;
-use crate::com::handshake::PUBLIC_KEY_LEN;
+use crate::com::handshake::{PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::models::common::{
     Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
 };
@@ -82,6 +82,7 @@ pub(crate) fn build_key_renew_challenge_buffer(
 pub(crate) fn build_key_renew_ack_buffer(
     sensor_mac: [u8; 17],
     gateway_mac: [u8; 17],
+    sensor_eph_pubkey: [u8; PUBLIC_KEY_LEN],
     ack_nonce: [u8; 12],
     timestamp: u32,
 ) -> ([u8; 256], usize) {
@@ -90,7 +91,7 @@ pub(crate) fn build_key_renew_ack_buffer(
         80,
         OneDestination(gateway_mac),
         MessageType::KeyRenewAck,
-        RequestType::KeyRenewAck(KeyRenewAck),
+        RequestType::KeyRenewAck(KeyRenewAck::new(sensor_eph_pubkey)),
         timestamp,
     );
     message
@@ -104,14 +105,29 @@ fn ack_nonce_for_retry(base: [u8; 12], tx_index: u8) -> [u8; 12] {
     nonce
 }
 
-fn test_ecdh_ephemeral(
-    _sensor_pubkey: &[u8; PUBLIC_KEY_LEN],
-) -> Result<([u8; PUBLIC_KEY_LEN], [u8; 32]), ()> {
-    Ok(([0x11u8; PUBLIC_KEY_LEN], [0xCCu8; 32]))
+/// Gateway ephemeral pubkey returned by the mock `generate_gateway_ephemeral` callback.
+pub(crate) const TEST_GW_EPH_PUBKEY: [u8; PUBLIC_KEY_LEN] = [0x11u8; PUBLIC_KEY_LEN];
+
+/// Sensor ephemeral pubkey returned by the mock `ecdh_ephemeral_with_peer` callback.
+pub(crate) const TEST_SENSOR_EPH_PUBKEY: [u8; PUBLIC_KEY_LEN] = [0x22u8; PUBLIC_KEY_LEN];
+
+/// Shared secret returned by both mock ECDH callbacks.
+pub(crate) const TEST_EPH_EPH_SHARED_SECRET: [u8; 32] = [0xCCu8; 32];
+
+pub(crate) fn test_generate_gateway_ephemeral() -> Result<[u8; PUBLIC_KEY_LEN], ()> {
+    Ok(TEST_GW_EPH_PUBKEY)
 }
 
-fn test_ecdh_shared_secret(_eph_pubkey: &[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()> {
-    Ok([0xCCu8; 32])
+pub(crate) fn test_ecdh_with_sensor_ephemeral(
+    _sensor_eph_pubkey: &[u8; PUBLIC_KEY_LEN],
+) -> Result<[u8; 32], ()> {
+    Ok(TEST_EPH_EPH_SHARED_SECRET)
+}
+
+pub(crate) fn test_ecdh_ephemeral_with_peer(
+    _gw_eph_pubkey: &[u8; PUBLIC_KEY_LEN],
+) -> Result<([u8; PUBLIC_KEY_LEN], [u8; 32]), ()> {
+    Ok((TEST_SENSOR_EPH_PUBKEY, TEST_EPH_EPH_SHARED_SECRET))
 }
 
 #[test]
@@ -152,6 +168,37 @@ fn key_renew_request_encrypted_wire_format() {
 }
 
 #[test]
+fn key_renew_ack_encrypted_wire_format() {
+    let sensor_eph = TEST_SENSOR_EPH_PUBKEY;
+    let (buffer, len) = build_key_renew_ack_buffer(
+        sensor_mac(),
+        gateway_mac(),
+        sensor_eph,
+        chacha_nonce(),
+        1_000,
+    );
+
+    assert!(len > 0);
+    assert!(len <= crate::models::common::LORA_USER_PAYLOAD_MAX);
+
+    let encrypted = crate::models::common::deserialize::<256>(&buffer[..len]).expect("deserialize");
+    let decrypted = crate::models::common::deserialize_body::<150>(
+        encrypted.header,
+        &encrypted.body,
+        &session_key(),
+        None,
+    )
+    .expect("decrypt body");
+
+    match decrypted.body {
+        crate::models::common::BodySchema::RequestType(RequestType::KeyRenewAck(ack)) => {
+            assert_eq!(ack.sensor_eph_pubkey_compressed(), &sensor_eph);
+        }
+        other => panic!("unexpected body: {:?}", other),
+    }
+}
+
+#[test]
 fn handle_renew_request_ok() {
     let sensor_nonce = [0xAA; 32];
     let gateway_nonce = [0xBB; 32];
@@ -161,7 +208,7 @@ fn handle_renew_request_ok() {
     let (challenge_buffer, challenge_len) = build_key_renew_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
-        [0x11u8; PUBLIC_KEY_LEN],
+        TEST_GW_EPH_PUBKEY,
         gateway_nonce,
         0u32,
         timestamp,
@@ -169,6 +216,7 @@ fn handle_renew_request_ok() {
     let (ack_buffer, ack_len) = build_key_renew_ack_buffer(
         sensor_mac(),
         gateway_mac(),
+        TEST_SENSOR_EPH_PUBKEY,
         chacha_nonce(),
         timestamp,
     );
@@ -193,7 +241,8 @@ fn handle_renew_request_ok() {
         &request,
         &session_key(),
         &chacha_nonce(),
-        test_ecdh_ephemeral,
+        test_generate_gateway_ephemeral,
+        test_ecdh_with_sensor_ephemeral,
         &[0u8; PUBLIC_KEY_LEN],
         sensor_mac(),
         gateway_mac(),
@@ -223,7 +272,7 @@ fn renew_session_ok() {
     let (challenge_buffer, challenge_len) = build_key_renew_challenge_buffer(
         gateway_mac(),
         sensor_mac(),
-        [0x11u8; PUBLIC_KEY_LEN],
+        TEST_GW_EPH_PUBKEY,
         gateway_nonce,
         0u32,
         timestamp,
@@ -231,18 +280,21 @@ fn renew_session_ok() {
     let (ack0, ack0_len) = build_key_renew_ack_buffer(
         sensor_mac(),
         gateway_mac(),
+        TEST_SENSOR_EPH_PUBKEY,
         ack_nonce_for_retry(base_nonce, 0),
         timestamp,
     );
     let (ack1, ack1_len) = build_key_renew_ack_buffer(
         sensor_mac(),
         gateway_mac(),
+        TEST_SENSOR_EPH_PUBKEY,
         ack_nonce_for_retry(base_nonce, 1),
         timestamp,
     );
     let (ack2, ack2_len) = build_key_renew_ack_buffer(
         sensor_mac(),
         gateway_mac(),
+        TEST_SENSOR_EPH_PUBKEY,
         ack_nonce_for_retry(base_nonce, 2),
         timestamp,
     );
@@ -276,7 +328,7 @@ fn renew_session_ok() {
         &session_key(),
         &base_nonce,
         sensor_nonce,
-        test_ecdh_shared_secret,
+        test_ecdh_ephemeral_with_peer,
         timestamp,
     );
 
@@ -290,15 +342,23 @@ fn renew_session_ok() {
 }
 
 #[test]
-fn key_renew_challenge_payload_is_smaller_than_install_ecies() {
-    let challenge = KeyRenewChallenge::new([0x11u8; PUBLIC_KEY_LEN], [0xBB; 32], 0u32);
-    let mut encoded = [0u8; 128];
+fn install_challenge_body_is_smaller_than_legacy_ecies_blob() {
+    use crate::com::handshake::install_core::HandshakeChallenge;
+
+    let challenge = HandshakeChallenge::new(
+        [0x11u8; PUBLIC_KEY_LEN],
+        [0x22u8; SIGNATURE_LEN],
+        [0x33u8; PUBLIC_KEY_LEN],
+        [0xBBu8; 32],
+        0u32,
+    );
+    let mut encoded = [0u8; 256];
     let len = bincode::encode_into_slice(&challenge, &mut encoded, bincode::config::standard())
         .expect("encode");
 
     assert!(
         len < crate::com::handshake::ECIES_CIPHERTEXT_LEN,
-        "renew payload {}B vs install ECIES {}B",
+        "structured install challenge {}B vs legacy ECIES blob {}B",
         len,
         crate::com::handshake::ECIES_CIPHERTEXT_LEN
     );

@@ -45,9 +45,13 @@ impl HandshakeRequest {
     }
 }
 
-/// First-time installation: identity broadcast + install core (ECIES + ECDSA).
+/// First-time installation: identity broadcast + install core (eph-eph ECDH + ECDSA).
+///
+/// `ecdh_ephemeral_with_peer` must generate a sensor ephemeral keypair, perform ECDH with the
+/// gateway ephemeral pubkey from `HandshakeChallenge`, and return
+/// `(sensor_eph_pubkey_compressed, shared_secret)`.
 #[allow(clippy::too_many_arguments)]
-pub fn install_session<SPI, CS, RST, SpiErr, FECDH, FV, FS>(
+pub fn install_session<SPI, CS, RST, SpiErr, FEPH, FV, FS>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     delay: &mut impl DelayNs,
     sensor_mac: [u8; 17],
@@ -55,7 +59,7 @@ pub fn install_session<SPI, CS, RST, SpiErr, FECDH, FV, FS>(
     sensor_nonce: [u8; 32],
     sensor_pubkey: [u8; PUBLIC_KEY_LEN],
     sig_sensor_pubkey: [u8; SIGNATURE_LEN],
-    ecdh_shared_secret: FECDH,
+    ecdh_ephemeral_with_peer: FEPH,
     verify_sig_sensor_nonce: FV,
     sign_gateway_nonce: FS,
     timestamp: u32,
@@ -64,7 +68,7 @@ where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
     RST: OutputPin,
-    FECDH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
+    FEPH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<([u8; PUBLIC_KEY_LEN], [u8; 32]), ()>,
     FV: FnMut(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
     FS: FnMut(&[u8; 32]) -> [u8; SIGNATURE_LEN],
 {
@@ -102,7 +106,7 @@ where
         sensor_mac,
         battery_level,
         sensor_nonce,
-        ecdh_shared_secret,
+        ecdh_ephemeral_with_peer,
         verify_sig_sensor_nonce,
         sign_gateway_nonce,
         timestamp,
@@ -112,7 +116,7 @@ where
 
 /// Backward-compatible alias for [`install_session`].
 #[allow(clippy::too_many_arguments)]
-pub fn initiate_handshake<SPI, CS, RST, SpiErr, FECDH, FV, FS>(
+pub fn initiate_handshake<SPI, CS, RST, SpiErr, FEPH, FV, FS>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     delay: &mut impl DelayNs,
     sensor_mac: [u8; 17],
@@ -120,7 +124,7 @@ pub fn initiate_handshake<SPI, CS, RST, SpiErr, FECDH, FV, FS>(
     sensor_nonce: [u8; 32],
     sensor_pubkey: [u8; PUBLIC_KEY_LEN],
     sig_sensor_pubkey: [u8; SIGNATURE_LEN],
-    ecdh_shared_secret: FECDH,
+    ecdh_ephemeral_with_peer: FEPH,
     verify_sig_sensor_nonce: FV,
     sign_gateway_nonce: FS,
     timestamp: u32,
@@ -129,7 +133,7 @@ where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
     RST: OutputPin,
-    FECDH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
+    FEPH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<([u8; PUBLIC_KEY_LEN], [u8; 32]), ()>,
     FV: FnMut(&[u8; PUBLIC_KEY_LEN], &[u8; SIGNATURE_LEN]) -> bool,
     FS: FnMut(&[u8; 32]) -> [u8; SIGNATURE_LEN],
 {
@@ -141,7 +145,7 @@ where
         sensor_nonce,
         sensor_pubkey,
         sig_sensor_pubkey,
-        ecdh_shared_secret,
+        ecdh_ephemeral_with_peer,
         verify_sig_sensor_nonce,
         sign_gateway_nonce,
         timestamp,

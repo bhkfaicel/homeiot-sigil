@@ -70,7 +70,10 @@ impl Sigil {
             match clear_msg.header.message_type {
                 MessageType::HandshakeRequest
                 | MessageType::HandshakeChallenge
-                | MessageType::HandshakeConfirm => {
+                | MessageType::HandshakeConfirm
+                | MessageType::SessionResumeRequest
+                | MessageType::SessionResumeChallenge
+                | MessageType::SessionResumeConfirm => {
                     // Validate header using the provided validation function
                     if !validate_header(&clear_msg.header) {
                         return Err(ComError::DeserializeFailed);

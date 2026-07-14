@@ -16,9 +16,13 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::SpiBus;
 use lora;
 
-/// Lightweight renew core (sensor): waits for encrypted `KeyRenewChallenge`, ECDH only, sends `KeyRenewAck`.
+/// Lightweight renew core (sensor): waits for encrypted `KeyRenewChallenge`, ephemeral-to-ephemeral
+/// ECDH, sends `KeyRenewAck` with the sensor ephemeral pubkey.
+///
+/// `ecdh_ephemeral_with_peer` must generate a fresh sensor ephemeral keypair, perform ECDH with the
+/// gateway ephemeral pubkey from the challenge, and return `(sensor_eph_pubkey, shared_secret)`.
 #[allow(clippy::too_many_arguments)]
-pub fn complete_renew_as_sensor<SPI, CS, RST, SpiErr, FECDH, D>(
+pub fn complete_renew_as_sensor<SPI, CS, RST, SpiErr, FEPH, D>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     delay: &mut D,
     sensor_mac: [u8; 17],
@@ -27,7 +31,7 @@ pub fn complete_renew_as_sensor<SPI, CS, RST, SpiErr, FECDH, D>(
     sensor_nonce: [u8; 32],
     session_key: &[u8; 32],
     chacha_nonce: &[u8; 12],
-    mut ecdh_shared_secret: FECDH,
+    mut ecdh_ephemeral_with_peer: FEPH,
     timestamp: u32,
     rebroadcast_payload: Option<(&[u8], usize)>,
 ) -> Result<HandshakeSession, ComError<SpiErr>>
@@ -36,7 +40,7 @@ where
     CS: OutputPin,
     RST: OutputPin,
     D: DelayNs,
-    FECDH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
+    FEPH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<([u8; PUBLIC_KEY_LEN], [u8; 32]), ()>,
 {
     let mut recv_buffer = [0u8; HANDSHAKE_MESSAGE_MAX];
     for attempt in 0..SENSOR_CHALLENGE_RX_TIMEOUT {
@@ -60,10 +64,21 @@ where
                     continue;
                 };
 
-                let shared_secret = match ecdh_shared_secret(challenge.eph_pubkey_compressed()) {
-                    Ok(s) => s,
-                    Err(_) => return Err(ComError::VerificationFailed),
-                };
+                let gw_eph_pubkey = *challenge.eph_pubkey_compressed();
+                if gw_eph_pubkey.iter().all(|&b| b == 0) {
+                    continue;
+                }
+
+                let (sensor_eph_pubkey, shared_secret) =
+                    match ecdh_ephemeral_with_peer(&gw_eph_pubkey) {
+                        Ok(pair) => pair,
+                        Err(_) => return Err(ComError::VerificationFailed),
+                    };
+
+                if sensor_eph_pubkey.iter().all(|&b| b == 0) || shared_secret.iter().all(|&b| b == 0)
+                {
+                    return Err(ComError::VerificationFailed);
+                }
 
                 let gateway_nonce = *challenge.gateway_nonce();
                 let key_expire_at = challenge.key_expire_at();
@@ -79,7 +94,7 @@ where
                         battery_level,
                         OneDestination(gateway_mac),
                         MessageType::KeyRenewAck,
-                        RequestType::KeyRenewAck(KeyRenewAck),
+                        RequestType::KeyRenewAck(KeyRenewAck::new(sensor_eph_pubkey)),
                         timestamp,
                     );
                     let ack_nonce = derive_ack_nonce(chacha_nonce, tx);

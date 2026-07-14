@@ -3,8 +3,7 @@ use crate::com::handshake::install_core::HandshakeResult;
 use crate::com::handshake::lora_helpers::{send_encrypted, try_receive_encrypted};
 use crate::com::handshake::renew::sensor::KeyRenewRequest;
 use crate::com::handshake::renew_core::{
-    GATEWAY_RENEW_ACK_RX_TIMEOUT, GATEWAY_RENEW_CHALLENGE_RESEND_PERIOD, KeyRenewAck,
-    KeyRenewChallenge,
+    GATEWAY_RENEW_ACK_RX_TIMEOUT, GATEWAY_RENEW_CHALLENGE_RESEND_PERIOD, KeyRenewChallenge,
 };
 use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, derive_session_key};
 use crate::models::common::{
@@ -16,16 +15,20 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::SpiBus;
 use lora;
 
-/// Lightweight renew core (gateway): encrypted challenge (ECDH only) + wait for `KeyRenewAck`.
+/// Lightweight renew core (gateway): encrypted challenge + wait for `KeyRenewAck`.
 ///
-/// `ecdh_ephemeral` generates an ephemeral P-256 keypair and returns
-/// `(eph_pubkey_compressed, shared_secret)` for the paired sensor's public key.
+/// Uses **ephemeral-to-ephemeral** ECDH:
+/// 1. `generate_gateway_ephemeral` creates the gateway ephemeral keypair (private key stays in HW).
+/// 2. The sensor replies with its ephemeral pubkey in `KeyRenewAck`.
+/// 3. `ecdh_with_sensor_ephemeral` completes ECDH between the stored gateway ephemeral private
+///    key and the sensor ephemeral public key.
 #[allow(clippy::too_many_arguments)]
-pub fn send_renew_challenge_and_wait_ack<SPI, CS, RST, SpiErr, FEPH>(
+pub fn send_renew_challenge_and_wait_ack<SPI, CS, RST, SpiErr, FGEN, FECDH>(
     request: &KeyRenewRequest,
     session_key: &[u8; 32],
     chacha_nonce: &[u8; 12],
-    ecdh_ephemeral: FEPH,
+    generate_gateway_ephemeral: FGEN,
+    ecdh_with_sensor_ephemeral: FECDH,
     sensor_pubkey: &[u8; PUBLIC_KEY_LEN],
     sensor_mac: [u8; 17],
     gateway_mac: [u8; 17],
@@ -40,12 +43,12 @@ where
     CS: OutputPin,
     RST: OutputPin,
     SpiErr: core::fmt::Debug,
-    FEPH: Fn(&[u8; PUBLIC_KEY_LEN]) -> Result<([u8; PUBLIC_KEY_LEN], [u8; 32]), ()>,
+    FGEN: Fn() -> Result<[u8; PUBLIC_KEY_LEN], ()>,
+    FECDH: Fn(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
 {
-    let (eph_pubkey, shared_secret) = ecdh_ephemeral(sensor_pubkey)
-        .map_err(|_| ComError::VerificationFailed)?;
+    let gw_eph_pubkey = generate_gateway_ephemeral().map_err(|_| ComError::VerificationFailed)?;
 
-    if eph_pubkey.iter().all(|&b| b == 0) || shared_secret.iter().all(|&b| b == 0) {
+    if gw_eph_pubkey.iter().all(|&b| b == 0) {
         return Err(ComError::VerificationFailed);
     }
 
@@ -54,7 +57,7 @@ where
         gateway_mac,
         MessageType::KeyRenewChallenge,
         ResponseType::KeyRenewChallenge(KeyRenewChallenge::new(
-            eph_pubkey,
+            gw_eph_pubkey,
             gateway_nonce,
             key_expire_at,
         )),
@@ -86,10 +89,20 @@ where
                 if msg.header.src != sensor_mac {
                     continue;
                 }
-                if !matches!(
-                    msg.body,
-                    BodySchema::RequestType(RequestType::KeyRenewAck(KeyRenewAck))
-                ) {
+                let ack = if let BodySchema::RequestType(RequestType::KeyRenewAck(ack)) = msg.body {
+                    ack
+                } else {
+                    continue;
+                };
+
+                let sensor_eph_pubkey = *ack.sensor_eph_pubkey_compressed();
+                if sensor_eph_pubkey.iter().all(|&b| b == 0) {
+                    continue;
+                }
+
+                let shared_secret = ecdh_with_sensor_ephemeral(&sensor_eph_pubkey)
+                    .map_err(|_| ComError::VerificationFailed)?;
+                if shared_secret.iter().all(|&b| b == 0) {
                     continue;
                 }
 
