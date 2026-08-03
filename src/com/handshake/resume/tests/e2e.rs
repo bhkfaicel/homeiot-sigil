@@ -8,10 +8,10 @@ use crate::com::handshake::resume::gateway::handle_resume_request;
 use crate::com::handshake::resume::sensor::resume_session;
 use crate::com::handshake::resume_core::SessionResumeRequest;
 use crate::com::handshake::sensor::tests::helpers::{
-    create_controller, test_ecdh_ephemeral_with_peer, test_ecdh_with_sensor_ephemeral,
-    test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY,
+    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY, create_controller, test_ecdh_ephemeral_with_peer,
+    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral,
 };
-use crate::com::handshake::{derive_session_key, PUBLIC_KEY_LEN, SIGNATURE_LEN};
+use crate::com::handshake::{PUBLIC_KEY_LEN, SIGNATURE_LEN, derive_session_key};
 use lora::sx1278::tests::common::{
     expectations_for_new, expectations_for_receive_success, expectations_for_receiver_mode,
     expectations_for_send,
@@ -62,11 +62,20 @@ fn resume_session_keys_match() {
         0x42,
         Mode::Receiver,
     ));
-    sensor_exp.extend(expectations_for_send(&confirm_buffer[..confirm_len], Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     sensor_exp.extend(expectations_for_receiver_mode());
-    sensor_exp.extend(expectations_for_send(&confirm_buffer[..confirm_len], Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     sensor_exp.extend(expectations_for_receiver_mode());
-    sensor_exp.extend(expectations_for_send(&confirm_buffer[..confirm_len], Mode::Manual));
+    sensor_exp.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
 
     let mut gateway_exp = expectations_for_new(Mode::Manual);
     gateway_exp.extend(expectations_for_send(

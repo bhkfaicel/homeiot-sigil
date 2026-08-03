@@ -7,8 +7,8 @@ use crate::com::handshake::lora_helpers::send_with_retries;
 use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, derive_session_key};
 use crate::com::keys::Keys;
 use crate::models::common::{
-    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType,
-    ResponseType, deserialize_clear,
+    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
+    deserialize_clear,
 };
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
@@ -59,7 +59,10 @@ where
                 delay.delay_ms(120u32);
                 continue;
             }
-            Err(LoRaError::CrcError) | Err(LoRaError::DeCompressionFailed) | Err(LoRaError::Timeout) | Err(LoRaError::BufferTooSmall { .. }) => {
+            Err(LoRaError::CrcError)
+            | Err(LoRaError::DeCompressionFailed)
+            | Err(LoRaError::Timeout)
+            | Err(LoRaError::BufferTooSmall { .. }) => {
                 delay.delay_ms(80u32);
                 continue;
             }
@@ -70,9 +73,13 @@ where
                 });
             }
             Err(LoRaError::Canceled) => return Err(ComError::Canceled),
-            Err(LoRaError::UnsupportedModule(code)) => return Err(ComError::UnsupportedModule(code)),
+            Err(LoRaError::UnsupportedModule(code)) => {
+                return Err(ComError::UnsupportedModule(code));
+            }
             Err(LoRaError::CompressionFailed) => return Err(ComError::CompressionFailed),
-            Err(LoRaError::Spi(_)) => return Err(ComError::Custom("SPI error during challenge receive")),
+            Err(LoRaError::Spi(_)) => {
+                return Err(ComError::Custom("SPI error during challenge receive"));
+            }
         };
 
         let clear_msg =
@@ -88,13 +95,12 @@ where
             continue;
         }
 
-        let challenge = if let BodySchema::ResponseType(ResponseType::HandshakeChallenge(c)) =
-            clear_msg.body
-        {
-            c
-        } else {
-            continue;
-        };
+        let challenge =
+            if let BodySchema::ResponseType(ResponseType::HandshakeChallenge(c)) = clear_msg.body {
+                c
+            } else {
+                continue;
+            };
 
         let gw_eph_pubkey = *challenge.eph_pubkey_compressed();
         if gw_eph_pubkey.iter().all(|&b| b == 0) {
@@ -126,10 +132,7 @@ where
             battery_level,
             OneDestination(gateway_mac),
             MessageType::HandshakeConfirm,
-            RequestType::HandshakeConfirm(HandshakeConfirm::new(
-                sig_gw_nonce,
-                sensor_eph_pubkey,
-            )),
+            RequestType::HandshakeConfirm(HandshakeConfirm::new(sig_gw_nonce, sensor_eph_pubkey)),
             timestamp,
         );
         let (confirm_buffer, confirm_len) = confirm_msg

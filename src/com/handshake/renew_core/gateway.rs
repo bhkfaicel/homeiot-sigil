@@ -7,8 +7,7 @@ use crate::com::handshake::renew_core::{
 };
 use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, derive_session_key};
 use crate::models::common::{
-    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType,
-    ResponseType,
+    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
 };
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;

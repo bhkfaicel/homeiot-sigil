@@ -14,6 +14,7 @@ and this project adheres to semantic versioning.
 - Add: `scripts/check-version-sync.sh`, `resolve-cargo-registry.sh`, `release-branch-name.sh` (+ unit tests).
 - Docs: `.forgejo/README.md` documents the release / maintenance-branch model.
 - Remove: legacy `publish-on-dev.yml` / `publish-on-main.yml` (PAT-in-URL + Cargo.toml `-rc` bump on main).
+- Add: `validate-branch-flow.yml` calls shared `faicel/central_ci` → `validate_flow.yml` (`* → dev`, `dev → staging`, `staging → main`); remove local `enforce-branch-flow.yml`.
 
 ## [0.4.0-rc.0] 2026-07-14
 

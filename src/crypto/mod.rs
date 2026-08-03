@@ -1,7 +1,7 @@
 use chacha20poly1305::{
-    aead::generic_array::GenericArray,
-    aead::{heapless::Vec, AeadInPlace},
     ChaCha20Poly1305, KeyInit,
+    aead::generic_array::GenericArray,
+    aead::{AeadInPlace, heapless::Vec},
 };
 
 /// Encrypts a buffer in place using ChaCha20-Poly1305.

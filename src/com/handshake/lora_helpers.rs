@@ -3,7 +3,7 @@
 use crate::com::error::model::ComError;
 use crate::com::handshake::HANDSHAKE_MESSAGE_MAX;
 use crate::models::common::{
-    deserialize, deserialize_body, MessageSchema, MessageType, LORA_USER_PAYLOAD_MAX,
+    LORA_USER_PAYLOAD_MAX, MessageSchema, MessageType, deserialize, deserialize_body,
 };
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;

@@ -1,12 +1,11 @@
 use crate::com::error::model::ComError;
-use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::com::handshake::sensor::initiate_handshake;
 use crate::com::handshake::sensor::tests::helpers::{
-    build_handshake_challenge_buffer, build_handshake_confirm_buffer,
-    build_handshake_request_buffer, create_controller,
+    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY, build_handshake_challenge_buffer,
+    build_handshake_confirm_buffer, build_handshake_request_buffer, create_controller,
     expectations_for_sensor_challenge_listen_timeout, test_ecdh_ephemeral_with_peer,
-    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY,
 };
+use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use lora::sx1278::tests::common::{
     expectations_for_new, expectations_for_receive_success, expectations_for_receiver_mode,
     expectations_for_send,
@@ -14,11 +13,15 @@ use lora::sx1278::tests::common::{
 use lora::sx1278::{Controller, Mode};
 
 fn sensor_mac() -> [u8; 17] {
-    [67, 56, 58, 67, 53, 58, 68, 55, 58, 48, 49, 58, 54, 50, 58, 50, 51]
+    [
+        67, 56, 58, 67, 53, 58, 68, 55, 58, 48, 49, 58, 54, 50, 58, 50, 51,
+    ]
 }
 
 fn gateway_mac() -> [u8; 17] {
-    [26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51]
+    [
+        26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51,
+    ]
 }
 
 #[test]
@@ -59,10 +62,7 @@ fn ok() {
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(
-        &request_buffer[..request_len],
-        mode,
-    ));
+    expectations.extend(expectations_for_send(&request_buffer[..request_len], mode));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
         &challenge_buffer[..challenge_len],
@@ -189,10 +189,7 @@ fn verification_failed_sig_sensor_nonce() {
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(
-        &request_buffer[..request_len],
-        mode,
-    ));
+    expectations.extend(expectations_for_send(&request_buffer[..request_len], mode));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
         &challenge_buffer[..challenge_len],

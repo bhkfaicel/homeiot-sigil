@@ -1,11 +1,10 @@
 use crate::com::error::model::ComError;
 use crate::com::handshake::gateway::handle_handshake_request;
 use crate::com::handshake::sensor::tests::helpers::{
-    build_handshake_challenge_buffer, build_handshake_confirm_buffer,
-    build_handshake_request_buffer, create_controller,
+    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY, build_handshake_challenge_buffer,
+    build_handshake_confirm_buffer, build_handshake_request_buffer, create_controller,
     expectations_for_sensor_challenge_listen_timeout, test_ecdh_ephemeral_with_peer,
-    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY,
-    TEST_SENSOR_EPH_PUBKEY,
+    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral,
 };
 use crate::com::handshake::sensor::{HandshakeRequest, initiate_handshake};
 use crate::com::handshake::{

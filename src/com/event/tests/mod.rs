@@ -8,7 +8,9 @@ mod tests {
     use crate::com::keys::KeyManager;
     use crate::models::common::Destination::OneDestination;
     use crate::models::common::TIMESTAMP_NOT_AVAILABLE;
-    use crate::models::common::{MessageSchema, MessageType, RequestType, ResponseType, Status, LORA_USER_PAYLOAD_MAX};
+    use crate::models::common::{
+        LORA_USER_PAYLOAD_MAX, MessageSchema, MessageType, RequestType, ResponseType, Status,
+    };
 
     use lora::sx1278::tests::common::{expectations_for_new, expectations_for_send};
     use lora::sx1278::{Controller, Mode};

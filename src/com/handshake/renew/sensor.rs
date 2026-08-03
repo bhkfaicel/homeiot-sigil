@@ -2,9 +2,7 @@ use crate::com::error::model::ComError;
 use crate::com::handshake::install_core::HandshakeSession;
 use crate::com::handshake::lora_helpers::send_encrypted;
 use crate::com::handshake::renew_core::sensor::complete_renew_as_sensor;
-use crate::models::common::{
-    Destination::OneDestination, MessageSchema, MessageType, RequestType,
-};
+use crate::models::common::{Destination::OneDestination, MessageSchema, MessageType, RequestType};
 use bincode::{Decode, Encode};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
@@ -51,10 +49,9 @@ where
     SPI: SpiBus<u8, Error = SpiErr>,
     CS: OutputPin,
     RST: OutputPin,
-    FEPH: FnMut(&[u8; crate::com::handshake::PUBLIC_KEY_LEN]) -> Result<
-        ([u8; crate::com::handshake::PUBLIC_KEY_LEN], [u8; 32]),
-        (),
-    >,
+    FEPH: FnMut(
+        &[u8; crate::com::handshake::PUBLIC_KEY_LEN],
+    ) -> Result<([u8; crate::com::handshake::PUBLIC_KEY_LEN], [u8; 32]), ()>,
 {
     let mut msg = MessageSchema::create_body_request(
         sensor_mac,

@@ -12,7 +12,10 @@ pub struct SessionResumeRequest {
 
 impl SessionResumeRequest {
     /// Builds a resume request with the sensor nonce and its ECDSA signature.
-    pub fn new(sensor_nonce: [u8; 32], sig_sensor_nonce: [u8; crate::com::handshake::SIGNATURE_LEN]) -> Self {
+    pub fn new(
+        sensor_nonce: [u8; 32],
+        sig_sensor_nonce: [u8; crate::com::handshake::SIGNATURE_LEN],
+    ) -> Self {
         Self {
             sensor_nonce,
             sig_sensor_nonce,

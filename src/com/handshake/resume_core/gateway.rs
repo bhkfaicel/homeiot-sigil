@@ -7,8 +7,8 @@ use crate::com::handshake::{
     HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN, derive_session_key,
 };
 use crate::models::common::{
-    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType,
-    ResponseType, deserialize_clear,
+    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
+    deserialize_clear,
 };
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
@@ -86,12 +86,11 @@ where
             }
         };
 
-        let clear_msg = match deserialize_clear::<HANDSHAKE_MESSAGE_MAX>(
-            &recv_buffer[..receive_result.size],
-        ) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let clear_msg =
+            match deserialize_clear::<HANDSHAKE_MESSAGE_MAX>(&recv_buffer[..receive_result.size]) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
 
         if clear_msg.header.message_type != MessageType::SessionResumeConfirm {
             if clear_msg.header.message_type == MessageType::SessionResumeRequest
@@ -124,11 +123,8 @@ where
                 continue;
             }
 
-            let session_key = derive_session_key(
-                &shared_secret,
-                request.sensor_nonce(),
-                gateway_nonce,
-            );
+            let session_key =
+                derive_session_key(&shared_secret, request.sensor_nonce(), gateway_nonce);
             return Ok(HandshakeResult {
                 session_key,
                 sensor_pubkey: *sensor_pubkey,

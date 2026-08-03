@@ -22,7 +22,8 @@ The stable/unstable split is done by **registry**, not by rewriting the crate ve
 7. Tag push → `publish-on-tag.yml` publishes to `forgejo` (client prod).  
    Note: that workflow sets `enable_tag_check: false` because the tag already exists (it is the trigger); the tag check stays enabled on feature/`dev`/`main` pushes to prevent duplicate releases.
 
-`enforce-branch-flow.yml` still validates PR direction (`* → dev`, `dev → staging`, `staging → main`).
+`validate-branch-flow.yml` enforces PR direction via shared `faicel/central_ci` → `validate_flow.yml`:
+`* → dev`, `dev → staging`, `staging → main`.
 
 Keep `Cargo.toml` and the latest `CHANGELOG.md` heading in sync (see `scripts/check-version-sync.sh`).
 

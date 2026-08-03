@@ -136,16 +136,19 @@ fn key_renew_request_roundtrip_encode() {
     let mut encoded = [0u8; 64];
     let len = bincode::encode_into_slice(&request, &mut encoded, bincode::config::standard())
         .expect("encode");
-    let (decoded, _) =
-        bincode::decode_from_slice::<KeyRenewRequest, _>(&encoded[..len], bincode::config::standard())
-            .expect("decode");
+    let (decoded, _) = bincode::decode_from_slice::<KeyRenewRequest, _>(
+        &encoded[..len],
+        bincode::config::standard(),
+    )
+    .expect("decode");
     assert_eq!(decoded, request);
 }
 
 #[test]
 fn key_renew_request_encrypted_wire_format() {
     let sensor_nonce = [0x55; 32];
-    let (buffer, len) = build_key_renew_request_buffer(sensor_mac(), gateway_mac(), sensor_nonce, 1_000);
+    let (buffer, len) =
+        build_key_renew_request_buffer(sensor_mac(), gateway_mac(), sensor_nonce, 1_000);
 
     assert!(len > 0);
     assert!(len <= crate::models::common::LORA_USER_PAYLOAD_MAX);
@@ -300,10 +303,7 @@ fn renew_session_ok() {
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(
-        &request_buffer[..request_len],
-        mode,
-    ));
+    expectations.extend(expectations_for_send(&request_buffer[..request_len], mode));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<256>(
         &challenge_buffer[..challenge_len],

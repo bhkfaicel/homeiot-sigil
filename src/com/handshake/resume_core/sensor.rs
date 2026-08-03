@@ -5,11 +5,13 @@ use crate::com::handshake::resume_core::{
     CONFIRM_RETRIES, SENSOR_CHALLENGE_RX_TIMEOUT, SENSOR_REBROADCAST_FIRST_ATTEMPT,
     SENSOR_REBROADCAST_INTERVAL,
 };
-use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN, derive_session_key};
+use crate::com::handshake::{
+    HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN, derive_session_key,
+};
 use crate::com::keys::Keys;
 use crate::models::common::{
-    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType,
-    ResponseType, deserialize_clear,
+    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
+    deserialize_clear,
 };
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
@@ -71,10 +73,14 @@ where
                 });
             }
             Err(LoRaError::Canceled) => return Err(ComError::Canceled),
-            Err(LoRaError::UnsupportedModule(code)) => return Err(ComError::UnsupportedModule(code)),
+            Err(LoRaError::UnsupportedModule(code)) => {
+                return Err(ComError::UnsupportedModule(code));
+            }
             Err(LoRaError::CompressionFailed) => return Err(ComError::CompressionFailed),
             Err(LoRaError::Spi(_)) => {
-                return Err(ComError::Custom("SPI error during resume challenge receive"));
+                return Err(ComError::Custom(
+                    "SPI error during resume challenge receive",
+                ));
             }
         };
 

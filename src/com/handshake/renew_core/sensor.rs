@@ -2,14 +2,13 @@ use crate::com::error::model::ComError;
 use crate::com::handshake::install_core::HandshakeSession;
 use crate::com::handshake::lora_helpers::{send_encrypted, try_receive_encrypted};
 use crate::com::handshake::renew_core::{
-    CONFIRM_RETRIES, KeyRenewAck, SENSOR_CHALLENGE_RX_TIMEOUT,
-    SENSOR_REBROADCAST_FIRST_ATTEMPT, SENSOR_REBROADCAST_INTERVAL,
+    CONFIRM_RETRIES, KeyRenewAck, SENSOR_CHALLENGE_RX_TIMEOUT, SENSOR_REBROADCAST_FIRST_ATTEMPT,
+    SENSOR_REBROADCAST_INTERVAL,
 };
 use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, derive_session_key};
 use crate::com::keys::Keys;
 use crate::models::common::{
-    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType,
-    ResponseType,
+    BodySchema, Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
 };
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
@@ -56,8 +55,9 @@ where
                     continue;
                 }
 
-                let challenge = if let BodySchema::ResponseType(ResponseType::KeyRenewChallenge(c)) =
-                    msg.body
+                let challenge = if let BodySchema::ResponseType(ResponseType::KeyRenewChallenge(
+                    c,
+                )) = msg.body
                 {
                     c
                 } else {
@@ -75,7 +75,8 @@ where
                         Err(_) => return Err(ComError::VerificationFailed),
                     };
 
-                if sensor_eph_pubkey.iter().all(|&b| b == 0) || shared_secret.iter().all(|&b| b == 0)
+                if sensor_eph_pubkey.iter().all(|&b| b == 0)
+                    || shared_secret.iter().all(|&b| b == 0)
                 {
                     return Err(ComError::VerificationFailed);
                 }
