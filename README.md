@@ -69,8 +69,13 @@ Add to your `Cargo.toml` (adjust registry and version as needed):
 
 ```toml
 [dependencies]
-sigil = { version = "0.3", registry = "forgejo", default-features = false, features = ["com"] }
+# Stable (prod):
+sigil = { version = "=0.4.0", registry = "forgejo", default-features = false, features = ["com"] }
+# Unstable (client staging), after a `dev` publish:
+# sigil = { version = "=0.4.0", registry = "forgejorc", default-features = false, features = ["com"] }
 ```
+
+Publish / release flow (tags, registries, `release/X.Y`): see [`.forgejo/README.md`](.forgejo/README.md).
 
 Read and decrypt a message with `Sigil::read`:
 
