@@ -1,10 +1,8 @@
 use crate::com::error::model::ComError;
-use crate::com::handshake::install_core::sensor::complete_install_as_sensor;
 use crate::com::handshake::install_core::HandshakeSession;
+use crate::com::handshake::install_core::sensor::complete_install_as_sensor;
 use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
-use crate::models::common::{
-    Destination::AllGateways, MessageSchema, MessageType, RequestType,
-};
+use crate::models::common::{Destination::AllGateways, MessageSchema, MessageType, RequestType};
 use bincode::{Decode, Encode};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;

@@ -1,6 +1,6 @@
 use crate::com::event::message::Event;
-use crate::com::handshake::install_core::{HandshakeChallenge, HandshakeConfirm};
 use crate::com::handshake::install::sensor::HandshakeRequest;
+use crate::com::handshake::install_core::{HandshakeChallenge, HandshakeConfirm};
 use crate::com::handshake::renew::sensor::KeyRenewRequest;
 use crate::com::handshake::renew_core::{KeyRenewAck, KeyRenewChallenge};
 use crate::com::handshake::resume_core::SessionResumeRequest;
@@ -291,7 +291,9 @@ impl MessageSchema {
     ///
     /// Callers must pass only `&buffer[..encoded_len]` to LoRa TX — trailing zeros break
     /// `deserialize_clear` on the receiver and can exceed the SX1278 user payload limit.
-    pub fn serialize_clear_with_len<const N: usize>(&mut self) -> Result<([u8; N], usize), &'static str> {
+    pub fn serialize_clear_with_len<const N: usize>(
+        &mut self,
+    ) -> Result<([u8; N], usize), &'static str> {
         let mut slice: [u8; N] = [0u8; N];
         let len = bincode::encode_into_slice(&*self, &mut slice, bincode::config::standard())
             .map_err(|_| "Envelope serialization failed")?;
@@ -312,10 +314,7 @@ pub fn deserialize<const N: usize>(
         bincode::config::standard(),
     )
     .map_err(|_| "Bad body")?;
-    Ok(EncryptedSchema {
-        header,
-        body,
-    })
+    Ok(EncryptedSchema { header, body })
 }
 
 /// Deserialize a clear‑text `MessageSchema` that was serialized without
@@ -340,10 +339,7 @@ pub fn deserialize_body<const N: usize>(
         bincode::decode_from_slice::<BodySchema, _>(&encrypted[..], bincode::config::standard())
             .map_err(|_| "Decryption decode failed")?;
 
-    Ok(MessageSchema {
-        header,
-        body,
-    })
+    Ok(MessageSchema { header, body })
 }
 
 pub mod error;

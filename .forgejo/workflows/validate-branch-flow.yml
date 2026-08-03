@@ -1,0 +1,15 @@
+# Enforce allowed PR directions for this repository:
+#   * → dev,  dev → staging,  staging → main
+#
+# Uses the shared reusable workflow from faicel/central_ci.
+# Lint/tests are NOT run here — see check-on-feature-branch.yml and create-tag-*.yml.
+
+name: Validate branch flow
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  validate:
+    uses: faicel/central_ci/.forgejo/workflows/validate_flow.yml@main

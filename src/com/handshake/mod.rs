@@ -1,12 +1,12 @@
-pub mod install_core;
-pub mod renew_core;
-pub mod resume_core;
-pub mod lora_helpers;
-pub mod primitives;
 pub mod gateway;
 pub mod install;
+pub mod install_core;
+pub mod lora_helpers;
+pub mod primitives;
 pub mod renew;
+pub mod renew_core;
 pub mod resume;
+pub mod resume_core;
 pub mod sensor;
 
 /// Backward-compatible alias for [`install_core`].
@@ -82,8 +82,8 @@ pub fn encrypt_challenge(
     plaintext: &[u8; CHALLENGE_PLAINTEXT_LEN],
     out: &mut [u8; ECIES_CIPHERTEXT_LEN],
 ) -> Result<(), ChallengeCryptoError> {
-    use chacha20poly1305::aead::heapless::Vec as HVec;
     use chacha20poly1305::aead::AeadInPlace;
+    use chacha20poly1305::aead::heapless::Vec as HVec;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
     use hkdf::Hkdf;
     use sha2::Sha256;
@@ -117,10 +117,10 @@ pub fn decrypt_challenge<FECDH>(
 where
     FECDH: FnMut(&[u8; PUBLIC_KEY_LEN]) -> Result<[u8; 32], ()>,
 {
-    use chacha20poly1305::aead::heapless::Vec as HVec;
-    use chacha20poly1305::aead::AeadInPlace;
-    use chacha20poly1305::KeyInit;
     use chacha20poly1305::ChaCha20Poly1305;
+    use chacha20poly1305::KeyInit;
+    use chacha20poly1305::aead::AeadInPlace;
+    use chacha20poly1305::aead::heapless::Vec as HVec;
     use hkdf::Hkdf;
     use sha2::Sha256;
 
@@ -132,8 +132,8 @@ where
         .map_err(|_| ChallengeCryptoError::InvalidCiphertextLayout)?;
     let ct_and_tag = &ciphertext[PUBLIC_KEY_LEN + 12..];
 
-    let shared_secret = ecdh_shared_secret(&eph_pubkey_compressed)
-        .map_err(|_| ChallengeCryptoError::EcdhFailed)?;
+    let shared_secret =
+        ecdh_shared_secret(&eph_pubkey_compressed).map_err(|_| ChallengeCryptoError::EcdhFailed)?;
 
     let hkdf = Hkdf::<Sha256>::new(Some(&eph_pubkey_compressed), &shared_secret);
     let mut enc_key = [0u8; 32];

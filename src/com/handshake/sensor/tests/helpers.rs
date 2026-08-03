@@ -1,9 +1,9 @@
-use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
+use crate::com::handshake::install::sensor::HandshakeRequest;
 use crate::com::handshake::install_core::{
     HandshakeChallenge, HandshakeConfirm, SENSOR_CHALLENGE_RX_TIMEOUT,
     SENSOR_REBROADCAST_FIRST_ATTEMPT, SENSOR_REBROADCAST_INTERVAL,
 };
-use crate::com::handshake::install::sensor::HandshakeRequest;
+use crate::com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::models::common::{
     Destination::{AllGateways, OneDestination},
     MessageSchema, MessageType, RequestType, ResponseType,
@@ -120,10 +120,7 @@ pub fn build_handshake_confirm_buffer(
         battery_level,
         OneDestination(gateway_mac),
         MessageType::HandshakeConfirm,
-        RequestType::HandshakeConfirm(HandshakeConfirm::new(
-            sig_gateway_nonce,
-            sensor_eph_pubkey,
-        )),
+        RequestType::HandshakeConfirm(HandshakeConfirm::new(sig_gateway_nonce, sensor_eph_pubkey)),
         timestamp,
     );
     message
@@ -175,10 +172,7 @@ pub fn create_expectations_for_initiate_handshake(
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(
-        &request_buffer[..request_len],
-        mode,
-    ));
+    expectations.extend(expectations_for_send(&request_buffer[..request_len], mode));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<HANDSHAKE_MESSAGE_MAX>(
         &challenge_buffer[..challenge_len],

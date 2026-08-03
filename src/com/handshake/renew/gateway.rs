@@ -1,8 +1,8 @@
 use crate::com::error::model::ComError;
+use crate::com::handshake::PUBLIC_KEY_LEN;
 use crate::com::handshake::install_core::HandshakeResult;
 use crate::com::handshake::renew::sensor::KeyRenewRequest;
 use crate::com::handshake::renew_core::gateway::send_renew_challenge_and_wait_ack;
-use crate::com::handshake::PUBLIC_KEY_LEN;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::SpiBus;

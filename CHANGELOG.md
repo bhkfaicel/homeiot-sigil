@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to semantic versioning.
 
+## [0.5.0] - 2026-08-04
+
+### Changed
+
+- CI publish flow aligned with lis2dh12: `Cargo.toml` stays at stable `X.Y.Z`; `dev` tags `vX.Y.Z-rc` → forgejorc; `staging` is merge gate only; `main` tags `vX.Y.Z` → forgejo and creates `release/X.Y` for hotfixes.
+- Add: `check-on-feature-branch.yml`, `create-tag-on-dev.yml`, `create-tag-on-main.yml`; rewrite `publish-on-tag.yml` (shared `central_ci` checks, `enable_tag_check: false` on tag publish).
+- Add: `scripts/check-version-sync.sh`, `resolve-cargo-registry.sh`, `release-branch-name.sh` (+ unit tests).
+- Docs: `.forgejo/README.md` documents the release / maintenance-branch model.
+- Remove: legacy `publish-on-dev.yml` / `publish-on-main.yml` (PAT-in-URL + Cargo.toml `-rc` bump on main).
+- Add: `validate-branch-flow.yml` calls shared `faicel/central_ci` → `validate_flow.yml` (`* → dev`, `dev → staging`, `staging → main`); remove local `enforce-branch-flow.yml`.
+
 ## [0.4.0-rc.0] 2026-07-14
 
 ### Added

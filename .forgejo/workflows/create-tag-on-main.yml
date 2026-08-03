@@ -1,0 +1,91 @@
+# On push to main: run shared Rust checks, create/push stable tag vX.Y.Z from
+# Cargo.toml (no -rc), and ensure maintenance branch `release/X.Y` exists.
+# Publishing is done by `publish-on-tag.yml` → forgejo.
+#
+# Cargo.toml always holds the stable base version (e.g. 0.4.0). Merge staging → main
+# without rewriting the version; `dev` adds a fixed `-rc` suffix on tags (staging does not publish).
+#
+# `release/X.Y` is created once (at first stable publish of that minor line) and is
+# NOT force-updated later — hotfixes land on that branch as 0.4.1, 0.4.2, …
+#
+# Requires: RUNNER_TOKEN secret (PAT with read repo and push for tags/branches).
+# Git push authenticates via GIT_ASKPASS (HTTP Basic: username + PAT as password).
+# Shared checks: faicel/central_ci rust_crate_checks.yml
+#
+# One broad RUNNER_TOKEN is OK because Forgejo branch protection
+# on `main` sets Protected file patterns `.gitea/**/*.yml;.forgejo/**/*.yml`
+
+name: Create tag on main
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  checks:
+    uses: faicel/central_ci/.forgejo/workflows/rust_crate_checks.yml@main
+    with:
+      enable_deny: false
+    secrets:
+      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+
+  tag_stable:
+    needs: checks
+    runs-on: docker
+    container:
+      image: code.bhk-itsolutions.com/homeiot/ci-rust-embedded:rust-1.97.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.RUNNER_TOKEN }}
+          fetch-depth: 0
+          # Do not persist the PAT in .git/config / remote URL (S1).
+          persist-credentials: false
+
+      - name: Create stable tag and ensure release/X.Y branch
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          FORGEJO_GIT_USERNAME: git
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "$VERSION" == *-rc* ]]; then
+            echo "Error: Cargo.toml version '$VERSION' must be stable on main (e.g. 0.4.0)."
+            exit 1
+          fi
+          TAG_NAME="v${VERSION}"
+          RELEASE_BRANCH=$(bash scripts/release-branch-name.sh "$VERSION")
+          echo "Stable tag: $TAG_NAME | maintenance branch: $RELEASE_BRANCH"
+
+          git config user.name "CI"
+          git config user.email "ci@forgejo"
+          git remote set-url origin "https://code.bhk-itsolutions.com/homeiot/sigil.git"
+
+          ASKPASS="$(mktemp)"
+          trap 'rm -f "$ASKPASS"' EXIT
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'case "$1" in' \
+            '  *Username*) printf "%s\n" "${FORGEJO_GIT_USERNAME:-git}" ;;' \
+            '  *) printf "%s\n" "$REPO_ACCESS_TOKEN" ;;' \
+            'esac' > "$ASKPASS"
+          chmod 700 "$ASKPASS"
+
+          if git ls-remote --tags origin "refs/tags/${TAG_NAME}" | grep -q .; then
+            echo "Tag $TAG_NAME already exists on remote, skipping tag push"
+          else
+            git tag "$TAG_NAME" 2>/dev/null || echo "Tag $TAG_NAME already exists locally"
+            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$ASKPASS" git push origin "$TAG_NAME"
+          fi
+
+          # Create release/X.Y once from this stable commit; do not move it later.
+          if git ls-remote --heads origin "refs/heads/${RELEASE_BRANCH}" | grep -q .; then
+            echo "Branch $RELEASE_BRANCH already exists on remote, leaving it unchanged"
+            echo "(Hotfixes belong on $RELEASE_BRANCH; do not reset it to main.)"
+          else
+            echo "Creating maintenance branch $RELEASE_BRANCH at $TAG_NAME"
+            git branch "$RELEASE_BRANCH" "$TAG_NAME"
+            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$ASKPASS" git push origin "$RELEASE_BRANCH"
+          fi

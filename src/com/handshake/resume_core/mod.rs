@@ -11,6 +11,4 @@ pub use crate::com::handshake::install_core::{
 };
 
 /// Re-exports gateway confirm listen constants (shared with install).
-pub use crate::com::handshake::{
-    GATEWAY_CHALLENGE_RESEND_PERIOD, GATEWAY_CONFIRM_RX_TIMEOUT,
-};
+pub use crate::com::handshake::{GATEWAY_CHALLENGE_RESEND_PERIOD, GATEWAY_CONFIRM_RX_TIMEOUT};

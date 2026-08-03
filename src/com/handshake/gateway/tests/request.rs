@@ -1,14 +1,14 @@
 use crate::com::error::model::ComError;
+use crate::com::handshake::gateway::{HandshakeChallenge, handle_handshake_request};
+use crate::com::handshake::sensor::tests::helpers::{
+    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY, test_ecdh_with_sensor_ephemeral,
+    test_generate_gateway_ephemeral,
+};
+use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
 use crate::com::handshake::{
     GATEWAY_CHALLENGE_RESEND_PERIOD, GATEWAY_CONFIRM_RX_TIMEOUT, HANDSHAKE_MESSAGE_MAX,
     PUBLIC_KEY_LEN, SIGNATURE_LEN,
 };
-use crate::com::handshake::gateway::{handle_handshake_request, HandshakeChallenge};
-use crate::com::handshake::sensor::tests::helpers::{
-    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY,
-    TEST_SENSOR_EPH_PUBKEY,
-};
-use crate::com::handshake::sensor::{HandshakeConfirm, HandshakeRequest};
 use crate::models::common::{
     Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
 };
@@ -25,11 +25,15 @@ use lora::sx1278::tests::common::{
 use lora::sx1278::{Controller, Mode};
 
 fn sensor_mac() -> [u8; 17] {
-    [67, 56, 58, 67, 53, 58, 68, 55, 58, 48, 49, 58, 54, 50, 58, 50, 51]
+    [
+        67, 56, 58, 67, 53, 58, 68, 55, 58, 48, 49, 58, 54, 50, 58, 50, 51,
+    ]
 }
 
 fn gateway_mac() -> [u8; 17] {
-    [26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51]
+    [
+        26, 56, 58, 67, 53, 58, 06, 55, 58, 48, 49, 58, 54, 91, 58, 50, 51,
+    ]
 }
 
 fn dummy_pubkey() -> [u8; PUBLIC_KEY_LEN] {
@@ -45,7 +49,10 @@ fn dummy_gateway_nonce() -> [u8; 32] {
 }
 
 /// Builds the expected structured `HandshakeChallenge` wire buffer.
-fn build_challenge_buffer(timestamp: u32, key_expire_at: u32) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
+fn build_challenge_buffer(
+    timestamp: u32,
+    key_expire_at: u32,
+) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) {
     let mut message = MessageSchema::create_body_response(
         sensor_mac(),
         gateway_mac(),
@@ -71,10 +78,7 @@ fn build_confirm_buffer(timestamp: u32) -> ([u8; HANDSHAKE_MESSAGE_MAX], usize) 
         80,
         OneDestination(gateway_mac()),
         MessageType::HandshakeConfirm,
-        RequestType::HandshakeConfirm(HandshakeConfirm::new(
-            dummy_sig(),
-            TEST_SENSOR_EPH_PUBKEY,
-        )),
+        RequestType::HandshakeConfirm(HandshakeConfirm::new(dummy_sig(), TEST_SENSOR_EPH_PUBKEY)),
         timestamp,
     );
     message
@@ -128,8 +132,7 @@ fn ok() {
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
 
-    let request =
-        HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
+    let request = HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| true,
@@ -179,8 +182,7 @@ fn timeout() {
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
 
-    let request =
-        HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
+    let request = HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| true,
@@ -214,8 +216,7 @@ fn verification_failed_verify_sensor() {
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
 
-    let request =
-        HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
+    let request = HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| false, // reject sensor identity
@@ -262,8 +263,7 @@ fn verification_failed_sig_gateway_nonce() {
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();
 
-    let request =
-        HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
+    let request = HandshakeRequest::new([0xAA; 32], dummy_pubkey(), dummy_sig());
     let result = handle_handshake_request(
         &request,
         |_pk, _sig| true,

@@ -3,15 +3,15 @@
 mod e2e;
 
 use crate::com::handshake::install_core::HandshakeChallenge;
+use crate::com::handshake::install_core::HandshakeConfirm;
 use crate::com::handshake::resume::gateway::handle_resume_request;
 use crate::com::handshake::resume::sensor::resume_session;
 use crate::com::handshake::resume_core::SessionResumeRequest;
 use crate::com::handshake::sensor::tests::helpers::{
-    create_controller, test_ecdh_ephemeral_with_peer, test_ecdh_with_sensor_ephemeral,
-    test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY,
+    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY, create_controller, test_ecdh_ephemeral_with_peer,
+    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral,
 };
 use crate::com::handshake::{PUBLIC_KEY_LEN, SIGNATURE_LEN};
-use crate::com::handshake::install_core::HandshakeConfirm;
 use crate::models::common::{
     Destination::OneDestination, MessageSchema, MessageType, RequestType, ResponseType,
 };
@@ -111,13 +111,8 @@ pub(crate) fn build_session_resume_confirm_buffer(
 fn session_resume_request_clear_wire_format() {
     let sensor_nonce = [0x55; 32];
     let sig = [0x66; SIGNATURE_LEN];
-    let (buffer, len) = build_session_resume_request_buffer(
-        sensor_mac(),
-        gateway_mac(),
-        sensor_nonce,
-        sig,
-        1_000,
-    );
+    let (buffer, len) =
+        build_session_resume_request_buffer(sensor_mac(), gateway_mac(), sensor_nonce, sig, 1_000);
 
     assert!(len > 0);
     assert!(len <= crate::models::common::LORA_USER_PAYLOAD_MAX);
@@ -230,21 +225,27 @@ fn resume_session_ok() {
     );
 
     let mut expectations = expectations_for_new(mode);
-    expectations.extend(expectations_for_send(
-        &request_buffer[..request_len],
-        mode,
-    ));
+    expectations.extend(expectations_for_send(&request_buffer[..request_len], mode));
     expectations.extend(expectations_for_receiver_mode());
     expectations.extend(expectations_for_receive_success::<256>(
         &challenge_buffer[..challenge_len],
         0x42,
         Mode::Receiver,
     ));
-    expectations.extend(expectations_for_send(&confirm_buffer[..confirm_len], Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_send(&confirm_buffer[..confirm_len], Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
     expectations.extend(expectations_for_receiver_mode());
-    expectations.extend(expectations_for_send(&confirm_buffer[..confirm_len], Mode::Manual));
+    expectations.extend(expectations_for_send(
+        &confirm_buffer[..confirm_len],
+        Mode::Manual,
+    ));
 
     let (mut spi, mut cs, mut rst, mut delay) = create_controller(&expectations);
     let mut controller = Controller::new(&mut spi, &mut cs, &mut rst, &mut delay, mode).unwrap();

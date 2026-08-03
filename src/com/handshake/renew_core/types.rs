@@ -74,9 +74,11 @@ mod tests {
         let mut encoded = [0u8; 64];
         let len = bincode::encode_into_slice(&ack, &mut encoded, bincode::config::standard())
             .expect("encode");
-        let (decoded, _) =
-            bincode::decode_from_slice::<KeyRenewAck, _>(&encoded[..len], bincode::config::standard())
-                .expect("decode");
+        let (decoded, _) = bincode::decode_from_slice::<KeyRenewAck, _>(
+            &encoded[..len],
+            bincode::config::standard(),
+        )
+        .expect("decode");
         assert_eq!(decoded, ack);
         assert_eq!(
             decoded.sensor_eph_pubkey_compressed(),

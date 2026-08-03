@@ -1,11 +1,10 @@
 use crate::{
-    com::handshake::{PUBLIC_KEY_LEN, SIGNATURE_LEN, HANDSHAKE_MESSAGE_MAX},
-    models::common::{
-        BodySchema, Destination::AllGateways, MessageSchema, MessageType,
-        RequestType, Status, TIMESTAMP_NOT_AVAILABLE, ENCRYPTED_BODY_MAX, LORA_USER_PAYLOAD_MAX,
-        deserialize_body,
-    },
     com::handshake::sensor::HandshakeRequest,
+    com::handshake::{HANDSHAKE_MESSAGE_MAX, PUBLIC_KEY_LEN, SIGNATURE_LEN},
+    models::common::{
+        BodySchema, Destination::AllGateways, ENCRYPTED_BODY_MAX, LORA_USER_PAYLOAD_MAX,
+        MessageSchema, MessageType, RequestType, Status, TIMESTAMP_NOT_AVAILABLE, deserialize_body,
+    },
 };
 
 fn dummy_pubkey() -> [u8; PUBLIC_KEY_LEN] {
@@ -77,13 +76,9 @@ fn test_message_serialize_deserialize() {
     );
     assert_eq!(parsed_msg.header.status, original_msg.header.status);
     assert_eq!(parsed_msg.header.timestamp, original_msg.header.timestamp);
-    let message = deserialize_body::<{ ENCRYPTED_BODY_MAX }>(
-        parsed_msg.header,
-        &parsed_msg.body,
-        &key,
-        None,
-    )
-    .unwrap();
+    let message =
+        deserialize_body::<{ ENCRYPTED_BODY_MAX }>(parsed_msg.header, &parsed_msg.body, &key, None)
+            .unwrap();
     match (message.body, &original_msg.body) {
         (
             BodySchema::RequestType(RequestType::HandshakeRequest(a)),
@@ -142,12 +137,8 @@ fn test_status_serialize_deserialize() {
 
     assert_eq!(parsed_msg.header.status, Status::Cancelled);
 
-    let message = deserialize_body::<{ ENCRYPTED_BODY_MAX }>(
-        parsed_msg.header,
-        &parsed_msg.body,
-        &key,
-        None,
-    )
-    .unwrap();
+    let message =
+        deserialize_body::<{ ENCRYPTED_BODY_MAX }>(parsed_msg.header, &parsed_msg.body, &key, None)
+            .unwrap();
     assert_eq!(message.header.status, Status::Cancelled);
 }

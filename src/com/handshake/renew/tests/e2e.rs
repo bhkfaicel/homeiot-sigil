@@ -1,15 +1,15 @@
 //! End-to-end renew tests: sensor and gateway derive the same session key.
 
 use super::{
-    build_key_renew_ack_buffer, build_key_renew_challenge_buffer, build_key_renew_request_buffer,
-    chacha_nonce, gateway_mac, sensor_mac, session_key, test_ecdh_ephemeral_with_peer,
-    test_ecdh_with_sensor_ephemeral, test_generate_gateway_ephemeral, TEST_GW_EPH_PUBKEY,
-    TEST_SENSOR_EPH_PUBKEY,
+    TEST_GW_EPH_PUBKEY, TEST_SENSOR_EPH_PUBKEY, build_key_renew_ack_buffer,
+    build_key_renew_challenge_buffer, build_key_renew_request_buffer, chacha_nonce, gateway_mac,
+    sensor_mac, session_key, test_ecdh_ephemeral_with_peer, test_ecdh_with_sensor_ephemeral,
+    test_generate_gateway_ephemeral,
 };
 use crate::com::handshake::renew::gateway::handle_renew_request;
 use crate::com::handshake::renew::sensor::{KeyRenewRequest, renew_session};
 use crate::com::handshake::sensor::tests::helpers::create_controller;
-use crate::com::handshake::{derive_session_key, PUBLIC_KEY_LEN};
+use crate::com::handshake::{PUBLIC_KEY_LEN, derive_session_key};
 use lora::sx1278::tests::common::{
     expectations_for_new, expectations_for_receive_success, expectations_for_receiver_mode,
     expectations_for_send,
@@ -146,7 +146,11 @@ fn renew_session_keys_match() {
         "renew_session returned: {:?}",
         sensor_result
     );
-    assert!(gateway_result.is_ok(), "handle_renew_request returned: {:?}", gateway_result);
+    assert!(
+        gateway_result.is_ok(),
+        "handle_renew_request returned: {:?}",
+        gateway_result
+    );
 
     let sensor_session = sensor_result.unwrap();
     let gateway_hr = gateway_result.unwrap();

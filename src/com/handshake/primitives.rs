@@ -43,7 +43,9 @@ pub fn build_renew_challenge_payload(
 pub fn parse_renew_challenge_payload(
     payload: &[u8; RENEW_CHALLENGE_PAYLOAD_LEN],
 ) -> ([u8; PUBLIC_KEY_LEN], [u8; 32], u32) {
-    let eph_pubkey = payload[..PUBLIC_KEY_LEN].try_into().expect("eph pubkey len");
+    let eph_pubkey = payload[..PUBLIC_KEY_LEN]
+        .try_into()
+        .expect("eph pubkey len");
     let gateway_nonce = payload[PUBLIC_KEY_LEN..PUBLIC_KEY_LEN + 32]
         .try_into()
         .expect("gateway nonce len");
@@ -58,8 +60,8 @@ pub fn parse_renew_challenge_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_install_plaintext, build_renew_challenge_payload, parse_renew_challenge_payload,
-        RENEW_CHALLENGE_PAYLOAD_LEN,
+        RENEW_CHALLENGE_PAYLOAD_LEN, build_install_plaintext, build_renew_challenge_payload,
+        parse_renew_challenge_payload,
     };
     use crate::com::handshake::{CHALLENGE_PLAINTEXT_LEN, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 
