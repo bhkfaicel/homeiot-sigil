@@ -1,6 +1,9 @@
 use crate::com::event::message::Event;
-use crate::com::init::gateway::{Validate, ValidateResponse};
-use crate::com::init::sensor::Install;
+use crate::com::handshake::install::sensor::HandshakeRequest;
+use crate::com::handshake::install_core::{HandshakeChallenge, HandshakeConfirm};
+use crate::com::handshake::renew::sensor::KeyRenewRequest;
+use crate::com::handshake::renew_core::{KeyRenewAck, KeyRenewChallenge};
+use crate::com::handshake::resume_core::SessionResumeRequest;
 use crate::crypto::{decrypt, encrypt};
 use crate::models::common::Destination::OneDestination;
 use bincode::{Decode, Encode};
@@ -11,6 +14,9 @@ use chacha20poly1305::aead::heapless::Vec;
 /// The encoded `EncryptedSchema` (`HeaderSchema` + `[u8; ENCRYPTED_BODY_MAX]`) must fit
 /// into the envelope used by `serialize::<N>()` (e.g. init uses 256). Header is ~47 bytes.
 pub const ENCRYPTED_BODY_MAX: usize = 200;
+
+/// Maximum user bytes passed to `lora::Controller::send` (254: one FIFO byte for compression flag).
+pub const LORA_USER_PAYLOAD_MAX: usize = 254;
 
 #[derive(Decode, Encode, Debug, Clone, Copy, PartialEq)]
 pub struct EncryptedSchema {
@@ -92,15 +98,25 @@ pub struct HeaderSchema {
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
 pub enum MessageType {
-    InstallSensorRequest,
-    ValidateRequest,
-    ValidateResponse,
-    InstallResponse,
     Event,
     EventResponse,
-    Data,
     Ack,
-    Error,
+    /// Secure handshake Step 1: sensor broadcasts nonce + public key.
+    HandshakeRequest,
+    /// Secure handshake Step 2: gateway sends ECIES-encrypted challenge.
+    HandshakeChallenge,
+    /// Secure handshake Step 3: sensor confirms by signing the gateway nonce.
+    HandshakeConfirm,
+    /// Session key renewal trigger (encrypted with the current session key).
+    KeyRenewRequest,
+    /// Lightweight renew challenge (encrypted with the current session key).
+    KeyRenewChallenge,
+    /// Lightweight renew acknowledgment (encrypted with the current session key).
+    KeyRenewAck,
+    /// Session resume for enrolled sensors (clear-text, ECDSA + eph-eph, no old session key).
+    SessionResumeRequest,
+    SessionResumeChallenge,
+    SessionResumeConfirm,
 }
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
@@ -111,16 +127,21 @@ pub enum Destination {
     OneDestination([u8; 17]),
 }
 
-#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq)]
-pub enum ProductType {
-    ContactSensor,
-}
-
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum RequestType {
-    Install(Install),
-    Validate(Validate),
     Event(Event),
+    /// Secure handshake Step 1: sensor broadcasts nonce + public key.
+    HandshakeRequest(HandshakeRequest),
+    /// Secure handshake Step 3: sensor confirms by signing the gateway nonce.
+    HandshakeConfirm(HandshakeConfirm),
+    /// Session key renewal trigger (encrypted with the current session key).
+    KeyRenewRequest(KeyRenewRequest),
+    /// Lightweight renew acknowledgment (encrypted with the current session key).
+    KeyRenewAck(KeyRenewAck),
+    /// Session resume trigger (clear-text, directed to gateway).
+    SessionResumeRequest(SessionResumeRequest),
+    /// Session resume confirmation (clear-text).
+    SessionResumeConfirm(HandshakeConfirm),
 }
 
 /// Acknowledgment structure for confirming receipt and processing of messages.
@@ -140,9 +161,13 @@ pub struct Ack {
 
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum ResponseType {
-    SensorValidate(ValidateResponse),
-    Validate(Validate),
     Event(Ack),
+    /// Secure handshake Step 2: gateway sends ECIES-encrypted challenge.
+    HandshakeChallenge(HandshakeChallenge),
+    /// Lightweight renew challenge (encrypted with the current session key).
+    KeyRenewChallenge(KeyRenewChallenge),
+    /// Session resume challenge (clear-text, same layout as install challenge).
+    SessionResumeChallenge(HandshakeChallenge),
 }
 
 #[derive(Encode, Decode, Debug, Clone)]
@@ -215,14 +240,22 @@ impl MessageSchema {
         nonce: &[u8; 12],
         aad: Option<&[u8]>,
     ) -> Result<[u8; N], &'static str> {
-        // ) -> Result<[u8; N], CommonModelsError> {
+        Ok(self.serialize_with_len::<N>(key, nonce, aad)?.0)
+    }
+
+    /// Serializes an encrypted envelope and returns `(buffer, encoded_len)`.
+    pub fn serialize_with_len<const N: usize>(
+        &mut self,
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: Option<&[u8]>,
+    ) -> Result<([u8; N], usize), &'static str> {
         let mut body_slice: [u8; N] = [0u8; N];
         let length =
             bincode::encode_into_slice(&self.body, &mut body_slice, bincode::config::standard())
                 .map_err(|_| "Body serialization failed")?;
         let mut encrypted_body_buffer =
             Vec::<u8, N>::from_slice(&body_slice[..length]).map_err(|_| "buffer too small")?;
-        // .map_err(|_| CommonModelsError::BufferTooSmall)?;
 
         let size = encrypt(&mut encrypted_body_buffer, key, nonce, aad)?;
         self.header.size = size as u8;
@@ -234,9 +267,9 @@ impl MessageSchema {
             body,
         };
         let mut slice: [u8; N] = [0u8; N];
-        bincode::encode_into_slice(result, &mut slice, bincode::config::standard())
+        let len = bincode::encode_into_slice(result, &mut slice, bincode::config::standard())
             .map_err(|_| "Envelope serialization failed")?;
-        Ok(slice)
+        Ok((slice, len))
     }
 
     /// Serialize the full `MessageSchema` in **clear text**, without encryption
@@ -251,10 +284,20 @@ impl MessageSchema {
     /// - Integrity/authenticity: expected to be provided by a signature
     ///   checked at application level.
     pub fn serialize_clear<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
+        Ok(self.serialize_clear_with_len::<N>()?.0)
+    }
+
+    /// Serializes a clear-text message and returns `(buffer, encoded_len)`.
+    ///
+    /// Callers must pass only `&buffer[..encoded_len]` to LoRa TX — trailing zeros break
+    /// `deserialize_clear` on the receiver and can exceed the SX1278 user payload limit.
+    pub fn serialize_clear_with_len<const N: usize>(
+        &mut self,
+    ) -> Result<([u8; N], usize), &'static str> {
         let mut slice: [u8; N] = [0u8; N];
-        bincode::encode_into_slice(&*self, &mut slice, bincode::config::standard())
+        let len = bincode::encode_into_slice(&*self, &mut slice, bincode::config::standard())
             .map_err(|_| "Envelope serialization failed")?;
-        Ok(slice)
+        Ok((slice, len))
     }
 }
 
@@ -271,10 +314,7 @@ pub fn deserialize<const N: usize>(
         bincode::config::standard(),
     )
     .map_err(|_| "Bad body")?;
-    Ok(EncryptedSchema {
-        header,
-        body,
-    })
+    Ok(EncryptedSchema { header, body })
 }
 
 /// Deserialize a clear‑text `MessageSchema` that was serialized without
@@ -299,10 +339,7 @@ pub fn deserialize_body<const N: usize>(
         bincode::decode_from_slice::<BodySchema, _>(&encrypted[..], bincode::config::standard())
             .map_err(|_| "Decryption decode failed")?;
 
-    Ok(MessageSchema {
-        header,
-        body,
-    })
+    Ok(MessageSchema { header, body })
 }
 
 pub mod error;

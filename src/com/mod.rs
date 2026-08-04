@@ -2,10 +2,8 @@ use crate::models::common::{
     Ack, Destination::OneDestination, HeaderSchema, MessageSchema, MessageType, RSSI_NOT_AVAILABLE,
     ResponseType, SNR_NOT_AVAILABLE, Status,
 };
-#[allow(deprecated)]
 use crate::{
     com::error::model::ComError,
-    com::init::DEFAULT_KEY,
     models::common::{deserialize, deserialize_body, deserialize_clear},
 };
 use embedded_hal::{delay::DelayNs, digital::OutputPin, spi::SpiBus};
@@ -13,7 +11,7 @@ use heapless::Vec;
 
 pub mod error;
 pub mod event;
-pub mod init;
+pub mod handshake;
 pub mod keys;
 pub struct Sigil {}
 impl Sigil {
@@ -68,9 +66,14 @@ impl Sigil {
             clear_msg.header.rssi = receive_result.rssi;
             clear_msg.header.snr = receive_result.snr;
 
-            // Only treat clear-text messages as valid for init types
+            // Only treat clear-text messages as valid for handshake types
             match clear_msg.header.message_type {
-                MessageType::InstallSensorRequest | MessageType::ValidateRequest => {
+                MessageType::HandshakeRequest
+                | MessageType::HandshakeChallenge
+                | MessageType::HandshakeConfirm
+                | MessageType::SessionResumeRequest
+                | MessageType::SessionResumeChallenge
+                | MessageType::SessionResumeConfirm => {
                     // Validate header using the provided validation function
                     if !validate_header(&clear_msg.header) {
                         return Err(ComError::DeserializeFailed);
@@ -160,14 +163,21 @@ impl Sigil {
 
                 // Send the Ack message via LoRa to inform the sender
                 let mode = lora.get_mode();
-                let nonce = [0u8; 12]; // Use zero nonce for unauthenticated response
-                #[allow(deprecated)]
-                let buffer = ack_message
-                    .serialize::<256>(&DEFAULT_KEY, &nonce, None)
+                // Fallback key used only for unauthenticated ACK responses (not a session key)
+                const FALLBACK_ACK_KEY: [u8; 32] = [0x26; 32];
+                let nonce = [0u8; 12];
+                let (buffer, len) = ack_message
+                    .serialize_with_len::<256>(&FALLBACK_ACK_KEY, &nonce, None)
                     .map_err(ComError::Custom)?;
+                if len > crate::models::common::LORA_USER_PAYLOAD_MAX {
+                    return Err(ComError::MessageTooLong {
+                        length: len,
+                        max: crate::models::common::LORA_USER_PAYLOAD_MAX,
+                    });
+                }
 
                 lora.set_mode(lora::sx1278::Mode::Manual, delay);
-                lora.send(&buffer, &mut delay)?;
+                lora.send(&buffer[..len], &mut delay)?;
                 lora.set_mode(mode, delay);
                 return Err(ComError::Custom(
                     "No key available for this message type and destination",

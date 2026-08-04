@@ -1,0 +1,55 @@
+sequenceDiagram
+    autonumber
+    participant Sensor as Sensor<br/>(initiate_handshake)
+    participant LoRa as LoRa (SX1278)
+    participant Gateway as Gateway<br/>(handle_handshake_request)
+    participant HW_S as Secure Element<br/>(ATECC608x)
+    participant HW_G as Secure Element<br/>(ATECC608x)
+
+    Note over Sensor,Gateway: Step 1 — Install request (clear-text)
+
+    Sensor->>HW_S: Generate sensor_nonce, sensor_pubkey[33B]<br/>(P-256 compressed SEC1)
+    Sensor->>HW_S: sig_sensor_pubkey = ECDSA(sensor_pubkey)
+    Sensor->>LoRa: HandshakeRequest<br/>{sensor_nonce, sensor_pubkey[33B], sig_sensor_pubkey}<br/>dest: AllGateways
+    LoRa->>Gateway: Broadcast HandshakeRequest
+
+    Note over Gateway: Verification before any response
+
+    Gateway->>Gateway: verify_sensor(sensor_pubkey, sig_sensor_pubkey)
+    alt Unknown sensor / invalid signature
+        Gateway-->>Sensor: (silent reject — no response)
+    end
+
+    Gateway->>HW_G: sig_sensor_nonce = ECDSA(sensor_nonce)
+    Gateway->>HW_G: Generate gateway ephemeral keypair → gw_eph_pubkey[33B]
+
+    Note over Sensor,Gateway: Step 2 — Structured challenge (clear-text, eph-eph)
+
+    Gateway->>LoRa: HandshakeChallenge<br/>{gw_eph_pubkey, sig_sensor_nonce,<br/>gateway_pubkey, gateway_nonce, key_expire_at}
+    LoRa->>Sensor: HandshakeChallenge
+
+    Sensor->>Sensor: verify_sig_sensor_nonce(gateway_pubkey, sig_sensor_nonce)
+    alt Invalid gateway signature
+        Sensor-->>Sensor: Err(VerificationFailed)
+    end
+    Sensor->>HW_S: Generate sensor ephemeral keypair<br/>ECDH(gw_eph_pubkey) → shared_secret
+
+    Note over Sensor,Gateway: Step 3 — Confirmation (clear-text)
+
+    Sensor->>HW_S: sig_gateway_nonce = ECDSA(gateway_nonce)
+    Sensor->>LoRa: HandshakeConfirm<br/>{sig_gateway_nonce, sensor_eph_pubkey[33B]}<br/>dest: gateway_mac (×3 retries)
+    LoRa->>Gateway: HandshakeConfirm
+
+    Gateway->>Gateway: verify_sig_gateway_nonce(sensor_pubkey, sig_gateway_nonce)
+    alt Invalid sensor signature
+        Gateway-->>Gateway: Err(VerificationFailed)
+    end
+    Gateway->>HW_G: ECDH(sensor_eph_pubkey) → shared_secret (same as sensor)
+
+    Note over Sensor,Gateway: Session key derivation
+
+    Sensor->>Sensor: session_key[32B] = HKDF-SHA256(<br/>  salt: sensor_nonce ‖ gateway_nonce,<br/>  ikm: shared_secret,<br/>  info: "session")
+    Gateway->>Gateway: session_key[32B] = HKDF-SHA256(same inputs)
+
+    Sensor-->>Sensor: Ok(HandshakeSession { keys, gateway_mac })
+    Gateway-->>Gateway: Ok(HandshakeResult { session_key, sensor_pubkey, key_expire_at })
