@@ -1,6 +1,9 @@
 # Forgejo Actions (CI)
 
-Workflows in this directory tag, publish, and release the crate.
+Workflows in this directory are **thin callers**. Tag / publish / checks logic lives in
+[`faicel/central_ci`](https://code.bhk-itsolutions.com/faicel/central_ci) (`create_tag_on_dev`,
+`create_tag_on_main`, `publish_on_tag`, `rust_crate_checks`, `validate_flow`).
+Only triggers and crate-specific inputs (`repository`, `enable_deny`, `test_command`, …) stay here.
 
 ## Publish flow (happy path)
 

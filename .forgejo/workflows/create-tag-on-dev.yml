@@ -1,14 +1,6 @@
 # On push to `dev`: create and push prerelease tag `vX.Y.Z-rc`.
-# Cargo.toml stays at the stable base (e.g. 0.4.0). The tag is simply `v0.4.0-rc`
-# (no rc.N counter): each Cargo.toml version can be published once per registry, so
-# bump Cargo.toml + CHANGELOG before each unstable publish.
-# The tag push triggers `publish-on-tag.yml` → forgejorc (unstable).
-#
-# `staging` does not tag or publish: it is only a merge gate before `main`.
-#
-# Requires: RUNNER_TOKEN secret (PAT with read repo and push for tags).
-# Tag push authenticates via GIT_ASKPASS (HTTP Basic: username + PAT as password).
-# Shared checks: faicel/central_ci rust_crate_checks.yml
+# Implementation: faicel/central_ci create_tag_on_dev.yml
+# Repository is auto-detected from github.repository (caller).
 
 name: Create tag on dev
 
@@ -18,60 +10,9 @@ on:
       - dev
 
 jobs:
-  checks:
-    uses: faicel/central_ci/.forgejo/workflows/rust_crate_checks.yml@main
+  tag:
+    uses: faicel/central_ci/.forgejo/workflows/create_tag_on_dev.yml@main
     with:
       enable_deny: false
     secrets:
       RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
-
-  tag_prerelease:
-    needs: checks
-    runs-on: docker
-    container:
-      image: code.bhk-itsolutions.com/homeiot/ci-rust-embedded:rust-1.97.0
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.RUNNER_TOKEN }}
-          fetch-depth: 0
-          # Do not persist the PAT in .git/config / remote URL (S1).
-          persist-credentials: false
-
-      - name: Create and push -rc tag
-        env:
-          REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
-          FORGEJO_GIT_USERNAME: git
-        run: |
-          set -euo pipefail
-          VERSION=$(sed -n 's/^version\s*=\s*"\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          if [[ "$VERSION" == *-rc* ]]; then
-            echo "Error: Cargo.toml version '$VERSION' must stay stable (e.g. 0.4.0)."
-            echo "Prerelease suffix is added only on the git tag by CI."
-            exit 1
-          fi
-          TAG_NAME="v${VERSION}-rc"
-          echo "Creating prerelease tag $TAG_NAME from base $VERSION on branch ${GITHUB_REF_NAME}"
-
-          git config user.name "CI"
-          git config user.email "ci@forgejo"
-          git remote set-url origin "https://code.bhk-itsolutions.com/homeiot/sigil.git"
-
-          ASKPASS="$(mktemp)"
-          trap 'rm -f "$ASKPASS"' EXIT
-          printf '%s\n' \
-            '#!/bin/sh' \
-            'case "$1" in' \
-            '  *Username*) printf "%s\n" "${FORGEJO_GIT_USERNAME:-git}" ;;' \
-            '  *) printf "%s\n" "$REPO_ACCESS_TOKEN" ;;' \
-            'esac' > "$ASKPASS"
-          chmod 700 "$ASKPASS"
-
-          if git ls-remote --tags origin "refs/tags/${TAG_NAME}" | grep -q .; then
-            echo "Tag $TAG_NAME already exists on remote, skipping push"
-            echo "Bump Cargo.toml + CHANGELOG to a new version before the next unstable publish."
-          else
-            git tag "$TAG_NAME"
-            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$ASKPASS" git push origin "$TAG_NAME"
-          fi
