@@ -1,0 +1,24 @@
+# On push to any branch EXCEPT dev, staging, and main: run shared Rust checks.
+# No tag, no publish. Used for feature branches.
+#
+# Requires: RUNNER_TOKEN secret (PAT with read repo).
+# Shared checks: faicel/central_ci rust_crate_checks.yml
+# Note: enable_deny is false until this crate has a deny.toml.
+
+name: Run checks on feature branches
+
+on:
+  push:
+    branches:
+      - "*"
+      - "!dev"
+      - "!staging"
+      - "!main"
+
+jobs:
+  checks:
+    uses: faicel/central_ci/.forgejo/workflows/rust_crate_checks.yml@main
+    with:
+      enable_deny: false
+    secrets:
+      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}

@@ -1,0 +1,28 @@
+sequenceDiagram
+    autonumber
+    participant App_S as Sensor firmware
+    participant VK as ValidatedKey
+    participant RS as renew_session()
+    participant RC as renew_core
+    participant LoRa as LoRa (SX1278)
+    participant GW as handle_renew_request()
+    participant HW as ATECC608x (ECDH only)
+
+    App_S->>VK: should_renew() or !is_valid()
+    App_S->>RS: renew_session(session_key_old, sensor_nonce)
+
+    RS->>LoRa: KeyRenewRequest encrypted (session_key_old)
+    LoRa->>GW: KeyRenewRequest (AEAD auth)
+
+    GW->>HW: Generate gateway ephemeral keypair → gw_eph_pubkey[33B]
+    GW->>LoRa: KeyRenewChallenge encrypted<br/>{gw_eph_pubkey, gateway_nonce, key_expire_at}<br/>NO ECDSA, NO ECIES 194B
+    LoRa->>RC: KeyRenewChallenge
+
+    RC->>HW: Generate sensor ephemeral keypair<br/>ECDH(gw_eph_pubkey) → shared_secret
+    RC->>RC: session_key_new = HKDF(shared_secret, nonces)
+    RC->>LoRa: KeyRenewAck encrypted {sensor_eph_pubkey[33B]} (session_key_old)
+    LoRa->>GW: KeyRenewAck
+
+    GW->>HW: ECDH(sensor_eph_pubkey) → shared_secret (same as sensor)
+    GW->>GW: session_key_new = HKDF(same inputs)
+    RS-->>App_S: HandshakeSession { keys, gateway_mac }

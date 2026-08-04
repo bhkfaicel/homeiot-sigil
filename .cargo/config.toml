@@ -1,5 +1,10 @@
+# Stable packages (published from `main` / non-rc tags).
 [registries.forgejo]
 index = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot/cargo/"
+
+# Unstable / RC packages (published from `dev` / *-rc* tags).
+[registries.forgejorc]
+index = "sparse+https://code.bhk-itsolutions.com/api/packages/homeiot-rc/cargo/"
 
 [net]
 git-fetch-with-cli = true

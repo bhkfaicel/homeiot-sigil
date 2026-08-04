@@ -33,7 +33,7 @@ use lora;
 ///
 /// # Notes
 /// - The function **does not wait for a response** (one-way event push).
-/// - The maximum encoded message size is limited to **256 bytes**.
+/// - The maximum encoded message size is limited to **254 user bytes** (LoRa FIFO budget).
 /// - This function is designed for use in `no_std` embedded environments.
 ///
 /// # Errors
@@ -41,6 +41,7 @@ use lora;
 /// - `ComError::Timeout`: TX did not complete.
 /// - `ComError::CrcMismatch`: LoRa reported CRC failure.
 /// - Other variants depending on your `ComError` implementation.
+#[allow(clippy::too_many_arguments)]
 pub fn send<SPI, CS, RST, SpiErr>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     mut delay: &mut impl DelayNs,
@@ -67,12 +68,17 @@ where
         timestamp,
     );
 
-    let buffer = message
-        .serialize::<256>(&key, &nonce, None)
+    let (buffer, len) = message
+        .serialize_with_len::<255>(&key, &nonce, None)
         .map_err(ComError::Custom)?;
+    if len > crate::models::common::LORA_USER_PAYLOAD_MAX {
+        return Err(ComError::MessageTooLong {
+            length: len,
+            max: crate::models::common::LORA_USER_PAYLOAD_MAX,
+        });
+    }
 
-    // Send the serialized message via LoRa
-    lora.send(&buffer, &mut delay)?;
+    lora.send(&buffer[..len], &mut delay)?;
 
     Ok(())
 }
@@ -104,7 +110,7 @@ where
 ///
 /// # Notes
 /// - The function preserves the current LoRa mode and restores it after transmission.
-/// - The maximum encoded message size is limited to **256 bytes**.
+/// - The maximum encoded message size is limited to **254 user bytes** (LoRa FIFO budget).
 /// - This function is designed for use in `no_std` embedded environments.
 ///
 /// # Errors
@@ -112,6 +118,7 @@ where
 /// - `ComError::Timeout`: TX did not complete.
 /// - `ComError::CrcMismatch`: LoRa reported CRC failure.
 /// - Other variants depending on your `ComError` implementation.
+#[allow(clippy::too_many_arguments)]
 pub fn response<SPI, CS, RST, SpiErr>(
     lora: &mut lora::sx1278::Controller<SPI, CS, RST>,
     mut delay: &mut impl DelayNs,
@@ -141,12 +148,18 @@ where
         timestamp,
     );
 
-    let buffer = message
-        .serialize::<256>(&key, &nonce, None)
+    let (buffer, len) = message
+        .serialize_with_len::<255>(&key, &nonce, None)
         .map_err(ComError::Custom)?;
+    if len > crate::models::common::LORA_USER_PAYLOAD_MAX {
+        return Err(ComError::MessageTooLong {
+            length: len,
+            max: crate::models::common::LORA_USER_PAYLOAD_MAX,
+        });
+    }
 
     lora.set_mode(lora::sx1278::Mode::Manual, delay);
-    lora.send(&buffer, &mut delay)?;
+    lora.send(&buffer[..len], &mut delay)?;
     lora.set_mode(mode, delay);
 
     Ok(())

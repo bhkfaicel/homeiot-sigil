@@ -1,9 +1,18 @@
-# On push of tag v*: run tests, then create a Forgejo release for that tag.
-# Requires: RUNNER_TOKEN secret (PAT with read repo + write for releases).
+# On push of tag v*: run shared Rust checks, create a Forgejo release, and publish the crate.
 #
-# Adapt API_URL and owner/repo if your Forgejo instance or repo path differ.
+# - Tags containing "-rc" (from `dev`) → prerelease + publish to `forgejorc` (unstable).
+# - Stable tags (from `main`) → release + publish to `forgejo` (stable).
+#
+# The registry provides the stable/unstable separation; Cargo.toml version is NOT rewritten.
+# Each version (e.g. 0.4.0) can be published once per registry. To publish a new RC, bump
+# Cargo.toml + CHANGELOG to the next version before pushing to `dev`.
+# Unstable tags are `vX.Y.Z-rc` (fixed suffix, no rc.N counter).
+#
+# Requires: RUNNER_TOKEN secret (PAT with read repo + write for releases + write:package).
+# Shared checks: faicel/central_ci rust_crate_checks.yml
+# Registries: see `.cargo/config.toml` (`forgejo`, `forgejorc`).
 
-name: Create Forgejo release on tag
+name: Publish release on tag
 
 on:
   push:
@@ -11,39 +20,46 @@ on:
       - "v*"
 
 jobs:
+  checks:
+    uses: faicel/central_ci/.forgejo/workflows/rust_crate_checks.yml@main
+    with:
+      # Tag already exists when this workflow runs (it is the trigger). The tag
+      # check is meant for feature/dev/main pushes before creating a new release.
+      enable_tag_check: false
+      enable_deny: false
+    secrets:
+      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+
   release_on_tag:
+    needs: checks
     runs-on: docker
+    container:
+      image: code.bhk-itsolutions.com/homeiot/ci-rust-embedded:rust-1.97.0
     env:
       CARGO_REGISTRIES_FORGEJO_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
-
+      CARGO_REGISTRIES_FORGEJORC_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.RUNNER_TOKEN }}
+          persist-credentials: false
 
-      - name: Install Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Run tests
-        run: bash scripts/test.sh
-
-      - name: Create Forgejo release
+      - name: Create Forgejo release and resolve registry
         env:
           REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
         run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
           VERSION=$(sed -n 's/^version\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          TAG_NAME="${GITHUB_REF_NAME:-v${VERSION}}"
-          if [[ "$TAG_NAME" == *-rc* ]]; then
+          CRATE_NAME=$(sed -n 's/^name\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          REGISTRY=$(bash scripts/resolve-cargo-registry.sh "$TAG_NAME")
+          if [[ "$REGISTRY" == "forgejorc" ]]; then
             PRERELEASE=true
           else
             PRERELEASE=false
           fi
-          CRATE_NAME=$(sed -n 's/^name\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          echo "Creating Forgejo release $TAG_NAME for crate $CRATE_NAME (prerelease=$PRERELEASE)"
+          echo "Creating Forgejo release $TAG_NAME for crate $CRATE_NAME $VERSION (prerelease=$PRERELEASE, registry=$REGISTRY)"
           API_URL="https://code.bhk-itsolutions.com/api/v1/repos/homeiot/sigil/releases"
           curl -X POST "$API_URL" \
             -H "Content-Type: application/json" \
@@ -55,3 +71,12 @@ jobs:
               \"draft\": false,
               \"prerelease\": $PRERELEASE
             }"
+          echo "PRERELEASE=$PRERELEASE" >> "$GITHUB_ENV"
+
+      - name: Publish crate to Forgejo unstable registry (forgejorc)
+        if: env.PRERELEASE == 'true'
+        run: cargo publish --registry forgejorc
+
+      - name: Publish crate to Forgejo stable registry (forgejo)
+        if: env.PRERELEASE != 'true'
+        run: cargo publish --registry forgejo

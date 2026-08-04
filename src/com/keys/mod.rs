@@ -150,8 +150,20 @@ impl KeyManager {
 /// 5. Automatic renewal (when 1/4 of time remains):
 ///    - Renewal threshold: `elapsed_seconds >= duration_seconds * 3/4`
 ///    - Triggers proactive renewal to avoid service interruption
+///
+/// Session key with expiry metadata, as returned by the handshake.
+///
+/// `expire_at` is the Unix timestamp when the key expires (0 = never expires).
+/// `timestamp` is the Unix timestamp when the key was issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keys {
+    pub key: [u8; 32],
+    pub expire_at: u32,
+    pub timestamp: u32,
+}
+
 pub struct ValidatedKey {
-    key: super::init::gateway::Keys,
+    key: Keys,
     received_at_ticks: u64,
     duration_seconds: u32,
 }
@@ -160,19 +172,17 @@ impl ValidatedKey {
     /// RTC frequency in Hz (32.768 kHz is standard for RTCs)
     pub const RTC_FREQ: u64 = 32768;
 
-    /// Creates a new ValidatedKey from a Keys response
+    /// Creates a new ValidatedKey from a Keys struct.
     ///
     /// # Arguments
     ///
-    /// - `key`: The Keys struct received from the gateway
-    /// - `received_at_ticks`: The RTC ticks when the key was received
-    pub fn new(key: super::init::gateway::Keys, received_at_ticks: u64) -> Self {
+    /// - `key`: The Keys struct (session key + expiry).
+    /// - `received_at_ticks`: The RTC ticks when the key was received.
+    pub fn new(key: Keys, received_at_ticks: u64) -> Self {
         let duration_seconds = if key.expire_at == 0 {
             u32::MAX // Never expires
-        } else if key.expire_at > key.timestamp {
-            key.expire_at - key.timestamp
         } else {
-            0 // Already expired
+            key.expire_at.saturating_sub(key.timestamp)
         };
 
         Self {
@@ -224,12 +234,12 @@ impl ValidatedKey {
     }
 
     /// Returns a reference to the underlying Keys
-    pub fn keys(&self) -> &super::init::gateway::Keys {
+    pub fn keys(&self) -> &Keys {
         &self.key
     }
 
-    /// Consumes self and returns the underlying Keys
-    pub fn into_keys(self) -> super::init::gateway::Keys {
+    /// Consumes self and returns the underlying Keys.
+    pub fn into_keys(self) -> Keys {
         self.key
     }
 }
