@@ -1,27 +1,25 @@
 [package]
 name = "sigil"
-version = "0.5.3"
+version = "1.0.0"
 edition = "2024"
 
-[dependencies]
-#lora = { path = "../lora", default-features = false, features = ["sx1278"] }
-lora = { version = "0.3.0-rc.0", registry = "forgejorc",default-features = false, features = ["sx1278"] }
-
-embedded-hal = "1.0.0"
-
-log = { version = "0.4.33", default-features = false }
-
-bincode = { version = "2.0.0", default-features = false, features = ["derive"] }
-chacha20poly1305 = {version="0.10.1",default-features = false,features = ["heapless"]}
-heapless = "0.9.3"
-hkdf = { version = "0.12", default-features = false }
-sha2 = { version = "0.10", default-features = false, features = ["oid"] }
-
 [features]
-models = []
-com = []
+# Development/tests keep both roles. Products should disable defaults and
+# select only the role they ship.
+default = ["sensor", "gateway"]
+sensor = []
+gateway = []
 
-[dev-dependencies]
-embedded-hal-mock= {version="0.11.1",features=["eh1"]}
-#lora = { path = "../lora", default-features = false, features = ["test-support"] }
-lora = { version = "0.3.0-rc.0", registry = "forgejorc",default-features = false, features = ["test-support"] }
+[dependencies]
+# Cryptographic primitives
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+# Renew eph↔eph only. Install/resume identity ECDH stays on SecureElement (P-256).
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1.8", default-features = false, features = ["derive"] }
+# Direct dep for constant-time MAC compares (already transitive via AEAD / dalek).
+subtle = { version = "2.6", default-features = false }
+
+# Data structures and encoding
+heapless = "0.8"

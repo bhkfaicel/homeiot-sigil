@@ -12,7 +12,7 @@
 - Q: Wire compatibility with deployed devices — keep conceptual phases but which interop posture? → A: **B+** — new incompatible protocol (no dual-stack); retain existing peer MAC size/format (`[u8; 17]`), not the 6-byte address from `ARCHITECTURE_DEV.md`. Coupled sensor+gateway upgrades required for other wire/crypto/API changes.
 - Q: Packet counters / AEAD nonce — one shared counter or separate directions? → A: **B** — per session, separate `tx_counter` and `rx_counter` (64-bit each). Shared 4-byte nonce prefix from key establishment does not partition directions; TX/RX counter spaces must not overlap.
 - Q: Fast resume crypto model given LoRa size/energy constraints? → A: **A** — static↔static key agreement only (per `ARCHITECTURE_DEV.md`); no ephemeral exchange and no ECDSA on the resume path. Forward secrecy remains the job of periodic eph↔eph renew. Resume optimized for small packets and low power after reboot.
-- Q: When a WaitingForResponse timeout elapses, what happens to in-progress handshake state? → A: **B** — pending handshake state is retained until an explicit host `cancel`/abort, successful completion, or a host-started attempt that intentionally replaces it. The library does not auto-clear solely because the timeout hint elapsed.
+- Q: When a handshake radio-wait timeout hint elapses, what happens to in-progress handshake state? → A: **B** — pending handshake state is retained until an explicit host `cancel`/abort, successful completion, or a host-started attempt that intentionally replaces it. The library does not auto-clear solely because the timeout hint elapsed.
 - Q: Who may initiate session renew? → A: **A** — only the sensor initiates renew; the gateway only responds. Gateway-initiated renew is out of scope.
 
 ## User Scenarios & Testing *(mandatory)*
@@ -104,7 +104,10 @@ A gateway host configures a fixed-capacity session table (e.g. up to 100 peers).
 - What happens when a direction’s counter approaches overflow before renew? The library MUST refuse further encrypt (TX overflow) or decrypt (RX overflow / replay window exhausted) with a distinct error until renew or fast resume produces a new key and resets **both** counters.
 - How does the system handle truncated or malformed LoRa payloads? Return a parse/layout error; no partial session mutation.
 - What if two renew attempts overlap for the same peer? The library MUST keep session state consistent (reject or ignore stale steps); it MUST NOT apply a session key from an incomplete handshake.
-- What if a WaitingForResponse timeout hint elapses? Pending handshake state MUST remain until explicit host cancel/abort, success, or an intentional host retry that replaces it — not auto-cleared by time alone.
+- What if a `Transmit.wait_timeout_ms` timeout hint elapses? Pending MUST remain
+  until success, host `cancel_pending`, intentional `start_*` replace, `remove`,
+  or an explicit host call to `SessionManager::tick(now)` past the stamped
+  `deadline_at` — never auto-cleared inside the RX/encrypt pipeline by time alone.
 - What if the host passes a nil/empty random buffer fill failure? Crypto steps that need randomness MUST fail without producing a session key.
 - What if install is requested for a peer already present? Reject or replace only according to an explicit host call; never silently overwrite without a defined outcome (default: reject duplicate install unless host deletes first).
 - What if a received encrypted packet reuses a prior RX counter value under the same session key? The library MUST reject it as replay and MUST NOT advance session state.
@@ -121,7 +124,7 @@ A gateway host configures a fixed-capacity session table (e.g. up to 100 peers).
 - **FR-006**: The library MUST support three distinct protocol phases driven by the host: first-time installation, lightweight session renew, and fast resume after RAM loss.
 - **FR-007**: Installation MUST authenticate peers using durable factory/static identity material via host-provided secure-element capabilities and MUST yield peer static public key material for host NVRAM storage.
 - **FR-008**: Session renew MUST use ephemeral-to-ephemeral key agreement with host-provided randomness, MUST NOT require secure-element identity operations, MUST update the RAM session key, and MUST reset **both** `tx_counter` and `rx_counter` to zero. Only the **sensor** role MAY initiate renew; the gateway role MUST only accept/respond to sensor-initiated renew. Gateway-initiated renew is out of scope.
-- **FR-022**: Explicit out of scope for this feature: dual-stack legacy wire protocol, 6-byte MAC migration, gateway-initiated renew, and auto-clear of pending handshakes on timeout hints alone.
+- **FR-022**: Explicit out of scope for this feature: dual-stack legacy wire protocol, 6-byte MAC migration, gateway-initiated renew, and silent auto-clear of pending handshakes inside the packet pipeline. Optional reclaim via host-invoked `SessionManager::tick(now)` (past stamped `deadline_at`) is in scope as an alternative to manual `cancel_pending`.
 - **FR-009**: Fast resume MUST re-establish a session key using **static↔static** key agreement over known local and peer static public keys when the RAM session key is absent. It MUST NOT require ephemeral keypairs, ECDSA signatures, or a full install/ECIES challenge. It MUST reset both directional counters to zero. Forward secrecy for ongoing operation remains the responsibility of renew (FR-008), not resume.
 - **FR-020**: Fast resume MUST prioritize low LoRa airtime and energy versus install and renew (target on the order of ~60 bytes of crypto material excluding framing, per architecture guidance).
 - **FR-010**: Encrypted messaging MUST use ChaCha20-Poly1305 with a 12-byte nonce composed of a fixed 4-byte session prefix established at key establishment and an 8-byte counter drawn from the **direction-appropriate** counter (`tx_counter` when sending, peer counter field checked against `rx_counter` when receiving); XChaCha20 MUST NOT be used.
@@ -172,6 +175,8 @@ A gateway host configures a fixed-capacity session table (e.g. up to 100 peers).
 - Default capacities: sensor `SessionManager<1>`, gateway `SessionManager<100>`, overridable at compile time by the host.
 - Ephemeral private keys created during renew are zeroized after use as a security requirement.
 - Existing encrypted application message types remain conceptually the same once a session key exists; only session establishment and the processing pipeline are redesigned.
-- Timeout hints on WaitingForResponse are advisory for the host scheduler; pending handshake state lifetime is host-driven via cancel/success/replace, not wall-clock auto-expiry inside the library.
+- Timeout hints on `Transmit.wait_timeout_ms` are advisory for the host scheduler.
+  Pending lifetime is host-driven: manual `cancel_pending` / success / replace,
+  and/or optional `tick(now)` past `deadline_at` — never silent RX-pipeline expiry.
 - Renew is **sensor-initiated only**; gateway responds. Gateway push-renew is out of scope.
 - Documentation and comments for the feature remain in English, consistent with project conventions.

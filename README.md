@@ -1,6 +1,6 @@
 # sigil
 
-`no_std` Rust library for secure device communication over LoRa: messaging, encryption, install/renew handshakes, key derivation, and events.
+`no_std` Rust library for secure cryptographic communication over LoRa networks on embedded IoT devices. It provides device identification, authentication, and encrypted messaging primitives for LoRa-based sensor/gateway communication.
 
 ---
 
@@ -10,10 +10,37 @@
 
 ---
 
+## Architecture
+
+`sigil` is a **non-blocking, hardware-agnostic session engine**. The library never touches the radio or blocks; the host firmware owns all I/O and timing.
+
+Every frame carries an outer header
+`[sender_mac:17] [protocol_version:1 = 0x03] [frame_type:1]` where
+`sender_mac` is the transmitting device's durable identity
+(`SessionManager::local_mac`). The `protocol_version` byte at position 17 and
+`FrameType` at position 18 let the core reject foreign protocols and classify
+incoming frames **without decryption**, returning a typed `SigilEvent`:
+
+- `FrameType::Data` → fully decrypted, returned as `SigilEvent::Data`
+- `FrameType::TimeSync` → authenticated gateway clock sample, returned as
+  `SigilEvent::TimeSync`; it shares the session AEAD replay counter
+- `FrameType::TimeSyncRequest` → authenticated sensor request for a fresh clock
+  sample; the gateway host decides whether to answer with `TimeSync`
+- `FrameType::Event` / `EventAck` → reliable sensor event with an authenticated,
+  replay-protected application ACK generated only after durable gateway processing
+- Handshake frames → **per-step** events, e.g. `InstallChallenge` ≠ `InstallRequest`, paired with `SigilAction::NeedsHostDispatch` (not `Success`):
+  - `InstallRequest` / `InstallChallenge` / `InstallConfirm` / `InstallCommitConfirmed
+  - `RenewRequest` / `RenewChallenge` / `RenewAck` / `RenewCommitConfirmed
+  - `ResumeRequest` / `ResumeChallenge` / `ResumeConfirm` / `ResumeCommitConfirmed
+
+The host routes `*Request` to `handle_*` and challenge/confirm/ack/**CommitConfirmed** to `continue_*`.
+
+---
+
 ## Features
 
-- **`com`** — Communication over LoRa: read/write of encrypted messages, header validation, key callbacks.
-- **`models`** — Shared message and protocol models (`MessageSchema`, events, handshake types).
+- **Non-blocking core** — Host-owned radio + secure element via the `SecureElement` / `RandomSource` traits. Provides `SessionManager<N>`, a single ingress (`process_incoming_packet`), egress (`encrypt_data`), and three host-driven phases: install, sensor-initiated renew, and fast resume.
+- **`N` must be a power of two and `>= 2`** (constraint from `heapless::FnvIndexMap`); use `<2>` for single-peer sensors, `<128>` for gateways.
 
 ---
 
@@ -21,120 +48,297 @@
 
 ### Install (first pairing)
 
-Clear-text 3-message exchange with **ephemeral-to-ephemeral ECDH + ECDSA** for identity proof:
+Clear-text identity exchange plus AEAD CommitConfirmed, with **static ECDH + ECDSA** and **mutual factory attestation** (same manufacturing root on both devices):
 
 ```
-HandshakeRequest → HandshakeChallenge {gw_eph_pubkey, …} → HandshakeConfirm {sig_gateway_nonce, sensor_eph_pubkey}
-→ session_key = HKDF(ECDH(eph↔eph), sensor_nonce ‖ gateway_nonce)
+InstallRequest → InstallChallenge → InstallConfirm (Final) → InstallCommitConfirmed
+→ factory_cert verifies peer pubkey under SessionManager factory root
+→ DirectionalMaterial = HKDF-Expand(ECDH(static↔static), …)  // s2g ‖ g2s
+→ Sensor stages keys until CommitConfirmed; gateway commits on Final
 ```
 
-**Sensor:** `install_session()` — callback `ecdh_ephemeral_with_peer(gw_eph_pubkey) → (sensor_eph_pubkey, shared_secret)`  
-**Gateway:** `handle_install_request()` — callbacks `generate_gateway_ephemeral() → gw_eph_pubkey` and `ecdh_with_sensor_ephemeral(sensor_eph_pubkey) → shared_secret` (plus ECDSA verify/sign callbacks)
+**Construction:** `SessionManager::new(factory_pubkey, local_mac)` — host loads
+the factory root and this device's MAC once at boot (ATECC/NVRAM).
 
-### Renew (session key rotation)
+**Gateway discovery is mandatory** for first pairing: the sensor does not know
+the gateway MAC a priori.
 
-Encrypted 3-message exchange on the **existing session key** — **ephemeral-to-ephemeral ECDH** (no ECDSA, no ECIES):
+**Sensor:** `start_install(INSTALL_DISCOVERY_DEST)` (or host broadcast address) —
+outer header = sensor `local_mac`; host **must** TX as discovery/broadcast.
+`continue_install` learns the real gateway MAC from `InstallChallenge` and
+rebinds the pending entry.
+**Gateway host:** on `SigilEvent::InstallRequest` (not Challenge/Confirm), check pairing DB for `peer`
+(sender / sensor MAC from the outer header), then
+`handle_install_request(..., now, key_lifetime_secs)` — cheap DoS guards (pending / cooldown **15 s** / capacity) run first; after factory identity verification,
+the cooldown is stamped before device signature, ECDH and challenge. Sensor hosts route `InstallChallenge` /
+`InstallConfirm` / `InstallCommitConfirmed` via `continue_install`. On gateway
+Final, `PersistPeerStaticKey.transmit` carries CommitConfirmed (persist then TX).
+Host allowlist remains policy for _who_ may pair; the library rate-limits SE
+amplification. Host supplies an authenticated key lifetime in seconds.
+
+### Renew (session key rotation, sensor-initiated)
+
+Encrypted Request/Challenge under the **old**
+session key; Final (`RenewAck`) and CommitConfirmed under the **new** directional
+keys — **ephemeral-to-ephemeral ECDH** (no ECDSA, no ECIES). Only
+`SessionRole::Sensor` may call `start_renew`:
 
 ```
-KeyRenewRequest → KeyRenewChallenge {gw_eph_pubkey} → KeyRenewAck {sensor_eph_pubkey}
-→ session_key_new = HKDF(ECDH(eph↔eph), sensor_nonce ‖ gateway_nonce)
+RenewRequest → RenewChallenge → RenewAck (Final) → RenewCommitConfirmed
+→ DirectionalMaterial_new = HKDF-Expand(ECDH(eph↔eph), …)  // s2g ‖ g2s
+→ Sensor keeps old key until CommitConfirmed verifies
 ```
 
-**Sensor:** `com::handshake::renew::sensor::renew_session()` — callback `ecdh_ephemeral_with_peer(gw_eph_pubkey) → (sensor_eph_pubkey, shared_secret)`  
-**Gateway:** `com::handshake::renew::gateway::handle_renew_request()` — callbacks `generate_gateway_ephemeral() → gw_eph_pubkey` and `ecdh_with_sensor_ephemeral(sensor_eph_pubkey) → shared_secret`
+**Sensor only:** `start_renew()` — uses software X25519 ECDH (`ecdh_soft`)
+**Gateway:** `handle_renew_request()` — responds only; **no gateway initiate API**
 
-Trigger renew when `ValidatedKey::should_renew()` returns true (~75% of key lifetime elapsed).
+### Session resume (fast re-pair after reboot)
 
-### Session resume (re-pair session without full install)
-
-Clear-text 3-message exchange for **already-enrolled** sensors when the **session key is lost** but long-term identity is still trusted (no `AllGateways` broadcast, no re-enrollment):
+Request carries a **MAC keyed by the durable `resume_psk`** (derived at install);
+Challenge is clear text with a MAC over both nonces and the lifetime; Final (`ResumeConfirm`) and
+CommitConfirmed are **AEAD under the new keys**. Crypto uses **static↔static
+ECDH** only (no ECDSA, no ephemeral keys). Only `SessionRole::Sensor` may call
+`start_resume`:
 
 ```
-SessionResumeRequest {sig_sensor_nonce} → SessionResumeChallenge {gw_eph_pubkey, …} → SessionResumeConfirm {sig_gateway_nonce, sensor_eph_pubkey}
-→ session_key = HKDF(ECDH(eph↔eph), sensor_nonce ‖ gateway_nonce)
+ResumeRequest (nonce ‖ req_mac) → ResumeChallenge → ResumeConfirm (Final) → ResumeCommitConfirmed
+→ DirectionalMaterial = HKDF-Expand(ECDH(static↔static), …)  // s2g ‖ g2s
+→ Sensor stages keys until CommitConfirmed verifies
 ```
 
-**Sensor:** `com::handshake::resume::sensor::resume_session()` — sign `sensor_nonce` with long-term key + `ecdh_ephemeral_with_peer`  
-**Gateway:** `com::handshake::resume::gateway::handle_resume_request()` — lookup enrolled `sensor_pubkey`, verify resume signature, then same eph-eph callbacks as install
+Gateway verifies `req_mac` **before** SE-ECDH. Host must persist
+`resume_psk` with the peer static pubkey after install and reload via
+`Session::new_enrolled(..., resume_psk, ..., SessionRole)` after reboot.
 
-Use when: paired sensor lost session key in flash but gateway still has enrollment. Prefer **renew** when the old session key is still available.
+**Directional AEAD:** each peer holds independent TX/RX key
+material (`SessionRole::{Sensor,Gateway}` maps shared directional halves).
+Both TX counters may start at 0 without nonce reuse across directions.
+
+**NVRAM:** persist **enrollment only** (peer MAC, static pubkey,
+`resume_psk`, role). Never persist AEAD keys / nonce prefixes / counters —
+`Session::new_active` is not part of the host API.
+
+**Sensor:** `start_resume(..., now)` — MACs the request with `resume_psk`; an old active/expired key is retained until commit so a gateway reboot is recoverable; ECDH at challenge
+**Gateway:** `handle_resume_request(..., now, key_lifetime_secs)` — verify req MAC and gateway role → pending/cooldown → static↔static ECDH; retains any old key until Final, then emits CommitConfirmed
 
 See `diagramme/install.mermaid`, `diagramme/renew.mermaid`, and `diagramme/session_resume.mermaid`.
+
+### Host timebase (seconds)
+
+Product contract for all hosts (sensor SAMD21 and gateway):
+
+| Value                              | Unit                   | Role                                                              |
+| ---------------------------------- | ---------------------- | ----------------------------------------------------------------- |
+| `now`                              | **seconds**            | Local monotonic time passed into pipeline / handshake APIs        |
+| `key_lifetime_secs`                | **seconds**            | Authenticated duration; each peer computes `local_now + lifetime` |
+| `RESUME_REQUEST_COOLDOWN`          | **15 seconds**         | Min gap between accepted resume ECDH per peer                     |
+| `INSTALL_REQUEST_COOLDOWN`         | **15 seconds**         | Min gap between accepted install SE work per peer                 |
+| `MAX_SESSION_LIFETIME_SECS` | **2 days** (172 800 s) | Maximum accepted wire lifetime |
+
+| `*_TIMEOUT_MS` / `wait_timeout_ms` | **milliseconds**       | Advisory radio waits only — never mixed with `now`                |
+
+Sensor and gateway may use different clock epochs. Do not feed millisecond
+counters into `now` while leaving cooldown constants at 15. Hosts must pass
+`0 < key_lifetime_secs <= MAX_SESSION_LIFETIME_SECS` (for example `86_400`).
+
+The sensor may call `request_time_sync(peer, now)`. The gateway receives
+`SigilEvent::TimeSyncRequest` and may answer with
+`encrypt_time_sync(peer, gateway_time, sequence, uncertainty_secs, now)`.
+Both messages are AEAD and replay-protected. Requests are limited to one
+accepted request per peer every `TIME_SYNC_REQUEST_COOLDOWN_SECS` (15 seconds);
+the gateway host still owns the policy deciding whether to transmit a response.
+Only `SessionRole::Sensor` can request and only `SessionRole::Gateway` can emit
+the clock sample. The sensor host decides how to discipline its RTC.
+
+### Reliable events and authenticated ACK
+
+Use `send_event(peer, event_id, payload, now)` for sensor events that must not be
+silently lost. This is separate from `encrypt_data`, which remains fire-and-forget.
+
+```text
+Sensor                         Gateway host
+send_event(id, payload)  ───▶  Event { id, payload, duplicate: false }
+                               persist/deduplicate + perform durable work
+                         ◀───  ack_event(id) → authenticated EventAck
+process EventAck → clear pending
+```
+
+Security and reliability contract:
+
+- Only a sensor-role session can send `Event`; only a gateway-role session can
+  create its `EventAck`. Both frames use ChaCha20-Poly1305, bind the outer
+  header/type as AAD, and share the session replay counters.
+- The gateway **must not call `ack_event` before durable processing succeeds**.
+  A construction failure does not commit the receive state. A retry arriving
+  while processing is still pending is rejected with `EventDeliveryPending`.
+  If durable processing fails, call `release_event_delivery`; it emits no ACK
+  and permits the same id to be delivered again on the next sensor retry.
+- If the ACK is lost, the sensor calls `send_event` again after
+  `EVENT_ACK_TIMEOUT_MS` with the exact same id **and semantic payload**. Sigil
+  re-encrypts it with a fresh AEAD counter; never replay cached wire bytes.
+- A committed duplicate is returned with `duplicate: true`: do not repeat its
+  side effect, but call `ack_event` again to recover from ACK loss.
+- One outbound Event and one uncommitted inbound Event are allowed per session.
+  A wrong authenticated ACK cannot clear a different pending id.
+- The sensor host must durably allocate strictly increasing `u64` ids across
+  reboot. The gateway application/DB must also deduplicate `(peer, event_id)`
+  durably across reboot; Sigil's session-level cache is RAM-only.
+- After the host retry budget is exhausted, `cancel_pending_event` abandons the
+  event but its id stays consumed. `tick()` manages handshake state only; it
+  does not retry or cancel application Events.
+- With `process_incoming_packet::<DATA, MSG>`, the maximum Event application
+  payload is `DATA - 8` bytes. An EventAck is 55 bytes on wire.
+
+**`u32` wrap :** unix-epoch seconds wrap ~2106; a monotonic counter from 0 wraps after ~136 years of uptime. Out of product horizon — no `u64` migration in v1.
+
+### Host global rate-limit
+
+Library DoS guards are **per-peer** (`INSTALL_REQUEST_COOLDOWN` /
+`RESUME_REQUEST_COOLDOWN` / `PendingAlreadyExists`). The `pending` map is a
+**separate** table of capacity `N` (same `N` as sessions): a flood of distinct
+peers can fill every pending slot and block further handshakes while existing
+sessions still work.
+
+**Gateway firmware must enforce a global admission policy** before calling
+`handle_install_request` / `handle_resume_request` / renew handlers (after the
+install allowlist), e.g.:
+
+- max concurrent pending handshakes across all peers; and/or
+- a global token bucket (new handshake starts per minute).
+
+On `CapacityExceeded`, drop or defer RF work and `cancel_pending` stale peers
+when host radio timers expire. Sigil does not provide a global rate limiter.
+
+### Sensor install vs door / vibration 
+
+
+Install chains multiple secure-element ops in one call. Product priority:
+**door-open / vibration IRQs > install**. Keep those IRQs enabled during SE I/O;
+defer install if a critical sensing window needs the main loop. See CLAUDE.md
+and `SecureElement` rustdoc.
 
 ---
 
 ## Usage
 
-Add to your `Cargo.toml` (adjust registry and version as needed):
+Choose the product role explicitly in its `Cargo.toml`. This is important on
+the SAMD21: `default-features = false` prevents the gateway implementation and
+gateway-only API/events/state from being compiled into the sensor firmware.
 
 ```toml
 [dependencies]
-# Stable (prod):
-sigil = { version = "=0.4.0", registry = "forgejo", default-features = false, features = ["com"] }
-# Unstable (client staging), after a `dev` publish:
-# sigil = { version = "=0.4.0", registry = "forgejorc", default-features = false, features = ["com"] }
+# SAMD21 sensor firmware
+sigil = { version = "1.0.0", registry = "forgejo", default-features = false, features = ["sensor"] }
+
+# Raspberry Pi (or equivalent) gateway software
+# sigil = { version = "1.0.0", registry = "forgejo", default-features = false, features = ["gateway"] }
 ```
 
-Publish / release flow (tags, registries, `release/X.Y`): see [`.forgejo/README.md`](.forgejo/README.md).
+The crate default enables both roles for development, integration tests and
+protocol simulations. Production builds should select one role only. A build
+without either role is rejected at compile time.
 
-Read and decrypt a message with `Sigil::read`:
+`SigilEvent` intentionally keeps the complete wire-classification enum in both
+role builds so shared host adapters can remain exhaustive. Role-disabled frames
+are rejected by the ingress pipeline and their handlers/API/state are not
+compiled into the product.
+
+Main loop sketch:
 
 ```rust
-use sigil::Sigil;
+use sigil::core::{SessionManager, SigilEvent, SigilError};
 
-let msg = Sigil::read(
-    &mut lora,
-    &mut delay,
-    |header| { /* validate header */ true },
-    |msg_type, source| { /* return Some(session_key) or None */ None },
-    timestamp,
-)?;
+// Host loads factory root + local MAC once at boot (from ATECC / NVRAM).
+let factory_pubkey = [0x02u8; 33];
+let local_mac = [0x01u8; 17];
+let mut mgr: SessionManager<2> = SessionManager::new(factory_pubkey, local_mac);
+
+loop {
+    // Radio RX (host-owned)
+    if let Some(raw) = radio.try_recv() {
+        match mgr.process_incoming_packet::<200, 256>(&raw, now) {
+            // DATA=200 = max decrypted app payload; MSG=256 fits InstallChallenge (219).
+ // Handshake frames use MSG, not DATA .
+
+            Ok((SigilEvent::Data { peer, payload }, _)) => {
+                // handle decrypted application data
+            }
+            Ok((SigilEvent::TimeSync { gateway_time, sync_sequence,
+                                      uncertainty_secs, .. }, _)) => {
+                // Sensor host applies its RTC discipline / anti-rollback policy.
+            }
+            Ok((SigilEvent::TimeSyncRequest { peer }, _)) => {
+                // Gateway host applies reply policy/rate limits, then sends TimeSync.
+                if let Ok(frame) = mgr.encrypt_time_sync::<256>(
+                    &peer, gateway_time, next_sync_sequence(), uncertainty, now)
+                {
+                    radio.send(peer, &frame);
+                }
+            }
+            Ok((SigilEvent::Event { peer, event_id, payload, duplicate }, _)) => {
+                // Gateway: transactionally dedupe/persist before ACK.
+                if duplicate || host_db_commit_event(peer, event_id, &payload) {
+                    if let Ok(SigilAction::Transmit { payload: ack, .. }) =
+                        mgr.ack_event::<256>(&peer, event_id, now)
+                    {
+                        radio.send(peer, &ack);
+                    }
+                }
+            }
+            Ok((SigilEvent::EventAck { event_id, .. }, _)) => {
+                // Sensor: matching pending Event was authenticated and cleared.
+                mark_event_delivered(event_id);
+            }
+            Ok((SigilEvent::InstallRequest { peer, frame }, _)) => {
+                // Host policy: allowlist + **global** handshake admission .
+                // Library cooldowns are per-peer only; pending table can fill with
+                // many distinct MACs and block renew/resume — rate-limit globally here.
+                if host_db_allows_install(&peer) && host_global_handshake_admit() {
+                    mgr.handle_install_request::<256>(&frame, &mut se, &mut rng, now, key_lifetime_secs).ok();
+                }
+            }
+            Ok((SigilEvent::InstallChallenge { frame, .. }
+            | SigilEvent::InstallConfirm { frame, .. }
+            | SigilEvent::InstallCommitConfirmed { frame, .. }, _)) => {
+                // PersistPeerStaticKey may carry CommitConfirmed in `.transmit`.
+                mgr.continue_install::<256>(&frame, &mut se, now).ok();
+            }
+            Ok((SigilEvent::RenewRequest { peer: _, frame }, _)) => {
+                if host_global_handshake_admit() {
+                    mgr.handle_renew_request::<256>(&frame, &mut rng, now, key_lifetime_secs).ok();
+                }
+            }
+            Ok((SigilEvent::RenewChallenge { frame, .. }
+            | SigilEvent::RenewAck { frame, .. }
+            | SigilEvent::RenewCommitConfirmed { frame, .. }, _)) => {
+                mgr.continue_renew::<256>(&frame, &mut rng, now).ok();
+            }
+            Ok((SigilEvent::ResumeRequest { peer: _, frame }, _)) => {
+                if host_global_handshake_admit() {
+                    mgr.handle_resume_request::<256>(&frame, &mut se, &mut rng, now, key_lifetime_secs).ok();
+                }
+            }
+            Ok((SigilEvent::ResumeChallenge { frame, .. }
+            | SigilEvent::ResumeConfirm { frame, .. }
+            | SigilEvent::ResumeCommitConfirmed { frame, .. }, _)) => {
+                mgr.continue_resume::<256>(&frame, &mut se, now).ok();
+            }
+            Err(SigilError::SessionExpired { peer }) => {
+                // Sensor: call start_renew(...) — library does NOT auto-renew
+            }
+            Err(e) => { /* log error */ }
+        }
+    }
+
+    // Host owns handshake pending lifetime — pick one or both:
+    // A) Transmit { wait_timeout_ms: Some(t) } → host timer → cancel_pending
+    // B) mgr.tick(now) each loop → purge expired deadline_at (TimeoutElapsed semantics)
+    // Event timers instead retry send_event(same id + payload), then optionally
+    // cancel_pending_event after the product retry budget.
+}
 ```
 
-Renew example (sensor, already paired):
-
-```rust
-use sigil::com::handshake::renew::sensor::renew_session;
-
-let session = renew_session(
-    &mut lora,
-    &mut delay,
-    sensor_mac,
-    battery_level,
-    gateway_mac,
-    &current_session_key,
-    &chacha_nonce,
-    new_sensor_nonce,
-    |gw_eph_pubkey| {
-        /* ATECC608: generate sensor ephemeral keypair + ECDH with gw_eph_pubkey */
-        Ok((sensor_eph_pubkey, shared_secret))
-    },
-    timestamp,
-)?;
-// session.keys.key is the new session key
-```
-
-Session resume example (sensor, enrolled but session key lost):
-
-```rust
-use sigil::com::handshake::resume::sensor::resume_session;
-
-let session = resume_session(
-    &mut lora,
-    &mut delay,
-    sensor_mac,
-    battery_level,
-    gateway_mac,
-    new_sensor_nonce,
-    sig_sensor_nonce, // ECDSA(sensor_nonce) with long-term ATECC key
-    |gw_eph_pubkey| {
-        Ok((sensor_eph_pubkey, shared_secret))
-    },
-    |gateway_pubkey, sig| { /* verify gateway sig on sensor_nonce */ true },
-    |gateway_nonce| { /* sign gateway_nonce */ sig_gateway_nonce },
-    timestamp,
-)?;
-```
+See [quickstart](specs/001-nonblocking-session-core/quickstart.md) for the full integration guide.
 
 ---
 
@@ -144,21 +348,21 @@ let session = resume_session(
 sigil/
 ├── diagramme/           # Mermaid sequence diagrams (install, renew, session_resume)
 ├── src/
-│   ├── com/
-│   │   ├── handshake/
-│   │   │   ├── primitives/     # Shared crypto helpers (HKDF inputs, payloads)
-│   │   │   ├── lora_helpers/   # send_encrypted, try_receive_encrypted, …
-│   │   │   ├── install_core/   # Ephemeral-to-ephemeral ECDH + ECDSA (install)
-│   │   │   ├── renew_core/     # Lightweight renew (ephemeral-to-ephemeral ECDH)
-│   │   │   ├── resume_core/    # Session resume (ECDSA + eph-eph, no old session key)
-│   │   │   ├── install/        # install_session, handle_install_request
-│   │   │   ├── renew/          # renew_session, handle_renew_request
-│   │   │   └── resume/         # resume_session, handle_resume_request
-│   │   ├── keys/               # KeyManager, ValidatedKey
-│   │   ├── event/
-│   │   └── mod.rs              # Sigil::read()
-│   ├── models/common/
-│   └── crypto/                 # ChaCha20-Poly1305
+│   └── core/                  # Non-blocking session engine
+│       ├── frame/             # FrameType discriminator (byte 18) + wire-v2 outer header
+│       ├── install/           # Install handshake (clear-text + ECDSA + ECDH)
+│       ├── renew/             # Sensor-initiated renew (encrypted, eph↔eph ECDH)
+│       ├── resume/            # Fast resume (req MAC + static↔static ECDH)
+│       ├── manager/           # SessionManager<N> (fixed-capacity session table)
+│       ├── pipeline/          # process_incoming_packet (classifies + decrypts)
+│       ├── aead/              # ChaCha20-Poly1305 encrypt_append/decrypt_into (1 buffer)
+│       ├── derive/            # HKDF session key derivation
+│       ├── ecdh_soft/         # Software X25519 ECDH (renew ephemeral)
+│       ├── pending/           # PendingHandshake state (zeroizing)
+│       ├── session/           # Session struct (keys, counters, expiry)
+│       ├── event/             # SigilEvent + SigilAction enums
+│       ├── error/             # SigilError enum
+│       └── traits/            # SecureElement + RandomSource traits
 ├── scripts/test.sh
 └── Cargo.toml
 ```
@@ -167,7 +371,7 @@ sigil/
 
 ## Status
 
-Active development. Install API is stable; renew API was simplified in the unreleased refactor (see CHANGELOG).
+Active development. The non-blocking core is the single supported API as of v1.0.0.
 
 ---
 

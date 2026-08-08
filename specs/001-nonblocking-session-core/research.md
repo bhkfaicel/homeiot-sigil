@@ -9,11 +9,11 @@
 - **Rationale**: FR-001 / ARCHITECTURE_DEV — sigil is pure protocol logic; radio ownership caused blocking loops (`delay_ms`) incompatible with FR-003.
 - **Alternatives considered**: Optional `lora` feature adapter in-tree — rejected for v1 of this redesign (keeps HAL surface area); can live in firmware or a future `sigil-lora` helper crate.
 
-## R2 — Software ephemeral ECDH for renew (`p256` + `zeroize`)
+## R2 — Software ephemeral ECDH for renew (`x25519-dalek` + `zeroize`)
 
-- **Decision**: Implement renew eph↔eph with `p256` (`ecdh` / `ecdsa` features as needed, `no_std`) and `zeroize` on ephemeral secrets after HKDF.
-- **Rationale**: FR-008 forbids SE identity ops on renew; RandomSource fills ephemeral private key material.
-- **Alternatives considered**: ATECC ephemeral slots — rejected (power, latency, SE contention); pure `k256` — wrong curve (need P-256 to match identity keys).
+- **Decision**: Implement renew eph↔eph with **X25519** (`x25519-dalek`, `static_secrets`, `no_std`) and `zeroize` on ephemeral secrets after HKDF. Private scalar entropy must be **exactly 32 bytes** from `RandomSource`, then RFC 7748 clamp.
+- **Rationale**: FR-008 forbids SE identity ops on renew; soft P-256 ECDH was too slow on SAMD21 (perf P1). X25519 is far cheaper while remaining `no_std`-friendly. Install/resume identity keys stay P-256 on the SecureElement.
+- **Alternatives considered**: ATECC ephemeral slots — rejected (power, latency, SE contention); soft P-256 (`p256`) — rejected for renew cost on Cortex-M0+; `k256` — wrong curve for identity (install/resume stay P-256 on SE).
 
 ## R3 — Fast resume static↔static vs “no ATECC”
 

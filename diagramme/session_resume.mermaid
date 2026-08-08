@@ -1,36 +1,48 @@
 sequenceDiagram
     autonumber
-    participant App_S as Sensor firmware
-    participant RS as resume_session()
-    participant RC as resume_core
-    participant LoRa as LoRa (SX1278)
-    participant GW as handle_resume_request()
-    participant HW as ATECC608x
+    participant Sensor as Sensor<br/>(SessionManager)
+    participant LoRa as LoRa (host-owned)
+    participant Gateway as Gateway<br/>(SessionManager)
+    participant SE_S as SecureElement (sensor)
+    participant SE_G as SecureElement (gateway)
+    participant RNG_S as RandomSource (sensor)
+    participant RNG_G as RandomSource (gateway)
 
-    Note over App_S,GW: Enrolled sensor, session key lost — no broadcast install
+    Note over Sensor,Gateway: Fast resume — Request MAC'd with durable resume_psk (from install).<br/>Challenge clear-text + chal_mac. Confirm AEAD under new key. Static↔static ECDH via SE.
 
-    App_S->>RS: resume_session(gateway_mac, sig_sensor_nonce)
-    RS->>HW: ECDSA(sensor_nonce) → sig_sensor_nonce
-    RS->>LoRa: SessionResumeRequest clear {sensor_nonce, sig_sensor_nonce}<br/>dest: gateway_mac (NOT AllGateways)
-    LoRa->>GW: SessionResumeRequest
+    Note over Sensor: start_resume(peer, &mut se, &mut rng, now)<br/>rejects active key; requires resume_psk from NVRAM / Session
 
-    GW->>GW: verify_sig_sensor_nonce(enrolled sensor_pubkey, sig)
-    alt Unknown / bad signature
-        GW-->>App_S: (silent reject)
+    Sensor->>RNG_S: fill_bytes(sensor_nonce[16])
+    Sensor->>Sensor: req_mac = HKDF(resume_psk, "sigil-resume-req" ‖ sensor_mac ‖ nonce)
+    Sensor->>LoRa: Transmit ResumeRequest<br/>{peer_mac[17], frame_type=0x21, sensor_nonce[16], req_mac[16]}
+
+    Note over Gateway: handle_resume_request(packet, &mut se, &mut rng, now, key_lifetime_secs)
+
+    LoRa->>Gateway: ResumeRequest
+    Gateway->>Gateway: verify req_mac with resume_psk (before SE-ECDH)
+    alt invalid MAC
+        Gateway-->>Gateway: VerificationFailed (no SE-ECDH)
+    else valid MAC
+        Gateway->>SE_G: ecdh(peer_static_pub) → shared_secret
+        Gateway->>RNG_G: fill_bytes(gateway_nonce[16])
+        Gateway->>Gateway: derive_session_key(shared, "sigil-resume" ‖ nonces ‖ key_lifetime_secs)
+        Gateway->>Gateway: stash new_key in PendingHandshake
+        Gateway->>LoRa: Transmit ResumeChallenge (clear)<br/>{peer_mac[17], frame_type=0x22, gateway_nonce[16], key_lifetime_secs[4], chal_mac[16]}
     end
 
-    GW->>HW: sig_sensor_nonce = ECDSA(sensor_nonce)
-    GW->>HW: Generate gateway ephemeral → gw_eph_pubkey[33B]
-    GW->>LoRa: SessionResumeChallenge clear<br/>{gw_eph_pubkey, sig_sensor_nonce, gateway_pubkey, gateway_nonce, key_expire_at}
-    LoRa->>RC: SessionResumeChallenge
+    Note over Sensor: continue_resume(challenge, &mut se, now)
 
-    RC->>RC: verify_sig_sensor_nonce(gateway_pubkey, sig_sensor_nonce)
-    RC->>HW: Generate sensor ephemeral + ECDH(gw_eph) → shared_secret
-    RC->>HW: sig_gateway_nonce = ECDSA(gateway_nonce)
-    RC->>LoRa: SessionResumeConfirm clear {sig_gateway_nonce, sensor_eph_pubkey} (×3)
-    LoRa->>GW: SessionResumeConfirm
+    LoRa->>Sensor: ResumeChallenge (clear)
+    Sensor->>SE_S: ecdh(peer_static_pub) → same shared_secret
+    Sensor->>Sensor: verify chal_mac; derive_session_key(...)
+    Sensor->>Sensor: update_key(new_key, new_prefix, expire) — counters reset to 0
+    Sensor->>LoRa: Transmit ResumeConfirm (AEAD under new_key, ctr=0)<br/>{peer_mac[17], frame_type=0x23, prefix[4], counter[8], ct+tag}
 
-    GW->>GW: verify_sig_gateway_nonce(sensor_pubkey, sig_gateway_nonce)
-    GW->>HW: ECDH(sensor_eph_pubkey) → shared_secret
-    GW->>GW: session_key_new = HKDF(same inputs)
-    RS-->>App_S: HandshakeSession { keys, gateway_mac }
+    Note over Gateway: continue_resume(confirm, &mut se, now)
+
+    LoRa->>Gateway: ResumeConfirm (encrypted)
+    Gateway->>Gateway: AEAD decrypt under stashed new_key (proof of possession)
+    Gateway->>Gateway: update_key(stashed new_key, new_prefix, expire)
+    Gateway-->>Gateway: Success { peer }
+
+    Note over Sensor,Gateway: Both peers share the resumed session key.<br/>Host reloads peer static pubkey + resume_psk from NVRAM before resume.

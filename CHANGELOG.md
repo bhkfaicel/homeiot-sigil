@@ -5,6 +5,81 @@ All notable changes to this project will be documented in this file.
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to semantic versioning.
 
+## [Unreleased]
+
+### Time synchronization request
+
+- Add authenticated sensor→gateway `TimeSyncRequest` (`0x33`) and the
+  `request_time_sync` sensor API. The gateway receives a typed event and keeps
+  explicit control of the existing `TimeSync` response.
+- Enforce direction, AEAD replay protection, empty request bodies and a
+  15-second per-peer acceptance cooldown before the host may respond.
+
+### Reliable Events
+
+- Add sensor→gateway `Event` (`0x31`) and authenticated gateway→sensor
+  `EventAck` (`0x32`) with AEAD replay protection and strict role checks.
+- ACK creation is explicitly two-phase: the gateway host durably processes an
+  Event before calling `ack_event`; ACK construction failures preserve pending
+  delivery state, while `release_event_delivery` supports storage failures
+  without falsely acknowledging the Event.
+- Add monotonic host-assigned event ids, one in-flight Event per session,
+  exact ACK matching, retry with fresh AEAD counters, duplicate suppression,
+  `EVENT_ACK_TIMEOUT_MS`, and `cancel_pending_event`.
+- Add security tests for ACK loss/retry, replay, wrong ACK ids, premature ACK,
+  direction violations, frame-type tampering and fail-closed buffer handling.
+
+## [1.0.1] - 2026-08-06
+
+### Security / breaking API
+
+- Factory certificates now bind `hardware_profile_id` and `factory_key_id` in
+  addition to product, PeerId and static public key. `SecureElement` exposes the
+  protected metadata; Install Request/Challenge are now 215/219 bytes.
+
+- **`SessionManager::new(factory_pubkey, local_mac)`** — egress outer header is
+  always the sender identity; sessions are keyed by the remote peer. Fixes
+  multi-sensor gateway session collapse and allowlist ambiguity.
+- **`SigilAction::Transmit { wait_timeout_ms }`** — advisory radio wait after TX
+  (host must still call `cancel_pending`).
+- **Resume challenge MAC** (`sigil-resume-mac`) binds clear-text `key_expire_at`
+  to the static ECDH secret; MITM expiry flips fail before key install.
+- **Resume rejects active sessions** (`SessionAlreadyActive`) — use renew.
+- **Renew gateway** zeroizes the X25519 scalar after ECDH (no secret overwrite leak).
+- **Install gateway discovery is mandatory** — use `INSTALL_DISCOVERY_DEST` (or
+  host broadcast); `continue_install` rebinds pending to the real gateway MAC
+  from `InstallChallenge`. Unicast-to-known-gateway is not the supported
+  first-pairing model.
+- **Discovery rebind hardened** — outer≡body check before rebind; multi-pending
+  → `InvalidHandshakeState`; failed challenge rolls pending back to discovery
+  dest.
+
+### Tests / docs
+
+- Pairwise install/renew/resume tests use distinct `SENSOR_MAC` / `GW_MAC`.
+- Multi-sensor install isolation test on gateway.
+- README / quickstart / session-api / CLAUDE updated for identity model.
+
+### Breaking
+
+- Introduce a new **non-blocking session core** under `src/core/`.
+  - `SessionManager<N>` with host-owned I/O; no radio or `delay_ms` inside the library.
+  - Host traits `SecureElement` and `RandomSource` replace direct hardware coupling.
+  - Single ingress `process_incoming_packet` + egress `encrypt_data`.
+  - Three host-driven phases: **install** (identity + SE), **sensor-initiated renew** (pure-software eph↔eph ECDH), **fast resume** (static↔static via SE ECDH only).
+  - Directional `tx_counter` / `rx_counter` for AEAD nonces; replay-protected RX path.
+  - Explicit `cancel` / `remove` on pending handshakes; no auto-renew on expiry.
+- **Remove the entire legacy blocking stack** (`src/com/`, `src/models/`, `src/crypto/`).
+  - The `com`, `models`, and `legacy-lora` feature flags are gone.
+  - The `lora`, `embedded-hal`, `embedded-hal-mock`, and `log` dependencies are removed.
+  - The old `Sigil::read()` entry point and all blocking handshake functions are gone.
+- Add `p256` (ECDH, `no_std`) and `zeroize` dependencies.
+
+### Compatibility
+
+- Wire layouts are **breaking**. The 17-byte peer MAC format is retained.
+- No dual-stack parser; flash sensor and gateway together.
+
 ## [0.5.3] - 2026-08-04
 
 - Test workflow

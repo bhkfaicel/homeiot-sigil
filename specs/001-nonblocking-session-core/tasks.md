@@ -29,9 +29,9 @@ description: "Task list for non-blocking session core implementation"
 
 **Purpose**: Scaffold `src/core/` and adjust crate dependencies for hardware-agnostic builds
 
-- [ ] T001 Create `src/core/` module tree (`mod.rs`, `session.rs`, `manager.rs`, `traits.rs`, `error.rs`, `event.rs`, `pipeline.rs`, `aead.rs`, `ecdh_soft.rs`, `derive.rs`, `pending.rs`, `install/mod.rs`, `renew/mod.rs`, `resume/mod.rs`) and wire `pub mod core` in `src/lib.rs`
-- [ ] T002 Update `Cargo.toml`: add `p256` (no_std ECDH) and `zeroize`; remove `lora` and `embedded-hal` from library `[dependencies]`; bump version for breaking change; refresh `Cargo.lock`
-- [ ] T003 [P] Add English module-level docs in `src/core/mod.rs` describing non-blocking host-owned I/O and the three protocol phases
+- [X] T001 Create `src/core/` module tree (`mod.rs`, `session.rs`, `manager.rs`, `traits.rs`, `error.rs`, `event.rs`, `pipeline.rs`, `aead.rs`, `ecdh_soft.rs`, `derive.rs`, `pending.rs`, `install/mod.rs`, `renew/mod.rs`, `resume/mod.rs`) and wire `pub mod core` in `src/lib.rs`
+- [X] T002 Update `Cargo.toml`: add `p256` (no_std ECDH) and `zeroize`; remove `lora` and `embedded-hal` from library `[dependencies]`; bump version for breaking change; refresh `Cargo.lock`
+- [X] T003 [P] Add English module-level docs in `src/core/mod.rs` describing non-blocking host-owned I/O and the three protocol phases
 
 ---
 
@@ -41,18 +41,18 @@ description: "Task list for non-blocking session core implementation"
 
 **⚠️ CRITICAL**: No user story work begins until this phase is complete
 
-- [ ] T004 Implement `SigilError` variants in `src/core/error.rs` (`UnknownSession`, `SessionExpired`, `Replay`, `CounterExhausted`, `VerificationFailed`, `CapacityExceeded`, `ParseError`, `NoPending`, `EcdhFailed`, `RandomFailed`, …) with English docs
-- [ ] T005 [P] Implement `SecureElement` and `RandomSource` traits in `src/core/traits.rs` per `contracts/host-traits.md`
-- [ ] T006 [P] Implement `SigilEvent` and `SigilAction` enums in `src/core/event.rs` per `contracts/session-api.md` using `heapless` buffers (no `alloc`)
-- [ ] T007 Implement `Session` (peer `[u8; 17]`, static pubkey, optional session key + nonce prefix, `tx_counter`/`rx_counter`, `key_expire_at`) in `src/core/session.rs` per `data-model.md`
-- [ ] T008 Implement `SessionManager<N>` with `heapless::FnvIndexMap` insert/get/get_mut/remove in `src/core/manager.rs`
-- [ ] T009 Implement `PendingHandshake` storage + `cancel(peer)` zeroizing ephemeral secrets in `src/core/pending.rs`
-- [ ] T010 [P] Implement HKDF session-key derivation helpers in `src/core/derive.rs`
-- [ ] T011 Implement directional-counter AEAD nonce helpers + encrypt/decrypt wrappers in `src/core/aead.rs` (ChaCha20-Poly1305, 12-byte nonce = prefix‖counter, no XChaCha20)
-- [ ] T012 [P] Implement software ephemeral P-256 ECDH + `zeroize` in `src/core/ecdh_soft.rs` for renew
-- [ ] T013 [P] Implement `MockSecureElement` and `MockRandom` in `src/core/tests/mocks.rs` (deterministic ECDH/sign/random)
-- [ ] T014 Add foundational unit tests for session counter/nonce rules and manager insert/remove in `src/core/tests/foundation.rs`
-- [ ] T015 Adapt or freeze legacy `src/com/` LoRa-blocking entry points (compile feature gate or remove exports) so default build does not require `lora` — update `src/com/mod.rs` / `src/lib.rs` accordingly
+- [X] T004 Implement `SigilError` variants in `src/core/error.rs` (`UnknownSession`, `SessionExpired`, `Replay`, `CounterExhausted`, `VerificationFailed`, `CapacityExceeded`, `ParseError`, `NoPending`, `EcdhFailed`, `RandomFailed`, …) with English docs
+- [X] T005 [P] Implement `SecureElement` and `RandomSource` traits in `src/core/traits.rs` per `contracts/host-traits.md`
+- [X] T006 [P] Implement `SigilEvent` and `SigilAction` enums in `src/core/event.rs` per `contracts/session-api.md` using `heapless` buffers (no `alloc`)
+- [X] T007 Implement `Session` (peer `[u8; 17]`, static pubkey, optional session key + nonce prefix, `tx_counter`/`rx_counter`, `key_expire_at`) in `src/core/session.rs` per `data-model.md`
+- [X] T008 Implement `SessionManager<N>` with `heapless::FnvIndexMap` insert/get/get_mut/remove in `src/core/manager.rs`
+- [X] T009 Implement `PendingHandshake` storage + `cancel(peer)` zeroizing ephemeral secrets in `src/core/pending.rs`
+- [X] T010 [P] Implement HKDF session-key derivation helpers in `src/core/derive.rs`
+- [X] T011 Implement directional-counter AEAD nonce helpers + encrypt/decrypt wrappers in `src/core/aead.rs` (ChaCha20-Poly1305, 12-byte nonce = prefix‖counter, no XChaCha20)
+- [X] T012 [P] Implement software ephemeral P-256 ECDH + `zeroize` in `src/core/ecdh_soft.rs` for renew
+- [X] T013 [P] Implement `MockSecureElement` and `MockRandom` in `src/core/tests/mocks.rs` (deterministic ECDH/sign/random)
+- [X] T014 Add foundational unit tests for session counter/nonce rules and manager insert/remove in `src/core/tests/foundation.rs`
+- [X] T015 Adapt or freeze legacy `src/com/` LoRa-blocking entry points (compile feature gate or remove exports) so default build does not require `lora` — update `src/com/mod.rs` / `src/lib.rs` accordingly
 
 **Checkpoint**: Foundation ready — user stories can proceed
 
@@ -66,15 +66,15 @@ description: "Task list for non-blocking session core implementation"
 
 ### Tests for User Story 1
 
-- [ ] T016 [P] [US1] Write failing tests for `process_incoming_packet` data/unknown/expired paths in `src/core/tests/pipeline_data.rs`
-- [ ] T017 [P] [US1] Write failing tests for replay / non-monotonic `rx_counter` rejection in `src/core/tests/aead_counters.rs`
+- [X] T016 [P] [US1] Write failing tests for `process_incoming_packet` data/unknown/expired paths in `src/core/tests/pipeline_data.rs`
+- [X] T017 [P] [US1] Write failing tests for replay / non-monotonic `rx_counter` rejection in `src/core/tests/aead_counters.rs`
 
 ### Implementation for User Story 1
 
-- [ ] T018 [US1] Implement frame parse + session lookup + expiry check skeleton in `src/core/pipeline.rs`
-- [ ] T019 [US1] Implement `encrypt_data` / decrypt path using `src/core/aead.rs` and advance `tx_counter`/`rx_counter` from `SessionManager` in `src/core/manager.rs` / `src/core/pipeline.rs`
-- [ ] T020 [US1] Return `SigilError::SessionExpired` without starting renew/install in `src/core/pipeline.rs`
-- [ ] T021 [US1] Make T016–T017 pass; ensure public pipeline APIs take `&mut impl SecureElement` / time `now` without blocking
+- [X] T018 [US1] Implement frame parse + session lookup + expiry check skeleton in `src/core/pipeline.rs`
+- [X] T019 [US1] Implement `encrypt_data` / decrypt path using `src/core/aead.rs` and advance `tx_counter`/`rx_counter` from `SessionManager` in `src/core/manager.rs` / `src/core/pipeline.rs`
+- [X] T020 [US1] Return `SigilError::SessionExpired` without starting renew/install in `src/core/pipeline.rs`
+- [X] T021 [US1] Make T016–T017 pass; ensure public pipeline APIs take `&mut impl SecureElement` / time `now` without blocking
 
 **Checkpoint**: US1 MVP — encrypted data path works with mocks
 
@@ -88,17 +88,17 @@ description: "Task list for non-blocking session core implementation"
 
 ### Tests for User Story 2
 
-- [ ] T022 [P] [US2] Write failing pairwise install success + verify-fail tests in `src/core/tests/install_e2e.rs`
-- [ ] T023 [P] [US2] Write failing pending-timeout-does-not-auto-clear + `cancel` tests in `src/core/tests/pending_cancel.rs`
+- [X] T022 [P] [US2] Write failing pairwise install success + verify-fail tests in `src/core/tests/install_e2e.rs`
+- [X] T023 [P] [US2] Write failing pending-timeout-does-not-auto-clear + `cancel` tests in `src/core/tests/pending_cancel.rs`
 
 ### Implementation for User Story 2
 
-- [ ] T024 [P] [US2] Define install wire helpers / message builders in `src/core/install/wire.rs` (keep `[u8; 17]` MAC) aligned with `contracts/wire-messages.md`
-- [ ] T025 [US2] Implement sensor `start_install` / continue steps returning `SigilAction::{Transmit,WaitingForResponse}` in `src/core/install/sensor.rs`
-- [ ] T026 [US2] Implement gateway handle-install steps + SE verify/sign/ECDH as required in `src/core/install/gateway.rs`
-- [ ] T027 [US2] On install success, set session key, nonce prefix, counters=0, and emit `PersistStaticKey` action from `src/core/install/mod.rs`
-- [ ] T028 [US2] Route install message types through `src/core/pipeline.rs` into install handlers
-- [ ] T029 [US2] Make T022–T023 pass
+- [X] T024 [P] [US2] Define install wire helpers / message builders in `src/core/install/wire.rs` (keep `[u8; 17]` MAC) aligned with `contracts/wire-messages.md`
+- [X] T025 [US2] Implement sensor `start_install` / continue steps returning `SigilAction::{Transmit,WaitingForResponse}` in `src/core/install/sensor.rs`
+- [X] T026 [US2] Implement gateway handle-install steps + SE verify/sign/ECDH as required in `src/core/install/gateway.rs`
+- [X] T027 [US2] On install success, set session key, nonce prefix, counters=0, and emit `PersistStaticKey` action from `src/core/install/mod.rs`
+- [X] T028 [US2] Route install message types through `src/core/pipeline.rs` into install handlers
+- [X] T029 [US2] Make T022–T023 pass
 
 **Checkpoint**: Install works end-to-end with mocks; cancel semantics verified
 
@@ -112,17 +112,17 @@ description: "Task list for non-blocking session core implementation"
 
 ### Tests for User Story 3
 
-- [ ] T030 [P] [US3] Write failing sensor-initiated renew pairwise tests in `src/core/tests/renew_e2e.rs`
-- [ ] T031 [P] [US3] Write failing test that gateway cannot `start_renew` (API absent or error) in `src/core/tests/renew_initiator.rs`
+- [X] T030 [P] [US3] Write failing sensor-initiated renew pairwise tests in `src/core/tests/renew_e2e.rs`
+- [X] T031 [P] [US3] Write failing test that gateway cannot `start_renew` (API absent or error) in `src/core/tests/renew_initiator.rs`
 
 ### Implementation for User Story 3
 
-- [ ] T032 [P] [US3] Define renew wire builders (eph pubs ~50 B class crypto material) in `src/core/renew/wire.rs`
-- [ ] T033 [US3] Implement `start_renew_sensor` using `ecdh_soft` + `RandomSource` and encrypt under old session key in `src/core/renew/sensor.rs`
-- [ ] T034 [US3] Implement gateway renew accept/respond only in `src/core/renew/gateway.rs` (no gateway initiate API)
-- [ ] T035 [US3] On renew success, rotate session key/prefix, reset `tx_counter`/`rx_counter`, zeroize eph secrets in `src/core/renew/mod.rs`
-- [ ] T036 [US3] Route renew types in `src/core/pipeline.rs`; reject AEAD-auth failures without changing old key
-- [ ] T037 [US3] Make T030–T031 pass
+- [X] T032 [P] [US3] Define renew wire builders (eph pubs ~50 B class crypto material) in `src/core/renew/wire.rs`
+- [X] T033 [US3] Implement `start_renew_sensor` using `ecdh_soft` + `RandomSource` and encrypt under old session key in `src/core/renew/sensor.rs`
+- [X] T034 [US3] Implement gateway renew accept/respond only in `src/core/renew/gateway.rs` (no gateway initiate API)
+- [X] T035 [US3] On renew success, rotate session key/prefix, reset `tx_counter`/`rx_counter`, zeroize eph secrets in `src/core/renew/mod.rs`
+- [X] T036 [US3] Route renew types in `src/core/pipeline.rs`; reject AEAD-auth failures without changing old key
+- [X] T037 [US3] Make T030–T031 pass
 
 **Checkpoint**: Renew path complete; sensor-only initiate enforced
 
@@ -136,16 +136,16 @@ description: "Task list for non-blocking session core implementation"
 
 ### Tests for User Story 4
 
-- [ ] T038 [P] [US4] Write failing fast-resume pairwise tests (success + missing static key) in `src/core/tests/resume_e2e.rs`
-- [ ] T039 [P] [US4] Write failing assertion tests that resume path does not call sign_ecdsa / soft eph ECDH in `src/core/tests/resume_constraints.rs`
+- [X] T038 [P] [US4] Write failing fast-resume pairwise tests (success + missing static key) in `src/core/tests/resume_e2e.rs`
+- [X] T039 [P] [US4] Write failing assertion tests that resume path does not call sign_ecdsa / soft eph ECDH in `src/core/tests/resume_constraints.rs`
 
 ### Implementation for User Story 4
 
-- [ ] T040 [P] [US4] Define resume wire builders (~60 B class, no eph/ECDSA fields) in `src/core/resume/wire.rs`
-- [ ] T041 [US4] Implement sensor/gateway resume steps using `SecureElement::ecdh(peer_static)` in `src/core/resume/sensor.rs` and `src/core/resume/gateway.rs`
-- [ ] T042 [US4] On success set session key/prefix, reset both counters; fail closed on missing static material in `src/core/resume/mod.rs`
-- [ ] T043 [US4] Route resume types in `src/core/pipeline.rs`
-- [ ] T044 [US4] Make T038–T039 pass
+- [X] T040 [P] [US4] Define resume wire builders (~60 B class, no eph/ECDSA fields) in `src/core/resume/wire.rs`
+- [X] T041 [US4] Implement sensor/gateway resume steps using `SecureElement::ecdh(peer_static)` in `src/core/resume/sensor.rs` and `src/core/resume/gateway.rs`
+- [X] T042 [US4] On success set session key/prefix, reset both counters; fail closed on missing static material in `src/core/resume/mod.rs`
+- [X] T043 [US4] Route resume types in `src/core/pipeline.rs`
+- [X] T044 [US4] Make T038–T039 pass
 
 **Checkpoint**: Fast resume works under power/size constraints
 
@@ -159,13 +159,13 @@ description: "Task list for non-blocking session core implementation"
 
 ### Tests for User Story 5
 
-- [ ] T045 [P] [US5] Write failing capacity/full-insert/delete tests in `src/core/tests/manager_capacity.rs`
+- [X] T045 [P] [US5] Write failing capacity/full-insert/delete tests in `src/core/tests/manager_capacity.rs`
 
 ### Implementation for User Story 5
 
-- [ ] T046 [US5] Enforce `CapacityExceeded` on insert when full and document `SessionManager<1>` vs `<100>` defaults in `src/core/manager.rs`
-- [ ] T047 [US5] Ensure `remove_session` only drops RAM `Session`/`PendingHandshake` (no NVRAM hooks) in `src/core/manager.rs`
-- [ ] T048 [US5] Make T045 pass; add compile-time example or doc test noting gateway N=100 memory is fixed/no heap in `src/core/manager.rs`
+- [X] T046 [US5] Enforce `CapacityExceeded` on insert when full and document `SessionManager<1>` vs `<100>` defaults in `src/core/manager.rs`
+- [X] T047 [US5] Ensure `remove_session` only drops RAM `Session`/`PendingHandshake` (no NVRAM hooks) in `src/core/manager.rs`
+- [X] T048 [US5] Make T045 pass; add compile-time example or doc test noting gateway N=100 memory is fixed/no heap in `src/core/manager.rs`
 
 **Checkpoint**: Multi-peer table behavior meets FR-014/FR-015
 
@@ -175,13 +175,13 @@ description: "Task list for non-blocking session core implementation"
 
 **Purpose**: Docs, legacy cleanup, CI sanity
 
-- [ ] T049 [P] Update `CLAUDE.md` and `README.md` for non-blocking core, trait integration, and removal of LoRa-from-lib
-- [ ] T050 [P] Update `CHANGELOG.md` with breaking changes (B+, counters, resume static↔static, sensor-only renew)
-- [ ] T051 Remove or archive obsolete blocking handshake modules under `src/com/handshake/` / `src/com/init/` leftovers that still pull radio I/O; keep only what models need
-- [ ] T052 Align `src/models/common/mod.rs` message types with `contracts/wire-messages.md` (install/renew/resume names) while keeping `[u8; 17]` MAC
-- [ ] T053 Run `bash scripts/test.sh` and `cargo clippy -- -D warnings`; fix failures
-- [ ] T054 Validate `specs/001-nonblocking-session-core/quickstart.md` against public APIs (adjust quickstart if signatures drifted)
-- [ ] T055 [P] Refresh `diagramme/*.mermaid` for install/renew/resume to match non-blocking + clarified crypto (English)
+- [X] T049 [P] Update `CLAUDE.md` and `README.md` for non-blocking core, trait integration, and removal of LoRa-from-lib
+- [X] T050 [P] Update `CHANGELOG.md` with breaking changes (B+, counters, resume static↔static, sensor-only renew)
+- [X] T051 Remove or archive obsolete blocking handshake modules under `src/com/handshake/` / `src/com/init/` leftovers that still pull radio I/O; keep only what models need
+- [X] T052 Align `src/models/common/mod.rs` message types with `contracts/wire-messages.md` (install/renew/resume names) while keeping `[u8; 17]` MAC
+- [X] T053 Run `bash scripts/test.sh` and `cargo clippy -- -D warnings`; fix failures
+- [X] T054 Validate `specs/001-nonblocking-session-core/quickstart.md` against public APIs (adjust quickstart if signatures drifted)
+- [X] T055 [P] Refresh `diagramme/*.mermaid` for install/renew/resume to match non-blocking + clarified crypto (English)
 
 ---
 

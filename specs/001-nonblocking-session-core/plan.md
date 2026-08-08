@@ -12,7 +12,7 @@ Replace the LoRa-coupled, blocking handshake stack with a **hardware-agnostic, n
 ## Technical Context
 
 **Language/Version**: Rust edition 2024 (`no_std`, no heap)  
-**Primary Dependencies**: `heapless`, `chacha20poly1305` (heapless), `hkdf`, `sha2`, `bincode` (no_std); add `p256` (ECDH, no_std) + `zeroize` for software ephemeral renew; **remove** `lora` and `embedded-hal` from the library core  
+**Primary Dependencies**: `heapless`, `chacha20poly1305` (heapless), `hkdf`, `sha2`, `bincode` (no_std); add `x25519-dalek` (ECDH, no_std) + `zeroize` for software ephemeral renew; **remove** `lora` and `embedded-hal` from the library core  
 **Storage**: N/A in-library (host owns NVRAM for static keys); RAM-only `Session` / pending handshake state  
 **Testing**: `cargo test` / `scripts/test.sh`; deterministic mocks for SE + RNG (`embedded-hal-mock` only if still needed by optional adapters — prefer pure Rust mocks in-tree)  
 **Target Platform**: ARM Cortex-M0+ (SAMD21) and above; host firmware supplies radio + ATECC608x  
@@ -70,7 +70,7 @@ src/
 │   ├── event.rs               # SigilEvent / SigilAction
 │   ├── pipeline.rs            # process_incoming_packet
 │   ├── aead.rs                # ChaCha20-Poly1305 + directional counters
-│   ├── ecdh_soft.rs           # p256 ephemeral ECDH + zeroize (renew)
+│   ├── ecdh_soft.rs           # X25519 ephemeral ECDH + zeroize (renew)
 │   ├── derive.rs              # HKDF session key derivation
 │   ├── pending.rs             # In-progress handshake state + cancel
 │   ├── install/               # Non-blocking install steps
@@ -94,6 +94,6 @@ tests/                         # Prefer module tests under src/**/tests + integr
 | Item | Why Needed | Simpler Alternative Rejected Because |
 |------|------------|-------------------------------------|
 | Separate `tx_counter` / `rx_counter` | Bidirectional AEAD nonce safety | Single counter (ARCHITECTURE sketch) risks nonce reuse when both sides encrypt |
-| Software `p256` for renew | Eph↔eph without ATECC (spec) | SE-only ECDH would force ATECC on every renew (power/latency) |
+| Software X25519 for renew | Eph↔eph without ATECC; fast on M0+ | Soft P-256 was too slow; SE-only ECDH would force ATECC on every renew |
 | Pending handshake + cancel API | Non-blocking host scheduler | Auto-timeout clear races with late packets |
 | Remove `lora` from lib | FR-001 / G2 | Keep radio in lib would violate hardware-agnostic rule |
