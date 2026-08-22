@@ -350,9 +350,16 @@ impl<const N: usize> Default for PendingStore<N> {
 /// one peer MAC (see
 /// [`INSTALL_REQUEST_COOLDOWN`](crate::core::install::INSTALL_REQUEST_COOLDOWN)).
 /// Expired entries are purged opportunistically so the table cannot
-/// permanently fill with historical PeerIds. Capacity failures of this table
-/// are admission-table saturation (see [`AdmissionStore::mark_install_request`]
-/// and [`AdmissionStore::install_last_at_full_for`]).
+/// permanently fill with historical PeerIds; the purge runs exactly once per
+/// request inside the decide phase ([`AdmissionStore::admit_install`]), and
+/// capacity failures of this table are admission-table saturation (surfaced
+/// by [`AdmissionStore::admit_install`] and, fail-closed, by
+/// [`AdmissionStore::stamp_install_request`]).
+///
+/// The store is deliberately two-phase so an accepted request performs at
+/// most **one** full-table scan: `decide cheap → caller verifies identity →
+/// stamp`. Unauthenticated senders never reach the stamp, so they can consume
+/// only expired-entry reclamation — never live cooldown state.
 #[cfg(feature = "gateway")]
 pub(crate) struct AdmissionStore<const N: usize> {
     /// Last accepted install SE work timestamp (**seconds**) per peer.
@@ -366,53 +373,63 @@ impl<const N: usize> AdmissionStore<N> {
         Self::default()
     }
 
-    /// Returns `true` if install SE work for `peer` is allowed at `now`
-    /// (seconds). Expired cooldown entries are purged opportunistically so
-    /// the table does not permanently fill with historical PeerIds.
-    pub(crate) fn install_cooldown_elapsed(&mut self, peer: &PeerId, now: u32) -> bool {
-        self.purge_expired_install_cooldowns(now);
-        match self.install_last_at.get(peer) {
-            None => true,
-            Some(last) => {
-                now.saturating_sub(*last) >= crate::core::install::INSTALL_REQUEST_COOLDOWN
-            }
-        }
-    }
-
     /// Removes `install_last_at` entries whose cooldown window has elapsed.
+    /// The only full-table scan in this store; called exactly once per
+    /// install request from [`AdmissionStore::admit_install`].
     fn purge_expired_install_cooldowns(&mut self, now: u32) {
         let cooldown = crate::core::install::INSTALL_REQUEST_COOLDOWN;
         self.install_last_at
             .retain(|_, last| now.saturating_sub(*last) < cooldown);
     }
 
+    /// Decides install admission for `peer` at `now` (seconds) with a single
+    /// opportunistic purge of expired cooldown entries, preserving the
+    /// documented guard order: a peer still inside its
+    /// [`INSTALL_REQUEST_COOLDOWN`](crate::core::install::INSTALL_REQUEST_COOLDOWN)
+    /// window is rejected with [`SigilError::RateLimited`] before capacity is
+    /// considered; a new peer with no free slot after the purge is rejected
+    /// with [`SigilError::AdmissionTableFull`]. `Ok(())` means the caller may
+    /// proceed to identity verification and must stamp via
+    /// [`AdmissionStore::stamp_install_request`] only once that verification
+    /// succeeds. Because this method does not mutate live state beyond
+    /// removing already-expired entries, an unauthenticated flood can trigger
+    /// the purge but can never stamp or poison another peer's cooldown.
+    pub(crate) fn admit_install(&mut self, peer: &PeerId, now: u32) -> Result<(), SigilError> {
+        // The single O(C) scan shared by every decision of this request.
+        self.purge_expired_install_cooldowns(now);
+        if let Some(last) = self.install_last_at.get(peer) {
+            if now.saturating_sub(*last) < crate::core::install::INSTALL_REQUEST_COOLDOWN {
+                return Err(SigilError::RateLimited { peer: *peer });
+            }
+            return Ok(());
+        }
+        if self.install_last_at.len() >= N {
+            return Err(SigilError::AdmissionTableFull);
+        }
+        Ok(())
+    }
+
     /// Records that install admission for `peer` was accepted at `now`
     /// (seconds). Callers stamp this only after factory attestation and the
     /// dynamic device signature bind the claimed `peer`, but before ECDH
     /// work, so a sender that merely replayed a public factory certificate
-    /// cannot poison a legitimate peer's cooldown. If the table is full and
-    /// `peer` is new, returns [`SigilError::AdmissionTableFull`]
-    /// (admission-table saturation).
-    pub(crate) fn mark_install_request(
+    /// cannot poison a legitimate peer's cooldown.
+    ///
+    /// Performs **no** scan: the paired decide phase
+    /// ([`AdmissionStore::admit_install`]) already purged expired entries and
+    /// reserved the slot within the same single-threaded API call, so the
+    /// insert cannot grow past capacity. The failure mapping stays fail-closed
+    /// ([`SigilError::AdmissionTableFull`]) in case a future caller pairs the
+    /// phases incorrectly.
+    pub(crate) fn stamp_install_request(
         &mut self,
         peer: PeerId,
         now: u32,
     ) -> Result<(), SigilError> {
-        self.purge_expired_install_cooldowns(now);
-        if self.install_last_at.len() >= N && !self.install_last_at.contains_key(&peer) {
-            return Err(SigilError::AdmissionTableFull);
-        }
         self.install_last_at
             .insert(peer, now)
             .map_err(|_| SigilError::AdmissionTableFull)?;
         Ok(())
-    }
-
-    /// Returns true if the install cooldown table cannot accept `peer`.
-    /// Purges expired entries first so capacity reflects live cooldowns only.
-    pub(crate) fn install_last_at_full_for(&mut self, peer: &PeerId, now: u32) -> bool {
-        self.purge_expired_install_cooldowns(now);
-        self.install_last_at.len() >= N && !self.install_last_at.contains_key(peer)
     }
 
     /// Drops the cooldown entry for `peer` so forgotten peers free capacity.

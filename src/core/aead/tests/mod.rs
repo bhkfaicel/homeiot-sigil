@@ -2,6 +2,12 @@
 
 //! Unit tests for AEAD encryption and decryption
 
+// Host-side performance measurement suite (dev-only, prints with
+// --nocapture). Gated to the explicit two-role composition like the other
+// measurement suites so single-role test sets stay unchanged.
+#[cfg(all(feature = "sensor", feature = "gateway"))]
+mod perf_measurements;
+
 use crate::core::aead::{
     HANDSHAKE_PLAINTEXT_CAP, RX_COUNTER_MAX_GAP, aad_from_frame, build_aad, build_nonce,
     check_tx_counter, decrypt, decrypt_into, encrypt, encrypt_append,

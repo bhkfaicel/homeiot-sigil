@@ -5,6 +5,9 @@
 // Isolated semantic-handler tests (Event delivery, TimeSync cooldown).
 mod handlers;
 
+// Host-side performance measurement suite (dev-only, prints with --nocapture).
+mod perf_measurements;
+
 use crate::core::error::SigilError;
 use crate::core::frame::{
     FRAME_TYPE_OFFSET, FrameType, OUTER_HEADER_SIZE, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET,

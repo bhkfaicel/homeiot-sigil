@@ -38,21 +38,30 @@ use super::EVENT_ID_SIZE;
 
 /// Handles an already-authenticated gateway-side Event frame.
 ///
-/// Receives the decrypted plaintext (`[event_id: 8 BE][application payload]`)
-/// and the pre-open snapshots of `last_rx_event_id` / `pending_rx_event_id`.
+/// Receives the **owned** decrypted plaintext
+/// (`[event_id: 8 BE][application payload]`, already carried in a
+/// `DATA`-capacity buffer by the ingress primitive) and the pre-open
+/// snapshots of `last_rx_event_id` / `pending_rx_event_id`.
 ///
 /// Ordering (byte-identical with the former inline arm):
 /// 1. length + id parse failures reject **before** any mutation;
 /// 2. a parallel delivery is rejected **before** any mutation;
 /// 3. a committed duplicate is reported without any mutation;
 /// 4. otherwise the delivery stamp below happens **before** the application
-///    payload copy — if that copy exceeds `DATA`, the stamp survives (fail
-///    closed: the id stays reserved and deduplicated, never silently lost).
+///    payload is exposed: the id prefix is stripped **in place** (a
+///    `rotate_left` + `truncate` pair) inside the very buffer the AEAD open
+///    filled, so no second `DATA`-capacity buffer ever exists. That strip
+///    cannot fail — the authenticated plaintext already fits `DATA`, hence
+///    the application payload fits `DATA` a fortiori — so every rejection
+///    happens strictly before the stamp and, once stamped, no fallible step
+///    remains between the stamp and delivery. Fail closed is preserved end
+///    to end: a stamped id is always delivered here or explicitly released
+///    by the host, never lost to a buffer error.
 #[cfg(feature = "gateway")]
 pub(super) fn handle_event_frame<const N: usize, const DATA: usize, const MSG: usize>(
     stores: &mut ProtocolStores<'_, N>,
     peer: &PeerId,
-    payload: &[u8],
+    mut payload: Vec<u8, DATA>,
     last_rx_event_id: Option<u64>,
     pending_rx_event_id: Option<u64>,
 ) -> Result<SigilEvent<DATA, MSG>, SigilError> {
@@ -81,15 +90,18 @@ pub(super) fn handle_event_frame<const N: usize, const DATA: usize, const MSG: u
             .ok_or(SigilError::UnknownSession { peer: *peer })?
             .pending_rx_event_id = Some(event_id);
     }
-    let mut event_payload = Vec::<u8, DATA>::new();
-    event_payload
-        .extend_from_slice(&payload[EVENT_ID_SIZE..])
-        .map_err(|_| SigilError::OutputBufferTooSmall)?;
+    // In-place id strip inside the single `DATA`-capacity plaintext buffer:
+    // shift the application payload over the id prefix, then shorten the
+    // vector. Infallible by construction (length pre-checked above; capacity
+    // unchanged), so this introduces no error path past the delivery stamp.
+    let payload_len = payload.len() - EVENT_ID_SIZE;
+    payload.rotate_left(EVENT_ID_SIZE);
+    payload.truncate(payload_len);
 
     Ok(SigilEvent::Event {
         peer: *peer,
         event_id,
-        payload: event_payload,
+        payload,
         duplicate: already_committed,
     })
 }

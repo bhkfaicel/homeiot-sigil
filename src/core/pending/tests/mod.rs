@@ -7,6 +7,7 @@
 //! exercised from its valid predecessor and rejected from an invalid one,
 //! with fail-atomic state preservation on every rejection.
 
+mod footprint_report;
 mod type_size_bounds;
 
 use crate::core::error::SigilError;

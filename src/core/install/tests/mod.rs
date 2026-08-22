@@ -4,6 +4,9 @@
 
 mod transitions;
 
+// Host-side performance measurement suite (dev-only, prints with --nocapture).
+mod perf_measurements;
+
 use crate::core::error::SigilError;
 use crate::core::event::SigilAction;
 use crate::core::frame::{

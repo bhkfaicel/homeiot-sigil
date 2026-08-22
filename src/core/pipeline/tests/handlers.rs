@@ -64,7 +64,9 @@ fn sensor_with_session(expire: u32) -> SessionManager<4> {
 }
 
 /// Builds an authenticated-context Event plaintext: `[id: 8 BE][payload]`.
-fn event_plaintext(event_id: u64, app: &[u8]) -> Vec<u8, 64> {
+/// Generic over the destination capacity so each call produces the owned
+/// `DATA`-capacity buffer the delivery handler consumes.
+fn event_plaintext<const CAP: usize>(event_id: u64, app: &[u8]) -> Vec<u8, CAP> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&event_id.to_be_bytes()).unwrap();
     payload.extend_from_slice(app).unwrap();
@@ -81,7 +83,7 @@ fn test_event_delivery_handler_stamps_pending_and_rejects_parallel_id() {
         let delivered = event::handle_event_frame::<4, 200, 256>(
             &mut stores,
             &REMOTE,
-            &event_plaintext(7, b"door-open"),
+            event_plaintext(7, b"door-open"),
             None,
             None,
         )
@@ -105,7 +107,7 @@ fn test_event_delivery_handler_stamps_pending_and_rejects_parallel_id() {
             event::handle_event_frame::<4, 200, 256>(
                 &mut stores,
                 &REMOTE,
-                &event_plaintext(8, b"x"),
+                event_plaintext(8, b"x"),
                 None,
                 Some(7),
             ),
@@ -124,7 +126,7 @@ fn test_event_delivery_handler_stamps_pending_and_rejects_parallel_id() {
         let duplicate = event::handle_event_frame::<4, 200, 256>(
             &mut stores,
             &REMOTE,
-            &event_plaintext(7, b"door-open"),
+            event_plaintext(7, b"door-open"),
             Some(7),
             None,
         )
@@ -142,23 +144,65 @@ fn test_event_delivery_handler_stamps_pending_and_rejects_parallel_id() {
 }
 
 #[test]
-fn test_event_payload_overflow_after_stamp_is_fail_closed() {
-    // Documents the pre-existing fail-closed ordering: the delivery stamp
-    // happens strictly before the application-payload copy into `DATA`. If
-    // that copy exceeds the buffer, the error surfaces but the id stays
-    // reserved and deduplicated — never silently lost.
+fn test_event_payload_strip_after_stamp_is_infallible() {
+    // Documents the consolidated receive-path ordering: the delivery stamp
+    // still happens strictly before the application-payload handling, but
+    // that handling strips the id **in place** inside the one `DATA`-capacity
+    // plaintext buffer the ingress primitive produced, so it cannot fail. A
+    // plaintext longer than `DATA` cannot reach this handler at all (the AEAD
+    // open into the `DATA` buffer rejects it first), which makes the former
+    // post-stamp `OutputBufferTooSmall` path structurally impossible: every
+    // rejection happens before the stamp, and a stamped fresh delivery always
+    // completes with exactly the authenticated application payload.
     let mut mgr = gateway_with_session(100_000);
-    // DATA = 10 holds at most 10 application bytes; deliver 11.
-    let oversized = event_plaintext(9, &[0xAA; 11]);
+    // DATA = 10 carries at most 10 plaintext bytes: an 8-byte id plus exactly
+    // 2 application bytes — the maximal Event this configuration can deliver.
+    let maximal = event_plaintext(9, &[0xAA; 2]);
 
     {
         let mut stores = mgr.protocol_stores();
-        assert_eq!(
-            event::handle_event_frame::<4, 10, 256>(&mut stores, &REMOTE, &oversized, None, None),
-            Err(SigilError::OutputBufferTooSmall)
-        );
+        let delivered =
+            event::handle_event_frame::<4, 10, 256>(&mut stores, &REMOTE, maximal, None, None)
+                .unwrap();
+        match delivered {
+            SigilEvent::Event {
+                event_id: 9,
+                duplicate: false,
+                payload,
+                ..
+            } => {
+                // The id was stripped in place; only the application bytes
+                // remain, byte-for-byte as authenticated on the wire.
+                assert_eq!(&payload[..], &[0xAAu8; 2]);
+            }
+            other => panic!("unexpected delivery result: {other:?}"),
+        }
     }
+    // The fresh id stays reserved and deduplicated exactly as before.
     assert_eq!(mgr.get(&REMOTE).unwrap().pending_rx_event_id, Some(9));
+
+    // An empty application payload (id-only plaintext) is equally valid and
+    // delivers an empty payload without touching the transaction state.
+    {
+        let mut stores = mgr.protocol_stores();
+        let delivered = event::handle_event_frame::<4, 200, 256>(
+            &mut stores,
+            &REMOTE,
+            event_plaintext(12, &[]),
+            None,
+            None,
+        )
+        .unwrap();
+        match delivered {
+            SigilEvent::Event {
+                event_id: 12,
+                payload,
+                ..
+            } => assert!(payload.is_empty()),
+            other => panic!("unexpected delivery result: {other:?}"),
+        }
+    }
+    assert_eq!(mgr.get(&REMOTE).unwrap().pending_rx_event_id, Some(12));
 }
 
 #[test]
@@ -168,7 +212,13 @@ fn test_event_malformed_payload_rejected_before_any_mutation() {
     {
         let mut stores = mgr.protocol_stores();
         assert_eq!(
-            event::handle_event_frame::<4, 200, 256>(&mut stores, &REMOTE, &[0u8; 7], None, None),
+            event::handle_event_frame::<4, 200, 256>(
+                &mut stores,
+                &REMOTE,
+                Vec::from_slice(&[0u8; 7]).unwrap(),
+                None,
+                None,
+            ),
             Err(SigilError::MalformedFrame)
         );
     }

@@ -12,7 +12,9 @@
 //! crate-internal regression contract only: final flash, static RAM, and stack
 //! budgets remain the **host firmware's** responsibility, measured and enforced
 //! on its own final linked image for the chosen target and feature set (see
-//! the crate-level footprint contract in `src/lib.rs`).
+//! the crate-level footprint contract in `src/lib.rs`). Latest record refresh:
+//! 2026-08-22, transcribed from the crate-owner-approved measurement source
+//! `docs/footprint-report.md`.
 //!
 //! # Measured sizes (host, bytes)
 //! The asserted generic parameters are the documented LoRa defaults

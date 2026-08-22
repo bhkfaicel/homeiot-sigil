@@ -255,40 +255,33 @@ impl<const N: usize> SessionManager<N> {
         self.pending.insert(peer, handshake)
     }
 
-    /// Returns `true` if install SE work for `peer` is allowed at `now` (seconds).
-    /// Expired cooldown entries are purged opportunistically so the
-    /// table does not permanently fill with historical PeerIds.
+    /// Runs the gateway install-admission decide phase for `peer` at `now`
+    /// (seconds): one opportunistic purge, then the documented guard order
+    /// ([`SigilError::RateLimited`] inside the cooldown window,
+    /// [`SigilError::AdmissionTableFull`] for a new peer at capacity,
+    /// otherwise `Ok(())`).
     /// Test-only seam: production install admission flows through the lent
     /// [`ProtocolStores`] view, so this facade helper exists only for the
     /// dual-role unit tests.
     #[cfg(all(test, feature = "sensor", feature = "gateway"))]
-    pub(crate) fn install_cooldown_elapsed(&mut self, peer: &PeerId, now: u32) -> bool {
-        self.install_admission.install_cooldown_elapsed(peer, now)
+    pub(crate) fn admit_install(&mut self, peer: &PeerId, now: u32) -> Result<(), SigilError> {
+        self.install_admission.admit_install(peer, now)
     }
 
-    /// Records that install admission for `peer` was accepted at `now` (seconds).
-    /// Returns [`SigilError::AdmissionTableFull`] when the admission table is
-    /// full and `peer` is new (admission-table saturation).
+    /// Stamps install admission for `peer` at `now` (seconds) without any
+    /// scan or capacity guard (the scan-free post-authentication stamp of the
+    /// two-phase admission flow; fails closed with
+    /// [`SigilError::AdmissionTableFull`] if misused on a full table).
     /// Test-only seam: production install admission flows through the lent
     /// [`ProtocolStores`] view, so this facade helper exists only for the
     /// dual-role unit tests.
     #[cfg(all(test, feature = "sensor", feature = "gateway"))]
-    pub(crate) fn mark_install_request(
+    pub(crate) fn stamp_install_request(
         &mut self,
         peer: PeerId,
         now: u32,
     ) -> Result<(), SigilError> {
-        self.install_admission.mark_install_request(peer, now)
-    }
-
-    /// Returns true if the install cooldown table cannot accept `peer`.
-    /// Purges expired entries first so capacity reflects live cooldowns only.
-    /// Test-only seam: production install admission flows through the lent
-    /// [`ProtocolStores`] view, so this facade helper exists only for the
-    /// dual-role unit tests.
-    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
-    pub(crate) fn install_last_at_full_for(&mut self, peer: &PeerId, now: u32) -> bool {
-        self.install_admission.install_last_at_full_for(peer, now)
+        self.install_admission.stamp_install_request(peer, now)
     }
 
     /// Gets a reference to the pending handshake for the specified peer

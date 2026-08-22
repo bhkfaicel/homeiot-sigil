@@ -169,48 +169,64 @@ fn test_pending_saturation_does_not_block_the_session_table() {
 
 #[test]
 #[cfg(feature = "gateway")]
-fn test_admission_full_for_reflects_live_cooldowns_only() {
+fn test_admission_decide_reflects_live_cooldowns_only() {
     let mut store: AdmissionStore<2> = AdmissionStore::new();
     let t0 = 1_000u32;
     let peer_a = [0xA1u8; 17];
     let peer_b = [0xB2u8; 17];
     let newcomer = [0xC3u8; 17];
 
-    // An empty table admits everyone.
-    assert!(!store.install_last_at_full_for(&newcomer, t0));
-    store.mark_install_request(peer_a, t0).unwrap();
-    store.mark_install_request(peer_b, t0).unwrap();
+    // An empty table admits everyone (single decide phase, no stamp).
+    assert!(store.admit_install(&newcomer, t0).is_ok());
+    store.stamp_install_request(peer_a, t0).unwrap();
+    store.stamp_install_request(peer_b, t0).unwrap();
 
     // Full for a NEW peer while both cooldowns are live...
-    assert!(store.install_last_at_full_for(&newcomer, t0));
-    // ...but a known peer is never blocked by its own entry.
-    assert!(!store.install_last_at_full_for(&peer_a, t0));
+    assert_eq!(
+        store.admit_install(&newcomer, t0),
+        Err(SigilError::AdmissionTableFull)
+    );
+    // ...while a known live-cooldown peer is rejected by the cooldown guard
+    // that runs first in the documented order.
+    assert_eq!(
+        store.admit_install(&peer_a, t0),
+        Err(SigilError::RateLimited { peer: peer_a })
+    );
 
     // Admission saturation heals over time without any explicit removal:
     // once the cooldown window elapses the purged entries free slots.
     let later = t0 + crate::core::install::INSTALL_REQUEST_COOLDOWN;
-    assert!(!store.install_last_at_full_for(&newcomer, later));
-    store.mark_install_request(newcomer, later).unwrap();
-    assert!(!store.install_last_at_full_for(&[0xD4u8; 17], later));
+    assert!(store.admit_install(&newcomer, later).is_ok());
+    store.stamp_install_request(newcomer, later).unwrap();
+    assert!(store.admit_install(&[0xD4u8; 17], later).is_ok());
 }
 
 #[test]
 #[cfg(feature = "gateway")]
-fn test_admission_mark_rejects_only_unknown_peer_when_full() {
+fn test_admission_saturation_blocks_only_unknown_peer() {
     let mut store: AdmissionStore<2> = AdmissionStore::new();
     let t0 = 1_000u32;
     let peer_a = [0xA1u8; 17];
     let peer_b = [0xB2u8; 17];
     let newcomer = [0xC3u8; 17];
-    store.mark_install_request(peer_a, t0).unwrap();
-    store.mark_install_request(peer_b, t0).unwrap();
+    store.stamp_install_request(peer_a, t0).unwrap();
+    store.stamp_install_request(peer_b, t0).unwrap();
 
     // Admission-table saturation originates inside AdmissionStore::
-    // mark_install_request and blocks only unknown peers.
-    let err = store.mark_install_request(newcomer, t0);
-    assert_eq!(err, Err(SigilError::AdmissionTableFull));
+    // admit_install and blocks only unknown peers.
+    assert_eq!(
+        store.admit_install(&newcomer, t0),
+        Err(SigilError::AdmissionTableFull)
+    );
+
+    // The scan-free stamp fails closed if a caller pairs the phases
+    // incorrectly on a full table with an unknown peer.
+    assert_eq!(
+        store.stamp_install_request(newcomer, t0),
+        Err(SigilError::AdmissionTableFull)
+    );
 
     // Re-stamping a known peer still succeeds at capacity (replacement, no
     // net growth).
-    store.mark_install_request(peer_a, t0 + 1).unwrap();
+    store.stamp_install_request(peer_a, t0 + 1).unwrap();
 }

@@ -7,6 +7,60 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+- Version the footprint measurement report in the documentation tree
+  (`docs/footprint-report.md`) instead of the untracked working-notes
+  directory, and rename its companion example binary to match
+  (`examples/footprint_report.rs`, previously `examples/footprint_scratch.rs`).
+  The report records measured bytes per type per feature configuration plus
+  the host-firmware stack high-water procedure; no production code changes.
+
+- Consolidate gateway install admission into a two-phase flow so an accepted
+  install request performs at most one full-table cooldown scan instead of
+  three: `AdmissionStore` now exposes a single-purge decide phase
+  (`admit_install`, which reclaims expired entries once and then applies the
+  cooldown and capacity guards in the documented order) plus a scan-free
+  post-authentication stamp (`stamp_install_request`). The stamp still
+  happens only after both ECDSA verifications bind the claimed identity and
+  strictly before ECDH/signing, unauthenticated senders can still never stamp
+  or poison cooldown state, and every error variant and guard ordering is
+  unchanged (`PendingAlreadyExists` → `SessionTableFull` →
+  `PendingTableFull` → `RateLimited` → `AdmissionTableFull`). Internal
+  optimization only: no wire format, public API, or security-property change.
+
+- Deliver received Events without a second payload copy: the authenticated
+  ingress primitive now moves the decrypted `DATA`-capacity plaintext buffer
+  into the Event delivery handler, which strips the 8-byte event id in place
+  (`rotate_left` + `truncate`) after the durable-delivery stamp. Exactly one
+  `DATA`-sized buffer is alive on the Event receive path, matching the Data
+  path. Wire format, public API, replay/duplicate semantics, and the
+  fail-closed ordering are unchanged: every rejection still happens strictly
+  before the delivery stamp, and the former post-stamp buffer-overflow
+  failure is structurally impossible because the authenticated plaintext
+  already fits `DATA`. Internal optimization only; no behavioral change.
+
+- Add dev-only footprint reporting tooling alongside the performance
+  measurement suite: a test-only breakdown of every `PendingState` variant's
+  nominal byte cost (`src/core/pending/tests/footprint_report.rs`) and an
+  example binary (`examples/footprint_report.rs`) printing `size_of` for the
+  public manager/session/pending/event/action types per feature
+  configuration. All numbers are host-target measurements for planning only;
+  final flash, RAM, and stack budgets remain host-firmware responsibilities,
+  measured on optimized target artifacts.
+
+- Add a dev-only host-side performance measurement suite (test files under
+  `src/core/aead/tests/`, `src/core/pipeline/tests/`,
+  `src/core/manager/tests/`, and `src/core/install/tests/`, all named with the
+  `perf_measurements_` prefix and printed with `--nocapture`). It records the
+  first timing/copy baseline for the Data AEAD primitives at representative
+  payload lengths, the Event receive path (including the structural second
+  payload copy), clear-text handshake frame classification, `tick` at
+  empty/half/full pending occupancy, install admission helpers and the full
+  request handler at empty/half/full cooldown occupancy with source-level
+  purge-scan counts, and FNV-indexed session lookups at 1/64/128 keys. All
+  measurement code is test-only (`cfg(test)`), adds no dependency, and leaves
+  every production feature configuration byte-identical; host wall-clock
+  numbers are informational only and are not target metrics.
+
 - Reconcile the host-facing documentation with the shipped code: the README now
   states that `sensor` is the default feature and describes every supported
   configuration (`wire`, `sensor`, `gateway`, `sensor,gateway`) together with

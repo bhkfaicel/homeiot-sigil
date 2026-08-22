@@ -93,13 +93,11 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
     if !stores.pending.slot_available(&peer) {
         return Err(SigilError::PendingTableFull);
     }
-    if !stores.admission.install_cooldown_elapsed(&peer, now) {
-        return Err(SigilError::RateLimited { peer });
-    }
-    // purge-aware capacity check.
-    if stores.admission.install_last_at_full_for(&peer, now) {
-        return Err(SigilError::AdmissionTableFull);
-    }
+    // Single-scan admission decision (cooldown window first, then
+    // post-purge capacity — the documented guard order). The one O(C)
+    // cooldown-table purge of this request happens here; unauthenticated
+    // senders can trigger only that expired-entry reclamation.
+    stores.admission.admit_install(&peer, now)?;
     // Factory attestation: cert binds PeerId ‖ pubkey.
     let cert_msg = crate::core::install::factory_cert_message(
         crate::core::install::FACTORY_PRODUCT_ID_SENSOR,
@@ -130,8 +128,10 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
     // the factory-certified device key. A certificate is public wire data and
     // is not sufficient by itself to let a sender consume this peer's
     // cooldown. Keep the stamp before ECDH and gateway signing so authenticated
-    // request replays still cannot amplify the more expensive work.
-    stores.admission.mark_install_request(peer, now)?;
+    // request replays still cannot amplify the more expensive work. The stamp
+    // performs no scan: the decide phase above already purged expired entries
+    // and reserved this peer's slot in the same single-threaded call.
+    stores.admission.stamp_install_request(peer, now)?;
 
     // Gateway identity material for the challenge — generate nonce BEFORE
     // HKDF so both handshake nonces are mixed into the session key.

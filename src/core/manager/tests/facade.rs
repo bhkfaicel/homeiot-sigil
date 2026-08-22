@@ -264,29 +264,36 @@ fn test_remove_also_clears_pending() {
 
 #[test]
 fn test_install_last_at_purged_and_cleared_on_remove() {
-    // expired cooldown entries free capacity; removedrops the stamp.
+    // expired cooldown entries free capacity on decide; remove drops the
+    // stamp.
 
     let mut mgr: SessionManager<2> = crate::core::test_support::test_manager();
     let peer_a = [0xA1u8; 17];
     let peer_b = [0xB2u8; 17];
     let peer_c = [0xC3u8; 17];
     let t0 = 1_000u32;
-    mgr.mark_install_request(peer_a, t0).unwrap();
-    mgr.mark_install_request(peer_b, t0).unwrap();
+    mgr.stamp_install_request(peer_a, t0).unwrap();
+    mgr.stamp_install_request(peer_b, t0).unwrap();
     // Table full for a new peer while cooldowns are still live.
-    assert!(mgr.install_last_at_full_for(&peer_c, t0));
-    // After cooldown elapses, purge frees slots.
+    assert_eq!(
+        mgr.admit_install(&peer_c, t0),
+        Err(SigilError::AdmissionTableFull)
+    );
+    // After cooldown elapses, the decide-phase purge frees slots.
     let later = t0 + crate::core::install::INSTALL_REQUEST_COOLDOWN;
-    assert!(!mgr.install_last_at_full_for(&peer_c, later));
-    mgr.mark_install_request(peer_c, later).unwrap();
+    assert!(mgr.admit_install(&peer_c, later).is_ok());
+    mgr.stamp_install_request(peer_c, later).unwrap();
 
     // Fresh stamps + remove clears the entry.
     let mut mgr2: SessionManager<4> = crate::core::test_support::test_manager();
     let peer = [9u8; 17];
-    mgr2.mark_install_request(peer, t0).unwrap();
-    assert!(!mgr2.install_cooldown_elapsed(&peer, t0));
+    mgr2.stamp_install_request(peer, t0).unwrap();
+    assert_eq!(
+        mgr2.admit_install(&peer, t0),
+        Err(SigilError::RateLimited { peer })
+    );
     mgr2.remove(&peer);
-    assert!(mgr2.install_cooldown_elapsed(&peer, t0));
+    assert!(mgr2.admit_install(&peer, t0).is_ok());
 }
 
 // Capacity & delete semantics

@@ -11,7 +11,9 @@
 //! crate-internal regression contract only: final flash, static RAM, and stack
 //! budgets remain the **host firmware's** responsibility, measured and enforced
 //! on its own final linked image for the chosen target and feature set (see
-//! the crate-level footprint contract in `src/lib.rs`).
+//! the crate-level footprint contract in `src/lib.rs`). Latest record refresh:
+//! 2026-08-22, transcribed from the crate-owner-approved measurement source
+//! `docs/footprint-report.md`.
 //!
 //! # Measured sizes (host, bytes)
 //! The size legitimately differs per feature configuration because the manager
@@ -20,13 +22,15 @@
 //!
 //! | Configuration   | `SessionManager<2>` | Bound | `SessionManager<128>` | Bound  |
 //! |-----------------|---------------------|-------|----------------------|--------|
-//! | `sensor` only   | 1336                | 1344  | 80968                | 80976  |
-//! | `gateway` only  | 1432                | 1440  | 86608                | 86624  |
-//! | `sensor,gateway`| 1496                | 1504  | 90704                | 90720  |
+//! | `sensor` only   | 1240                | 1344  | 74824                | 80976  |
+//! | `gateway` only  | 1144                | 1440  | 68176                | 86624  |
+//! | `sensor,gateway`| 1400                | 1504  | 84560                | 90720  |
 //!
-//! Bound rule: the measured size rounded up to the next 16-byte boundary
-//! (8-24 bytes of explicit headroom), keeping small layout shifts legal while
-//! catching any field addition or map widening.
+//! Bound rule: the bounds were approved from earlier measurements rounded up
+//! to the next 16-byte boundary (8-24 bytes of explicit headroom) and
+//! deliberately stay unchanged; the current measurements above sit well
+//! inside them, keeping small layout shifts legal while catching any field
+//! addition or map widening.
 //!
 //! # Why the two-role build guards every configuration
 //! This suite executes in the two-role configuration, where **every** role-gated
@@ -38,8 +42,8 @@
 //!
 //! # Integrator guidance
 //! When budgeting static RAM, treat the manager as the dominant fixed
-//! allocation of the library: roughly 1.5 KiB for a `SessionManager<2>` sensor
-//! and 80-91 KiB for a `SessionManager<128>` gateway, for the recorded feature
+//! allocation of the library: roughly 1.2 KiB for a `SessionManager<2>` sensor
+//! and 73-83 KiB for a `SessionManager<128>` gateway, for the recorded feature
 //! configuration. Re-measure on the final target: target layout may differ
 //! from the host measurements recorded here.
 //!
@@ -52,27 +56,27 @@ use core::mem::size_of;
 
 use crate::core::manager::SessionManager;
 
-/// Approved `SessionManager<2>` byte bound for sensor-only builds (measured 1336).
+/// Approved `SessionManager<2>` byte bound for sensor-only builds (measured 1240).
 #[cfg(all(feature = "sensor", not(feature = "gateway")))]
 const MANAGER2_MAX_BYTES: usize = 1344;
 
-/// Approved `SessionManager<2>` byte bound for gateway-only builds (measured 1432).
+/// Approved `SessionManager<2>` byte bound for gateway-only builds (measured 1144).
 #[cfg(all(feature = "gateway", not(feature = "sensor")))]
 const MANAGER2_MAX_BYTES: usize = 1440;
 
-/// Approved `SessionManager<2>` byte bound for the two-role composition (measured 1496).
+/// Approved `SessionManager<2>` byte bound for the two-role composition (measured 1400).
 #[cfg(all(feature = "sensor", feature = "gateway"))]
 const MANAGER2_MAX_BYTES: usize = 1504;
 
-/// Approved `SessionManager<128>` byte bound for sensor-only builds (measured 80968).
+/// Approved `SessionManager<128>` byte bound for sensor-only builds (measured 74824).
 #[cfg(all(feature = "sensor", not(feature = "gateway")))]
 const MANAGER128_MAX_BYTES: usize = 80976;
 
-/// Approved `SessionManager<128>` byte bound for gateway-only builds (measured 86608).
+/// Approved `SessionManager<128>` byte bound for gateway-only builds (measured 68176).
 #[cfg(all(feature = "gateway", not(feature = "sensor")))]
 const MANAGER128_MAX_BYTES: usize = 86624;
 
-/// Approved `SessionManager<128>` byte bound for the two-role composition (measured 90704).
+/// Approved `SessionManager<128>` byte bound for the two-role composition (measured 84560).
 #[cfg(all(feature = "sensor", feature = "gateway"))]
 const MANAGER128_MAX_BYTES: usize = 90720;
 

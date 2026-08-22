@@ -390,9 +390,11 @@ fn process_encrypted_application_frame<const N: usize, const DATA: usize, const 
         )?,
         #[cfg(feature = "gateway")]
         FrameType::Event => event::handle_event_frame(
+            // The owned decrypted plaintext moves into the handler so the
+            // 8-byte id can be stripped in place (no second payload copy).
             &mut stores,
             peer,
-            &payload,
+            payload,
             last_rx_event_id,
             pending_rx_event_id,
         )?,

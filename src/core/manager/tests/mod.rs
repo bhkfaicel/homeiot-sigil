@@ -27,6 +27,11 @@ mod store_saturation;
 #[cfg(all(feature = "sensor", feature = "gateway"))]
 mod type_size_bounds;
 
+// Host-side performance measurement suite (dev-only, prints with
+// --nocapture); uses the dual-role test seams below for pending fixtures.
+#[cfg(all(feature = "sensor", feature = "gateway"))]
+mod perf_measurements;
+
 // Shared two-role fixtures (used by this module's gated children through
 // `super::`). Compiled out of mono-role builds together with their callers.
 #[cfg(all(feature = "sensor", feature = "gateway"))]
