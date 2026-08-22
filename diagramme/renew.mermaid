@@ -1,49 +1,46 @@
 sequenceDiagram
     autonumber
-    participant Sensor as Sensor<br/>(SessionManager)
-    participant LoRa as LoRa (host-owned)
-    participant Gateway as Gateway<br/>(SessionManager)
-    participant RNG_S as RandomSource (sensor)
-    participant RNG_G as RandomSource (gateway)
+    participant Sensor as Sensor SessionManager
+    participant ATECC as ATECC608 TempKey
+    participant LoRa as LoRa host-owned
+    participant Gateway as Gateway SessionManager
+    participant Crypto as SecureElement host implementation
 
-    Note over Sensor,Gateway: Sensor-initiated renew (encrypted under CURRENT session key)<br/>Pure-software X25519 ephemeral↔ephemeral ECDH. No SecureElement calls.
+    Note over Sensor,Gateway: Renew P-256 éphémère, sans rétrocompatibilité X25519
+    Note over Sensor: start_renew(peer, now)
+    Sensor->>Sensor: AEAD old s2g (plaintext vide)
+    Sensor->>LoRa: RenewRequest, 47 octets
 
-    Note over Sensor: start_renew(peer, &mut rng)
+    LoRa->>Gateway: RenewRequest sous ancienne clé
+    Gateway->>Gateway: AEAD + anti-rejeu
+    Gateway->>Crypto: generate_ephemeral_keypair()
+    Crypto-->>Gateway: gateway_pub[33] + contexte opaque[32]
+    Gateway->>Gateway: Conserve le contexte zéroïsable dans pending
+    Gateway->>LoRa: RenewChallenge, 84 octets<br/>gateway_pub_compressed[33] + lifetime[4], ancienne clé
 
-    Sensor->>RNG_S: generate_ephemeral_scalar()
-    Sensor->>Sensor: pubkey_from_scalar(scalar)
-    Sensor->>Sensor: aead::encrypt(old_key, old_prefix, tx_counter, body)
-    Sensor->>Sensor: tx_counter += 1
-    Sensor->>LoRa: Transmit RenewRequest (AEAD)<br/>{peer_mac[17], frame_type=0x11, prefix[4], counter[8],<br/>ciphertext(sensor_eph_pub[32] X25519) + tag}
+    Note over Sensor: continue_renew(challenge, se, now)
+    LoRa->>Sensor: RenewChallenge sous ancienne clé
+    Sensor->>Sensor: AEAD + anti-rejeu + lifetime
+    Sensor->>ATECC: GenKey(mode=0x04, KeyID=0xFFFF)
+    ATECC-->>Sensor: sensor_pub X||Y
+    Sensor->>ATECC: ECDH(mode=0x0D, KeyID=0x0000, gateway X||Y)
+    ATECC-->>Sensor: shared[32], TempKey invalidée
+    Sensor->>Sensor: HKDF transcript v4 + proof[16]
+    Sensor->>LoRa: RenewConfirm, 96 octets<br/>sensor_pub_compressed[33] + proof[16], ancienne clé
 
-    Note over Gateway: handle_renew_request(packet, &mut rng)
-
-    LoRa->>Gateway: RenewRequest (encrypted)
-    Gateway->>Gateway: aead::decrypt(old_key, old_prefix, counter)
-    alt AEAD auth failure
-        Gateway-->>Gateway: Err(VerificationFailed) — old key unchanged
+    Note over Gateway: handle_renew_confirm(confirm, se, now)
+    LoRa->>Gateway: RenewConfirm sous ancienne clé
+    Gateway->>Gateway: AEAD + anti-rejeu
+    Gateway->>Crypto: complete_ephemeral_ecdh(contexte, sensor_pub)
+    Crypto-->>Gateway: shared[32] ou erreur de validation
+    Gateway->>Gateway: HKDF + proof constant-time
+    alt preuve ou clé invalide
+        Gateway-->>Gateway: rejet, ancienne session conservée
+    else confirmation valide
+        Gateway->>Gateway: Commit nouvelles clés
+        Gateway->>LoRa: RenewCommitConfirmed, 47 octets<br/>AEAD sous nouvelle clé g2s
     end
-    Gateway->>RNG_G: generate_ephemeral_scalar()
-    Gateway->>Sensor: ecdh_from_scalar(gw_scalar, sensor_eph_pub) → shared
-    Gateway->>Gateway: derive_session_key(shared, "sigil-renew")
-    Gateway->>Gateway: aead::encrypt(old_key, old_prefix, tx_counter, challenge_body)
-    Gateway->>LoRa: Transmit RenewChallenge (AEAD under OLD key)<br/>{peer_mac[17], frame_type=0x12, prefix[4], counter[8],<br/>ciphertext(gw_eph_pub[32] X25519, key_lifetime_secs[4]) + tag}
 
-    Note over Sensor: continue_renew(challenge, &mut rng, now)
-
-    LoRa->>Sensor: RenewChallenge (encrypted under old key)
-    Sensor->>Sensor: aead::decrypt(old_key, old_prefix, counter)
-    Sensor->>Sensor: ecdh_from_scalar(sensor_scalar, gw_eph_pub) → same shared
-    Sensor->>Sensor: derive_session_key(shared, "sigil-renew")
-    Sensor->>Sensor: update_key(new_key, new_prefix, expire) — counters reset to 0
-    Sensor->>Sensor: aead::encrypt(new_key, new_prefix, 0, ack_body)
-    Sensor->>LoRa: Transmit RenewAck (AEAD under NEW key)<br/>{peer_mac[17], frame_type=0x13, prefix[4], counter[8], ciphertext + tag}
-
-    Note over Gateway: continue_renew(ack, &mut rng, now)
-
-    LoRa->>Gateway: RenewAck (encrypted under new key)
-    Gateway->>Gateway: aead::decrypt(new_key, new_prefix, 0)
-    Gateway->>Gateway: update_key(new_key, new_prefix, expire) — counters reset to 0
-    Gateway-->>Gateway: Success { peer }
-
-    Note over Sensor,Gateway: Both peers now share the rotated session key.<br/>Gateway never initiates renew (sensor-only).
+    LoRa->>Sensor: RenewCommitConfirmed
+    Sensor->>Sensor: Vérifie AEAD nouvelle clé puis commit
+    Note over Sensor,Gateway: tick(now) reste obligatoire pour récupérer les pending pré-commit

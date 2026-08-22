@@ -6,7 +6,7 @@
 //! # Directional AEAD
 //!
 //! Each active session holds **independent** TX and RX key material. Both peers
-//! share the same [`DirectionalMaterial`] transcript; [`SessionRole`] maps
+//! share the same internal directional-material transcript; [`SessionRole`] maps
 //! sensor→gateway / gateway→sensor halves onto local TX vs RX so the two
 //! directions never share a `(key, nonce)` space.
 //!
@@ -21,6 +21,7 @@
 //! durable data: the fields cached in a live `Session` are RAM-only.
 
 use crate::core::error::SigilError;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Peer identifier using the existing 17-byte MAC format
@@ -54,11 +55,11 @@ pub fn validate_key_lifetime(lifetime_secs: u32) -> Result<(), SigilError> {
 pub(crate) fn expire_from_lifetime(now: u32, lifetime_secs: u32) -> Result<u32, SigilError> {
     validate_key_lifetime(lifetime_secs)?;
     now.checked_add(lifetime_secs)
-.ok_or(SigilError::InvalidKeyLifetime { lifetime_secs })
+        .ok_or(SigilError::InvalidKeyLifetime { lifetime_secs })
 }
 
 /// Local role in a pairwise session (immutable for the session lifetime).
-/// Determines how [`DirectionalMaterial`] maps onto TX / RX AEAD keys.
+/// Determines how internal directional material maps onto TX / RX AEAD keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRole {
     /// This device initiates renew / resume and uses the sensor→gateway TX half.
@@ -100,7 +101,7 @@ impl DirectionalMaterial {
     }
 
     /// Builds material with distinct halves from a base key/prefix (unit tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
     pub(crate) fn distinct_for_test(key: SessionKey, prefix: NoncePrefix) -> Self {
         let mut g2s_key = key;
         g2s_key[0] ^= 0xA5;
@@ -127,6 +128,25 @@ pub fn validate_key_expire_at(now: u32, key_expire_at: u32) -> Result<(), SigilE
     Ok(())
 }
 
+/// Performs the public-key format checks that do not require a P-256 backend.
+/// Full on-curve validation remains mandatory in [`crate::core::traits::SecureElement`].
+pub fn validate_static_public_key_encoding(
+    public_key: &StaticPublicKeyBytes,
+) -> Result<(), SigilError> {
+    if !matches!(public_key[0], 0x02 | 0x03) {
+        return Err(SigilError::InvalidStaticKey);
+    }
+    Ok(())
+}
+
+/// Rejects the sentinel all-zero value when enrollment is restored from NVRAM.
+pub fn validate_resume_psk(resume_psk: &ResumePsk) -> Result<(), SigilError> {
+    if bool::from(resume_psk.ct_eq(&[0u8; 32])) {
+        return Err(SigilError::InvalidResumePsk);
+    }
+    Ok(())
+}
+
 /// Session state for a single peer
 /// # Directional AEAD
 /// Active sessions store separate TX and RX keys/prefixes. Encrypt paths use
@@ -134,10 +154,10 @@ pub fn validate_key_expire_at(now: u32, key_expire_at: u32) -> Result<(), SigilE
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Session {
     /// Peer identifier (lookup key)
-    pub peer_mac: PeerId,
+    peer_mac: PeerId,
 
     /// Peer's static public key (durable identity, also stored in host NVRAM)
-    pub peer_static_pubkey: StaticPublicKeyBytes,
+    peer_static_pubkey: StaticPublicKeyBytes,
 
     /// Local role (maps directional transcript → TX/RX)
     #[zeroize(skip)]
@@ -227,10 +247,11 @@ impl Session {
         peer_mac: PeerId,
         peer_static_pubkey: StaticPublicKeyBytes,
         resume_psk: ResumePsk,
-        key_expire_at: u32,
         role: SessionRole,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SigilError> {
+        validate_static_public_key_encoding(&peer_static_pubkey)?;
+        validate_resume_psk(&resume_psk)?;
+        Ok(Self {
             peer_mac,
             peer_static_pubkey,
             role,
@@ -241,7 +262,9 @@ impl Session {
             resume_psk: Some(resume_psk),
             tx_counter: 0,
             rx_counter: 0,
-            key_expire_at,
+            // There is no active key after NVRAM restore. Resume installs a
+            // fresh expiry together with newly-derived key material.
+            key_expire_at: 0,
             #[cfg(feature = "gateway")]
             last_resume_request_at: None,
             #[cfg(feature = "gateway")]
@@ -254,7 +277,7 @@ impl Session {
             last_rx_event_id: None,
             #[cfg(feature = "gateway")]
             pending_rx_event_id: None,
-        }
+        })
     }
 
     /// Creates a session with active directional AEAD keys (install path).
@@ -271,6 +294,7 @@ impl Session {
         now: u32,
     ) -> Result<Self, SigilError> {
         validate_key_expire_at(now, key_expire_at)?;
+        validate_resume_psk(&resume_psk)?;
         let (tx_key, tx_prefix, rx_key, rx_prefix) = Self::apply_directional(role, &material);
         Ok(Self {
             peer_mac,
@@ -299,23 +323,29 @@ impl Session {
         })
     }
 
-    /// Returns a reference to the outbound session key, if any.
-    pub fn session_key(&self) -> Option<&SessionKey> {
+    /// Returns a reference to the outbound session key for crate-internal
+    /// protocol transitions and tests. Active AEAD material is deliberately
+    /// not exportable through the host API.
+    #[cfg(feature = "sensor")]
+    pub(crate) fn session_key(&self) -> Option<&SessionKey> {
         self.tx_key.as_ref()
     }
 
     /// Returns a reference to the inbound session key, if any.
-    pub fn rx_session_key(&self) -> Option<&SessionKey> {
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
+    pub(crate) fn rx_session_key(&self) -> Option<&SessionKey> {
         self.rx_key.as_ref()
     }
 
     /// Returns a reference to the outbound nonce prefix, if any.
-    pub fn nonce_prefix(&self) -> Option<&NoncePrefix> {
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
+    pub(crate) fn nonce_prefix(&self) -> Option<&NoncePrefix> {
         self.tx_prefix.as_ref()
     }
 
     /// Returns the inbound nonce prefix (wire prefix expected on decrypt).
-    pub fn rx_nonce_prefix(&self) -> Option<&NoncePrefix> {
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
+    pub(crate) fn rx_nonce_prefix(&self) -> Option<&NoncePrefix> {
         self.rx_prefix.as_ref()
     }
 
@@ -324,8 +354,20 @@ impl Session {
         self.role
     }
 
-    /// Returns a reference to the durable resume PSK, if enrolled.
-    pub fn resume_psk(&self) -> Option<&ResumePsk> {
+    /// Returns the immutable peer identity used as the manager lookup key.
+    pub fn peer_mac(&self) -> &PeerId {
+        &self.peer_mac
+    }
+
+    /// Returns the immutable, factory-attested static public key for the peer.
+    pub fn peer_static_pubkey(&self) -> &StaticPublicKeyBytes {
+        &self.peer_static_pubkey
+    }
+
+    /// Returns the durable resume PSK internally. Hosts receive enrollment
+    /// material only through `SigilAction::PersistPeerStaticKey`.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
+    pub(crate) fn resume_psk(&self) -> Option<&ResumePsk> {
         self.resume_psk.as_ref()
     }
 
@@ -383,6 +425,7 @@ impl Session {
     }
 
     /// Legacy alias: TX material (encrypt / renew-request paths).
+    #[cfg(feature = "sensor")]
     pub(crate) fn require_key_material(
         &self,
         peer: &PeerId,
@@ -391,8 +434,8 @@ impl Session {
     }
 
     /// Returns the resume PSK required to MAC / verify `ResumeRequest`.
-    pub(crate) fn require_resume_psk(&self) -> Result<ResumePsk, SigilError> {
-        self.resume_psk.ok_or(SigilError::InvalidStaticKey)
+    pub(crate) fn require_resume_psk(&self) -> Result<&ResumePsk, SigilError> {
+        self.resume_psk.as_ref().ok_or(SigilError::InvalidResumePsk)
     }
 
     /// Updates directional AEAD keys and resets counters (install/renew/resume).

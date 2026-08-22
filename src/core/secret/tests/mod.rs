@@ -1,4 +1,4 @@
-#![cfg(all(test, feature = "sensor", feature = "gateway"))]
+#![cfg(test)]
 
 //! Unit tests for [`super::SecretBytes`].
 

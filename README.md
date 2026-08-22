@@ -12,7 +12,10 @@
 
 ## Architecture
 
-`sigil` is a **non-blocking, hardware-agnostic session engine**. The library never touches the radio or blocks; the host firmware owns all I/O and timing.
+`sigil` is a **radio-non-blocking, hardware-agnostic session engine**. The
+library never waits for radio traffic or sleeps; the host firmware owns I/O and
+timing. Handshake calls use synchronous host `SecureElement` methods and occupy
+the calling task for the duration of those hardware operations.
 
 Every frame carries an outer header
 `[sender_mac:17] [protocol_version:1 = 0x03] [frame_type:1]` where
@@ -29,9 +32,9 @@ incoming frames **without decryption**, returning a typed `SigilEvent`:
 - `FrameType::Event` / `EventAck` → reliable sensor event with an authenticated,
   replay-protected application ACK generated only after durable gateway processing
 - Handshake frames → **per-step** events, e.g. `InstallChallenge` ≠ `InstallRequest`, paired with `SigilAction::NeedsHostDispatch` (not `Success`):
-  - `InstallRequest` / `InstallChallenge` / `InstallConfirm` / `InstallCommitConfirmed
-  - `RenewRequest` / `RenewChallenge` / `RenewAck` / `RenewCommitConfirmed
-  - `ResumeRequest` / `ResumeChallenge` / `ResumeConfirm` / `ResumeCommitConfirmed
+  - `InstallRequest` / `InstallChallenge` / `InstallConfirm` / `InstallCommitConfirmed`
+  - `RenewRequest` / `RenewChallenge` / `RenewConfirm` / `RenewCommitConfirmed`
+  - `ResumeRequest` / `ResumeChallenge` / `ResumeConfirm` / `ResumeCommitConfirmed`
 
 The host routes `*Request` to `handle_*` and challenge/confirm/ack/**CommitConfirmed** to `continue_*`.
 
@@ -39,8 +42,17 @@ The host routes `*Request` to `handle_*` and challenge/confirm/ack/**CommitConfi
 
 ## Features
 
+- **Role-scoped builds** — `sensor` is the safe, smallest default. Gateway
+  dependencies must use `default-features = false, features = ["gateway"]`;
+  pairwise development uses `--all-features`.
 - **Non-blocking core** — Host-owned radio + secure element via the `SecureElement` / `RandomSource` traits. Provides `SessionManager<N>`, a single ingress (`process_incoming_packet`), egress (`encrypt_data`), and three host-driven phases: install, sensor-initiated renew, and fast resume.
 - **`N` must be a power of two and `>= 2`** (constraint from `heapless::FnvIndexMap`); use `<2>` for single-peer sensors, `<128>` for gateways.
+- **Host-owned footprint budgets** — final flash, static RAM, and stack budgets
+  are measured and enforced by the host firmware on its own final linked image.
+  The crate guards its dominant fixed-capacity types with internal type-size
+  regression bounds (see the crate-level rustdoc); those recorded sizes are
+  planning inputs for host budgeting, not a substitute for target-level
+  measurement.
 
 ---
 
@@ -57,7 +69,7 @@ InstallRequest → InstallChallenge → InstallConfirm (Final) → InstallCommit
 → Sensor stages keys until CommitConfirmed; gateway commits on Final
 ```
 
-**Construction:** `SessionManager::new(factory_pubkey, local_mac)` — host loads
+**Construction:** `SessionManager::new(factory_pubkey, local_mac)?` — host loads
 the factory root and this device's MAC once at boot (ATECC/NVRAM).
 
 **Gateway discovery is mandatory** for first pairing: the sensor does not know
@@ -69,8 +81,8 @@ outer header = sensor `local_mac`; host **must** TX as discovery/broadcast.
 rebinds the pending entry.
 **Gateway host:** on `SigilEvent::InstallRequest` (not Challenge/Confirm), check pairing DB for `peer`
 (sender / sensor MAC from the outer header), then
-`handle_install_request(..., now, key_lifetime_secs)` — cheap DoS guards (pending / cooldown **15 s** / capacity) run first; after factory identity verification,
-the cooldown is stamped before device signature, ECDH and challenge. Sensor hosts route `InstallChallenge` /
+`handle_install_request(..., now, key_lifetime_secs)` — cheap DoS guards (pending / cooldown **15 s** / capacity) run first. After the factory certificate and dynamic device signature authenticate the sensor,
+the cooldown is stamped before ECDH and challenge construction. Sensor hosts route `InstallChallenge` /
 `InstallConfirm` / `InstallCommitConfirmed` via `continue_install`. On gateway
 Final, `PersistPeerStaticKey.transmit` carries CommitConfirmed (persist then TX).
 Host allowlist remains policy for _who_ may pair; the library rate-limits SE
@@ -78,19 +90,26 @@ amplification. Host supplies an authenticated key lifetime in seconds.
 
 ### Renew (session key rotation, sensor-initiated)
 
-Encrypted Request/Challenge under the **old**
-session key; Final (`RenewAck`) and CommitConfirmed under the **new** directional
-keys — **ephemeral-to-ephemeral ECDH** (no ECDSA, no ECIES). Only
+Request, Challenge and Final (`RenewConfirm`) are encrypted under the **old**
+session keys. CommitConfirmed uses the **new** gateway→sensor key. Renew uses
+ephemeral P-256 ECDH with a sensor private key confined to ATECC `TempKey`. Only
 `SessionRole::Sensor` may call `start_renew`:
 
 ```
-RenewRequest → RenewChallenge → RenewAck (Final) → RenewCommitConfirmed
-→ DirectionalMaterial_new = HKDF-Expand(ECDH(eph↔eph), …)  // s2g ‖ g2s
+RenewRequest(empty) → RenewChallenge(gateway_pub, lifetime)
+→ RenewConfirm(sensor_pub, proof) → RenewCommitConfirmed
+→ DirectionalMaterial_new = HKDF-Expand(ECDH(P-256 eph↔eph), transcript-v4)
 → Sensor keeps old key until CommitConfirmed verifies
 ```
 
-**Sensor only:** `start_renew()` — uses software X25519 ECDH (`ecdh_soft`)
-**Gateway:** `handle_renew_request()` — responds only; **no gateway initiate API**
+**Sensor:** `start_renew(peer, now)`, then
+`continue_renew(frame, secure_element, now)`. The ATECC operation must chain
+`GenKey TempKey` and ECDH atomically, with no EEPROM write in between.
+**Gateway:** `handle_renew_request(frame, secure_element, random, ...)`, then
+`handle_renew_confirm(frame, secure_element, now)`. The host implements the
+gateway P-256 methods of `SecureElement` with the backend of its choice
+(RustCrypto, OpenSSL, TPM, HSM...) and supplies its own `RandomSource`; there
+is **no gateway initiation API**.
 
 ### Session resume (fast re-pair after reboot)
 
@@ -108,7 +127,7 @@ ResumeRequest (nonce ‖ req_mac) → ResumeChallenge → ResumeConfirm (Final) 
 
 Gateway verifies `req_mac` **before** SE-ECDH. Host must persist
 `resume_psk` with the peer static pubkey after install and reload via
-`Session::new_enrolled(..., resume_psk, ..., SessionRole)` after reboot.
+`Session::new_enrolled(peer, peer_pubkey, resume_psk, SessionRole)?` after reboot.
 
 **Directional AEAD:** each peer holds independent TX/RX key
 material (`SessionRole::{Sensor,Gateway}` maps shared directional halves).
@@ -133,8 +152,7 @@ Product contract for all hosts (sensor SAMD21 and gateway):
 | `key_lifetime_secs`                | **seconds**            | Authenticated duration; each peer computes `local_now + lifetime` |
 | `RESUME_REQUEST_COOLDOWN`          | **15 seconds**         | Min gap between accepted resume ECDH per peer                     |
 | `INSTALL_REQUEST_COOLDOWN`         | **15 seconds**         | Min gap between accepted install SE work per peer                 |
-| `MAX_SESSION_LIFETIME_SECS` | **2 days** (172 800 s) | Maximum accepted wire lifetime |
-
+| `MAX_SESSION_LIFETIME_SECS`        | **2 days** (172 800 s) | Maximum accepted wire lifetime                                    |
 | `*_TIMEOUT_MS` / `wait_timeout_ms` | **milliseconds**       | Advisory radio waits only — never mixed with `now`                |
 
 Sensor and gateway may use different clock epochs. Do not feed millisecond
@@ -189,7 +207,7 @@ Security and reliability contract:
 - With `process_incoming_packet::<DATA, MSG>`, the maximum Event application
   payload is `DATA - 8` bytes. An EventAck is 55 bytes on wire.
 
-**`u32` wrap :** unix-epoch seconds wrap ~2106; a monotonic counter from 0 wraps after ~136 years of uptime. Out of product horizon — no `u64` migration in v1.
+**`u32` wrap:** unix-epoch seconds wrap ~2106; a monotonic counter from 0 wraps after ~136 years of uptime. Out of product horizon — no `u64` migration in v1.
 
 ### Host global rate-limit
 
@@ -206,8 +224,17 @@ install allowlist), e.g.:
 - max concurrent pending handshakes across all peers; and/or
 - a global token bucket (new handshake starts per minute).
 
-On `CapacityExceeded`, drop or defer RF work and `cancel_pending` stale peers
+On pending/admission saturation (`PendingTableFull` / `AdmissionTableFull`),
+drop or defer RF work and `cancel_pending` stale peers
 when host radio timers expire. Sigil does not provide a global rate limiter.
+
+Post-commit recovery entries are intentionally not removed by `tick`, because
+silently discarding staged keys or a cached `CommitConfirmed` can split the two
+peers across key epochs. Hosts must nevertheless bound recovery operationally:
+retry `retransmit_pending_cached`, observe `pending_len` /
+`commit_recovery_peers`, then call `abandon_commit_recovery` after the product
+retry budget is exhausted. That explicit terminal operation preserves the
+current session/enrollment while zeroizing and freeing the recovery slot.
 
 ### Sensor install vs door / vibration 
 
@@ -228,15 +255,22 @@ gateway-only API/events/state from being compiled into the sensor firmware.
 ```toml
 [dependencies]
 # SAMD21 sensor firmware
-sigil = { version = "1.0.0", registry = "forgejo", default-features = false, features = ["sensor"] }
+sigil = { version = "1.0.1", registry = "forgejo", default-features = false, features = ["sensor"] }
 
 # Raspberry Pi (or equivalent) gateway software
-# sigil = { version = "1.0.0", registry = "forgejo", default-features = false, features = ["gateway"] }
+# sigil = { version = "1.0.1", registry = "forgejo", default-features = false, features = ["gateway"] }
 ```
 
-The crate default enables both roles for development, integration tests and
-protocol simulations. Production builds should select one role only. A build
-without either role is rejected at compile time.
+The default feature is `sensor`, the safe smallest build for sensor firmware.
+Supported configurations are `wire` (manufacturing contract), `sensor`,
+`gateway`, and the explicit two-role composition `sensor,gateway`; pairwise
+development uses `--all-features`. A build without any supported feature set
+(no role and no `wire`) is rejected at compile time with an explicit
+diagnostic:
+
+```text
+sigil: no supported feature configuration selected; enable `wire` (manufacturing contract) or one of the session roles `sensor` / `gateway`
+```
 
 `SigilEvent` intentionally keeps the complete wire-classification enum in both
 role builds so shared host adapters can remain exhaustive. Role-disabled frames
@@ -251,7 +285,7 @@ use sigil::core::{SessionManager, SigilEvent, SigilError};
 // Host loads factory root + local MAC once at boot (from ATECC / NVRAM).
 let factory_pubkey = [0x02u8; 33];
 let local_mac = [0x01u8; 17];
-let mut mgr: SessionManager<2> = SessionManager::new(factory_pubkey, local_mac);
+let mut mgr: SessionManager<2> = SessionManager::new(factory_pubkey, local_mac)?;
 
 loop {
     // Radio RX (host-owned)
@@ -305,13 +339,15 @@ loop {
             }
             Ok((SigilEvent::RenewRequest { peer: _, frame }, _)) => {
                 if host_global_handshake_admit() {
-                    mgr.handle_renew_request::<256>(&frame, &mut rng, now, key_lifetime_secs).ok();
+                    mgr.handle_renew_request::<256>(&frame, &mut se, &mut rng, now, key_lifetime_secs).ok();
                 }
             }
             Ok((SigilEvent::RenewChallenge { frame, .. }
-            | SigilEvent::RenewAck { frame, .. }
             | SigilEvent::RenewCommitConfirmed { frame, .. }, _)) => {
-                mgr.continue_renew::<256>(&frame, &mut rng, now).ok();
+                mgr.continue_renew::<256>(&frame, &mut se, now).ok();
+            }
+            Ok((SigilEvent::RenewConfirm { frame, .. }, _)) => {
+                mgr.handle_renew_confirm::<256>(&frame, &mut se, now).ok();
             }
             Ok((SigilEvent::ResumeRequest { peer: _, frame }, _)) => {
                 if host_global_handshake_admit() {
@@ -338,7 +374,9 @@ loop {
 }
 ```
 
-See [quickstart](specs/001-nonblocking-session-core/quickstart.md) for the full integration guide.
+The authoritative integration contract is this document together with the
+crate rustdoc (`cargo doc --open`); every public API carries its host-facing
+contract inline.
 
 ---
 
@@ -349,19 +387,20 @@ sigil/
 ├── diagramme/           # Mermaid sequence diagrams (install, renew, session_resume)
 ├── src/
 │   └── core/                  # Non-blocking session engine
-│       ├── frame/             # FrameType discriminator (byte 18) + wire-v2 outer header
-│       ├── install/           # Install handshake (clear-text + ECDSA + ECDH)
-│       ├── renew/             # Sensor-initiated renew (encrypted, eph↔eph ECDH)
+│       ├── frame/             # FrameType discriminator (byte 18) + outer header (protocol 0x03)
+│       ├── factory_cert/      # Factory certificate parsing / verification types
+│       ├── install/           # Install handshake (clear-text + ECDSA + static↔static ECDH)
+│       ├── renew/             # Renew handshake (P-256 ephemeral ECDH via host SecureElement)
 │       ├── resume/            # Fast resume (req MAC + static↔static ECDH)
-│       ├── manager/           # SessionManager<N> (fixed-capacity session table)
-│       ├── pipeline/          # process_incoming_packet (classifies + decrypts)
+│       ├── manager/           # SessionManager<N> facade over crate-private session/pending/admission stores
+│       ├── pipeline/          # Single authenticated ingress + data/event/timesync handlers
 │       ├── aead/              # ChaCha20-Poly1305 encrypt_append/decrypt_into (1 buffer)
 │       ├── derive/            # HKDF session key derivation
-│       ├── ecdh_soft/         # Software X25519 ECDH (renew ephemeral)
-│       ├── pending/           # PendingHandshake state (zeroizing)
+│       ├── pending/           # PendingHandshake with tagged PendingState variants (zeroizing secrets)
+│       ├── secret/            # Zeroizing fixed-size secret buffers
 │       ├── session/           # Session struct (keys, counters, expiry)
 │       ├── event/             # SigilEvent + SigilAction enums
-│       ├── error/             # SigilError enum
+│       ├── error/             # SigilError enum (one host-policy category per variant)
 │       └── traits/            # SecureElement + RandomSource traits
 ├── scripts/test.sh
 └── Cargo.toml

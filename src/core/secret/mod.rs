@@ -6,7 +6,10 @@
 //! clears them on **every** drop (success or error).
 
 use core::ops::Deref;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::core::error::SigilError;
 
 /// Fixed-size secret wiped when dropped.
 /// Prefer this over a bare `[u8; N]` for ECDH shared secrets and short-lived
@@ -54,8 +57,22 @@ impl<const N: usize> AsRef<[u8]> for SecretBytes<N> {
 /// 32-byte ECDH shared secret or session-key copy.
 pub(crate) type SharedSecretBuf = SecretBytes<32>;
 
-/// 4-byte nonce-prefix copy (renew gateway challenge encrypt).
-#[cfg(any(feature = "gateway", test))]
+/// Validates and wraps a provider-produced ECDH shared secret.
+///
+/// A null result is never valid for the P-256 exchanges used by Sigil. Reject
+/// it at the protocol boundary even when the host provider claims to validate
+/// peer points, so Install, Renew and Resume all fail closed consistently.
+pub(crate) fn validated_ecdh_shared_secret(
+    mut shared: [u8; 32],
+) -> Result<SharedSecretBuf, SigilError> {
+    if shared.ct_eq(&[0u8; 32]).unwrap_u8() == 1 {
+        shared.zeroize();
+        return Err(SigilError::EcdhFailed);
+    }
+    Ok(SharedSecretBuf::new(shared))
+}
+
+/// 4-byte nonce-prefix copy used while constructing Renew frames.
 pub(crate) type NoncePrefixBuf = SecretBytes<4>;
 
 #[cfg(test)]

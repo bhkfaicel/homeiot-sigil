@@ -67,11 +67,11 @@ pub(crate) fn derive_resume_psk(
 ) -> Result<ResumePsk, SigilError> {
     let mut info = heapless::Vec::<u8, 64>::new();
     info.extend_from_slice(b"sigil-resume-psk")
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(sensor_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(gateway_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     let (psk, mut prefix) = derive_session_key(shared, Some(&info))?;
     prefix.zeroize();
     Ok(psk)
@@ -85,9 +85,9 @@ pub(crate) fn build_resume_request_body(
 ) -> Result<Vec<u8, 32>, SigilError> {
     let mut body = Vec::new();
     body.extend_from_slice(sensor_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     body.extend_from_slice(req_mac)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(body)
 }
 
@@ -123,11 +123,11 @@ pub(crate) fn resume_request_mac(
 ) -> Result<[u8; RESUME_REQ_MAC_SIZE], SigilError> {
     let mut info = heapless::Vec::<u8, 64>::new();
     info.extend_from_slice(b"sigil-resume-req")
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(sensor_mac)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(sensor_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     let (mut okm, mut prefix) = derive_session_key(resume_psk, Some(&info))?;
     let mut tag = [0u8; RESUME_REQ_MAC_SIZE];
     tag.copy_from_slice(&okm[..RESUME_REQ_MAC_SIZE]);
@@ -146,17 +146,18 @@ pub(crate) fn resume_challenge_mac(
 ) -> Result<[u8; RESUME_CHAL_MAC_SIZE], SigilError> {
     let mut info = heapless::Vec::<u8, 64>::new();
     info.extend_from_slice(b"sigil-resume-mac")
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(sensor_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(gateway_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(&key_lifetime_secs.to_be_bytes())
-.map_err(|_| SigilError::CapacityExceeded)?;
-    let (mut okm, _) = derive_session_key(shared, Some(&info))?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
+    let (mut okm, mut prefix) = derive_session_key(shared, Some(&info))?;
     let mut tag = [0u8; RESUME_CHAL_MAC_SIZE];
     tag.copy_from_slice(&okm[..RESUME_CHAL_MAC_SIZE]);
     okm.zeroize();
+    prefix.zeroize();
     Ok(tag)
 }
 
@@ -177,11 +178,11 @@ pub(crate) fn build_resume_challenge_body(
 ) -> Result<Vec<u8, 48>, SigilError> {
     let mut body = Vec::new();
     body.extend_from_slice(gateway_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     body.extend_from_slice(&key_lifetime_secs.to_be_bytes())
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     body.extend_from_slice(chal_mac)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(body)
 }
 

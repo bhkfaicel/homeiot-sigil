@@ -33,18 +33,22 @@ use crate::core::install::wire::{
     EcdsaSig, InstallChallenge, build_install_challenge, parse_install_confirm,
     parse_install_request,
 };
-use crate::core::manager::SessionManager;
-use crate::core::pending::{HandshakeRole, HandshakeStep, PendingHandshake};
+use crate::core::manager::ProtocolStores;
+use crate::core::pending::{InstallGatewayStaged, PendingHandshake, PendingState};
 use crate::core::session::{Session, SessionRole};
 use crate::core::traits::{FactoryCertificateMetadata, RandomSource, SecureElement};
 
 /// Processes an install request packet on the gateway side.
-/// Cheap DoS guards run before SE work; the per-peer cooldown is stamped after
-/// factory verification binds the claimed identity and before device-signature,
-/// ECDH, or signing work:
+/// Cheap DoS guards run before SE work; the per-peer cooldown is stamped only
+/// after both the factory certificate and the sensor's dynamic request
+/// signature authenticate the claimed identity, but before ECDH or signing:
 /// - existing pending → [`SigilError::PendingAlreadyExists`]
-/// - no pending slot / cooldown table full → [`SigilError::CapacityExceeded`]
+/// - session table full for a new peer → [`SigilError::SessionTableFull`]
+/// - no pending slot → [`SigilError::PendingTableFull`]
+/// - cooldown table full → [`SigilError::AdmissionTableFull`]
 /// - within [`crate::core::install::INSTALL_REQUEST_COOLDOWN`] → [`SigilError::RateLimited`]
+///
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
 ///
 /// # Arguments
 /// * `now` - Current host time in **seconds** (cooldown)
@@ -52,7 +56,7 @@ use crate::core::traits::{FactoryCertificateMetadata, RandomSource, SecureElemen
 ///   Each peer applies it to its local clock. Not the handshake timeout
 ///   ([`INSTALL_TIMEOUT_MS`](crate::core::install::INSTALL_TIMEOUT_MS), ms).
 pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+    stores: &mut ProtocolStores<'_, N>,
     packet: &[u8],
     se: &mut impl SecureElement,
     rng: &mut impl RandomSource,
@@ -61,33 +65,40 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
 ) -> Result<SigilAction<MSG>, SigilError> {
     crate::core::session::validate_key_lifetime(key_lifetime_secs)?;
 
-    let req = parse_install_request(packet).ok_or(SigilError::ParseError)?;
+    let req = parse_install_request(packet).ok_or(SigilError::MalformedFrame)?;
     let peer = req.sensor_peer_mac;
 
     // Outer header MAC must match the body sensor MAC (sender identity).
     if !crate::core::install::outer_peer_matches_body(packet, &peer) {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
+    crate::core::session::validate_static_public_key_encoding(&req.sensor_static_pubkey)?;
 
     // --- Cheap library DoS guards (before any SE work) ---
-    let replacing_stale_commit = manager.get_pending(&peer).is_some_and(|pending| {
-        pending.step == HandshakeStep::InstallCommitSent && pending.role == HandshakeRole::Gateway
+    // A stale install recovery state (cached CommitConfirmed the sensor never
+    // acknowledged) may be replaced by a fresh authenticated request; every
+    // other pending for this peer blocks a new handshake.
+    let replacing_stale_commit = stores.pending.get(&peer).is_some_and(|pending| {
+        matches!(
+            pending.state(),
+            PendingState::InstallGatewayCommitSent { .. }
+        )
     });
-    if manager.get_pending(&peer).is_some() && !replacing_stale_commit {
+    if stores.pending.get(&peer).is_some() && !replacing_stale_commit {
         return Err(SigilError::PendingAlreadyExists { peer });
     }
-    if manager.is_full() && manager.get(&peer).is_none() {
-        return Err(SigilError::CapacityExceeded);
+    if stores.sessions.is_full() && stores.sessions.get(&peer).is_none() {
+        return Err(SigilError::SessionTableFull);
     }
-    if !manager.pending_slot_available(&peer) {
-        return Err(SigilError::CapacityExceeded);
+    if !stores.pending.slot_available(&peer) {
+        return Err(SigilError::PendingTableFull);
     }
-    if !manager.install_cooldown_elapsed(&peer, now) {
+    if !stores.admission.install_cooldown_elapsed(&peer, now) {
         return Err(SigilError::RateLimited { peer });
     }
     // purge-aware capacity check.
-    if manager.install_last_at_full_for(&peer, now) {
-        return Err(SigilError::CapacityExceeded);
+    if stores.admission.install_last_at_full_for(&peer, now) {
+        return Err(SigilError::AdmissionTableFull);
     }
     // Factory attestation: cert binds PeerId ‖ pubkey.
     let cert_msg = crate::core::install::factory_cert_message(
@@ -99,13 +110,8 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
         &peer,
         &req.sensor_static_pubkey,
     )?;
-    se.verify_ecdsa(manager.factory_pubkey(), &cert_msg, &req.factory_cert_sig)
+    se.verify_ecdsa(stores.factory_pubkey, &cert_msg, &req.factory_cert_sig)
         .map_err(|_| SigilError::VerificationFailed)?;
-
-    // Stamp only after the factory certificate binds the claimed PeerId.
-    // Otherwise an unauthenticated packet can poison a legitimate device's
-    // per-peer cooldown. This remains before device-signature and ECDH work.
-    manager.mark_install_request(peer, now)?;
 
     // Verify the domain-separated wire-v3 sensor request proof.
     let signed = crate::core::install::install_request_sign_message(
@@ -119,9 +125,18 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
     )?;
     se.verify_ecdsa(&req.sensor_static_pubkey, &signed, &req.sensor_signature)
         .map_err(|_| SigilError::VerificationFailed)?;
+
+    // Stamp only after the dynamic request proof authenticates possession of
+    // the factory-certified device key. A certificate is public wire data and
+    // is not sufficient by itself to let a sender consume this peer's
+    // cooldown. Keep the stamp before ECDH and gateway signing so authenticated
+    // request replays still cannot amplify the more expensive work.
+    stores.admission.mark_install_request(peer, now)?;
+
     // Gateway identity material for the challenge — generate nonce BEFORE
     // HKDF so both handshake nonces are mixed into the session key.
     let gateway_static_pubkey = se.get_static_pubkey()?;
+    crate::core::session::validate_static_public_key_encoding(&gateway_static_pubkey)?;
     let factory_cert_sig = se.get_factory_cert()?;
     let factory_metadata = se.get_factory_cert_metadata()?;
     let mut gateway_nonce = [0u8; 16];
@@ -129,7 +144,8 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
 
     // ECDH(static_priv, sensor_static_pub) then HKDF with both nonces.
     // wrap so Drop zeroizes even if HKDF / resume_psk `?` fails.
-    let shared = crate::core::secret::SharedSecretBuf::new(se.ecdh(&req.sensor_static_pubkey)?);
+    let shared =
+        crate::core::secret::validated_ecdh_shared_secret(se.ecdh(&req.sensor_static_pubkey)?)?;
     let info = crate::core::install::install_hkdf_info(&req.sensor_nonce, &gateway_nonce)?;
     let material = derive_directional_session_keys(shared.as_array(), Some(&info))?;
     let resume_psk = crate::core::resume::wire::derive_resume_psk(
@@ -139,7 +155,7 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
     )?;
     drop(shared);
 
-    let local = *manager.local_mac();
+    let local = *stores.local_mac;
 
     // Sign (frame_type ‖ gateway_mac ‖ pubkey ‖ nonce ‖ key_expire).
     let to_sign = crate::core::install::install_challenge_sign_message(
@@ -168,27 +184,31 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
     let packet = build_install_challenge(&challenge)?;
     let mut out: heapless::Vec<u8, MSG> = heapless::Vec::new();
     out.extend_from_slice(&packet)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
 
-    let mut pending = PendingHandshake::new_install(
+    // The tagged gateway state carries every field needed to verify the
+    // sensor Final and commit the session. Building the whole struct first
+    // keeps the pending table untouched until all SE work succeeded.
+    let staged = InstallGatewayStaged {
+        keys: material,
+        resume_psk: crate::core::pending::ResumePskStash::new(resume_psk),
+        sensor_static_pubkey: req.sensor_static_pubkey,
+        key_lifetime_secs,
+        gateway_nonce: crate::core::pending::Nonce16Stash::new(gateway_nonce),
+        sensor_nonce: crate::core::pending::Nonce16Stash::new(req.sensor_nonce),
+    };
+    let pending = PendingHandshake::new_install_gateway_await_confirm(
         peer,
-        HandshakeRole::Gateway,
+        staged,
         crate::core::install::INSTALL_TIMEOUT_MS,
         now,
     );
-    pending.update_step(HandshakeStep::InstallWaitingForConfirm);
-    pending.set_directional_keys(material);
-    pending.resume_psk = Some(resume_psk);
-    pending.transcript_pubkey = Some(req.sensor_static_pubkey);
-    pending.transcript_expire = Some(key_lifetime_secs);
-    pending.transcript_challenge_nonce = Some(gateway_nonce);
-    pending.transcript_initiator_nonce = Some(req.sensor_nonce);
     // Keep the cached CommitConfirmed recoverable until all verification,
     // ATECC work, RNG, derivation, signing and frame building have succeeded.
     if replacing_stale_commit {
-        let _ = manager.remove_pending(&peer);
+        let _ = stores.pending.remove(&peer);
     }
-    manager.insert_pending(peer, pending)?;
+    stores.pending.insert(peer, pending)?;
 
     Ok(SigilAction::Transmit {
         dest: peer,
@@ -201,56 +221,54 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
 /// Verifies the sensor's confirm signature, commits the session, builds
 /// CommitConfirmed, caches it, and returns PersistPeerStaticKey with follow-up TX.
 /// Duplicate Final while CommitSent retransmits cached CommitConfirmed.
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
 pub(crate) fn handle_install_confirm<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+    stores: &mut ProtocolStores<'_, N>,
     packet: &[u8],
     se: &mut impl SecureElement,
     now: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    let cfm = parse_install_confirm(packet).ok_or(SigilError::ParseError)?;
+    let cfm = parse_install_confirm(packet).ok_or(SigilError::MalformedFrame)?;
     let peer = cfm.sensor_peer_mac;
 
     if !crate::core::install::outer_peer_matches_body(packet, &peer) {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
 
-    let pending = manager
-        .get_pending(&peer)
-        .ok_or(SigilError::NoPending { peer })?;
-
-    if pending.step == HandshakeStep::InstallCommitSent {
-        return retransmit_cached_persist::<N, MSG>(manager, &peer);
-    }
-
-    if pending.step != HandshakeStep::InstallWaitingForConfirm {
-        return Err(SigilError::InvalidStep { peer });
-    }
-
-    let sensor_pubkey = pending.transcript_pubkey.ok_or(SigilError::ParseError)?;
-    let gateway_nonce = pending
-        .transcript_challenge_nonce
-        .ok_or(SigilError::ParseError)?;
-    let sensor_nonce = pending
-        .transcript_initiator_nonce
-        .ok_or(SigilError::ParseError)?;
-    let key_lifetime_secs = pending.transcript_expire.ok_or(SigilError::ParseError)?;
+    // Extract every commit input from the tagged state while the pending
+    // borrow is immutable; the clone ends the borrow before mutations.
+    let (sensor_pubkey, gateway_nonce, sensor_nonce, key_lifetime_secs, material, resume_psk) = {
+        let pending = stores
+            .pending
+            .get(&peer)
+            .ok_or(SigilError::NoPending { peer })?;
+        match pending.state() {
+            PendingState::InstallGatewayCommitSent { .. } => {
+                // Duplicate Final after commit → idempotent reTX below.
+                return retransmit_cached_persist::<N, MSG>(stores, &peer);
+            }
+            PendingState::InstallGatewayAwaitConfirm(staged) => (
+                staged.sensor_static_pubkey,
+                *staged.gateway_nonce.as_array(),
+                *staged.sensor_nonce.as_array(),
+                staged.key_lifetime_secs,
+                staged.keys.clone(),
+                *staged.resume_psk.as_array(),
+            ),
+            _ => return Err(SigilError::InvalidStep { peer }),
+        }
+    };
     let confirm_message = crate::core::install::install_confirm_sign_message(
         &peer,
         &sensor_nonce,
-        manager.local_mac(),
+        stores.local_mac,
         &gateway_nonce,
         key_lifetime_secs,
     )?;
     se.verify_ecdsa(&sensor_pubkey, &confirm_message, &cfm.confirm_signature)
         .map_err(|_| SigilError::VerificationFailed)?;
 
-    let material = pending
-        .directional_keys()
-        .ok_or(SigilError::ParseError)?
-        .clone();
-    let resume_psk = pending.resume_psk.ok_or(SigilError::ParseError)?;
-
-    let local = *manager.local_mac();
+    let local = *stores.local_mac;
     let commit_frame = aead::build_commit_confirmed_frame::<MSG>(
         &local,
         FrameType::InstallCommitConfirmed,
@@ -274,26 +292,21 @@ pub(crate) fn handle_install_confirm<const N: usize, const MSG: usize>(
     session.tx_counter = 1;
     // Insert/replace session **without** `remove()` — that would also clear
     // pending (needed for CommitSent idempotent reTX).
-    manager.insert(session)?;
+    stores.sessions.insert(session)?;
 
-    let pending = manager
-        .get_pending_mut(&peer)
+    // Checked transition to the recovery state: swapping the variant consumes
+    // (zeroizes) the staged keys, PSK, and nonces by construction while
+    // keeping the cached CommitConfirmed for idempotent retransmission.
+    let pending = stores
+        .pending
+        .get_mut(&peer)
         .ok_or(SigilError::NoPending { peer })?;
-    if let Some(mut secrets) = pending.secrets.take() {
-        secrets.zeroize();
-    }
-    if let Some(mut psk) = pending.resume_psk.take() {
-        use zeroize::Zeroize;
-        psk.zeroize();
-    }
-    pending.set_cached_wire(&commit_frame)?;
-    pending.update_step(HandshakeStep::InstallCommitSent);
-    pending.update_timeout(INSTALL_TIMEOUT_MS, now);
+    pending.install_gateway_commit_sent(&commit_frame, now)?;
 
     Ok(SigilAction::PersistPeerStaticKey {
         peer,
         pubkey: sensor_pubkey,
-        resume_psk,
+        resume_psk: crate::core::event::ResumePskSecret::new(resume_psk),
         transmit: commit_frame,
         wait_timeout_ms: Some(INSTALL_TIMEOUT_MS),
     })
@@ -302,29 +315,32 @@ pub(crate) fn handle_install_confirm<const N: usize, const MSG: usize>(
 /// Retransmits cached CommitConfirmed wrapped as PersistPeerStaticKey follow-up
 /// (no re-persist of already-durable enrollment — host may ignore duplicate persist).
 fn retransmit_cached_persist<const N: usize, const MSG: usize>(
-    manager: &SessionManager<N>,
+    stores: &ProtocolStores<'_, N>,
     peer: &crate::core::session::PeerId,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    let pending = manager
-        .get_pending(peer)
+    let pending = stores
+        .pending
+        .get(peer)
         .ok_or(SigilError::NoPending { peer: *peer })?;
-    let cached = pending
-        .cached_wire
-        .as_ref()
-        .ok_or(SigilError::InvalidHandshakeState)?;
-    let session = manager
+    // The cached CommitConfirmed lives only in the tagged recovery variant.
+    let cached = match pending.state() {
+        PendingState::InstallGatewayCommitSent { cached } => cached.as_slice(),
+        _ => return Err(SigilError::InvariantViolation),
+    };
+    let session = stores
+        .sessions
         .get(peer)
         .ok_or(SigilError::UnknownSession { peer: *peer })?;
-    let pubkey = session.peer_static_pubkey;
+    let pubkey = *session.peer_static_pubkey();
     let resume_psk = session.require_resume_psk()?;
     let mut transmit: heapless::Vec<u8, MSG> = heapless::Vec::new();
     transmit
         .extend_from_slice(cached)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(SigilAction::PersistPeerStaticKey {
         peer: *peer,
         pubkey,
-        resume_psk,
+        resume_psk: crate::core::event::ResumePskSecret::new(*resume_psk),
         transmit,
         wait_timeout_ms: Some(INSTALL_TIMEOUT_MS),
     })

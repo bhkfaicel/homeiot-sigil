@@ -87,7 +87,7 @@ pub(crate) fn build_nonce(prefix: &NoncePrefix, counter: u64) -> [u8; NONCE_SIZE
 /// clear-text outer header first, then append the AEAD payload into the
 /// **same** `Vec` — avoiding a second large stack buffer.
 /// # Errors
-/// - `CapacityExceeded` if `out` cannot hold `plaintext.len() + TAG_SIZE`
+/// - `OutputBufferTooSmall` if `out` cannot hold `plaintext.len() + TAG_SIZE`
 /// - `VerificationFailed` if the cipher reports an error
 pub(crate) fn encrypt_append<const CAP: usize>(
     key: &SessionKey,
@@ -100,21 +100,21 @@ pub(crate) fn encrypt_append<const CAP: usize>(
     let start = out.len();
     let need = plaintext.len().saturating_add(TAG_SIZE);
     if start.saturating_add(need) > CAP {
-        return Err(SigilError::CapacityExceeded);
+        return Err(SigilError::OutputBufferTooSmall);
     }
 
     out.extend_from_slice(plaintext)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = Nonce::from(build_nonce(prefix, counter));
 
     let tag = cipher
-.encrypt_in_place_detached(&nonce, associated_data, &mut out.as_mut_slice()[start..])
-.map_err(|_| SigilError::VerificationFailed)?;
+        .encrypt_in_place_detached(&nonce, associated_data, &mut out.as_mut_slice()[start..])
+        .map_err(|_| SigilError::VerificationFailed)?;
 
     out.extend_from_slice(tag.as_slice())
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(())
 }
 
@@ -132,7 +132,7 @@ pub(crate) fn encrypt_tail_in_place<const CAP: usize>(
     out: &mut Vec<u8, CAP>,
 ) -> Result<(), SigilError> {
     if plaintext_start > out.len() || out.len().saturating_add(TAG_SIZE) > CAP {
-        return Err(SigilError::CapacityExceeded);
+        return Err(SigilError::OutputBufferTooSmall);
     }
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = Nonce::from(build_nonce(prefix, counter));
@@ -144,7 +144,7 @@ pub(crate) fn encrypt_tail_in_place<const CAP: usize>(
         )
         .map_err(|_| SigilError::VerificationFailed)?;
     out.extend_from_slice(tag.as_slice())
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(())
 }
 
@@ -154,7 +154,7 @@ pub(crate) fn encrypt_tail_in_place<const CAP: usize>(
 /// (e.g. `SigilEvent::Data` payload) so no intermediate AEAD scratch is needed.
 /// # Errors
 /// - `VerificationFailed` if the tag is missing/invalid or authentication fails
-/// - `CapacityExceeded` if the plaintext cannot fit in `out`
+/// - `OutputBufferTooSmall` if the plaintext cannot fit in `out`
 pub(crate) fn decrypt_into<const CAP: usize>(
     key: &SessionKey,
     prefix: &NoncePrefix,
@@ -169,27 +169,118 @@ pub(crate) fn decrypt_into<const CAP: usize>(
 
     let (msg, tag_bytes) = ciphertext.split_at(ciphertext.len() - TAG_SIZE);
     if msg.len() > CAP {
-        return Err(SigilError::CapacityExceeded);
+        return Err(SigilError::OutputBufferTooSmall);
     }
 
     out.clear();
     out.extend_from_slice(msg)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = Nonce::from(build_nonce(prefix, counter));
     let tag = Tag::from_slice(tag_bytes);
 
     cipher
-.decrypt_in_place_detached(&nonce, associated_data, out.as_mut_slice(), tag)
-.map_err(|_| SigilError::VerificationFailed)?;
+        .decrypt_in_place_detached(&nonce, associated_data, out.as_mut_slice(), tag)
+        .map_err(|_| SigilError::VerificationFailed)?;
     Ok(())
+}
+
+/// Counter acceptance policy used by [`open_frame`].
+pub(crate) enum RxCounterPolicy {
+    /// Normal session traffic: accept the current watermark or a bounded gap.
+    Window { current: u64 },
+    /// Commit-boundary traffic whose protocol requires one exact counter.
+    #[cfg(feature = "gateway")]
+    Exact { expected: u64 },
+}
+
+/// Authenticated result returned by [`open_frame`]. The caller commits
+/// `next_rx_counter` only after all message-specific validation succeeds.
+pub(crate) struct OpenedFrame<const CAP: usize> {
+    pub plaintext: Vec<u8, CAP>,
+    pub next_rx_counter: u64,
+}
+
+/// Parses and authenticates one encrypted Sigil frame without mutating session
+/// state. This is the single policy point for outer identity/type validation,
+/// nonce-prefix matching, replay checks, AAD selection and AEAD decryption.
+pub(crate) fn open_frame<const CAP: usize>(
+    peer: &PeerId,
+    expected_type: FrameType,
+    frame: &[u8],
+    key: &SessionKey,
+    prefix: &NoncePrefix,
+    counter_policy: RxCounterPolicy,
+) -> Result<OpenedFrame<CAP>, SigilError> {
+    let min_len = OUTER_HEADER_SIZE + NONCE_SIZE + TAG_SIZE;
+    if frame.len() < min_len {
+        return Err(SigilError::MalformedFrame);
+    }
+    let header = crate::core::frame::parse_header(frame).ok_or(SigilError::MalformedFrame)?;
+    if header.peer != *peer || header.frame_type != expected_type {
+        return Err(SigilError::MalformedFrame);
+    }
+
+    let wire_prefix: &[u8; 4] = frame[OUTER_HEADER_SIZE..OUTER_HEADER_SIZE + 4]
+        .try_into()
+        .map_err(|_| SigilError::MalformedFrame)?;
+    if wire_prefix != prefix {
+        return Err(SigilError::MalformedFrame);
+    }
+
+    let received_counter = u64::from_be_bytes(
+        frame[OUTER_HEADER_SIZE + 4..OUTER_HEADER_SIZE + NONCE_SIZE]
+            .try_into()
+            .map_err(|_| SigilError::MalformedFrame)?,
+    );
+    let next_rx_counter = match counter_policy {
+        RxCounterPolicy::Window { current } => verify_and_advance_rx_counter(
+            current,
+            received_counter,
+        )
+        .map_err(|error| match error {
+            SigilError::CounterExhausted { .. } => SigilError::CounterExhausted { peer: *peer },
+            _ => SigilError::Replay {
+                peer: *peer,
+                expected: current,
+                received: received_counter,
+            },
+        })?,
+        #[cfg(feature = "gateway")]
+        RxCounterPolicy::Exact { expected } => {
+            if received_counter != expected {
+                return Err(SigilError::Replay {
+                    peer: *peer,
+                    expected,
+                    received: received_counter,
+                });
+            }
+            expected
+                .checked_add(1)
+                .ok_or(SigilError::CounterExhausted { peer: *peer })?
+        }
+    };
+
+    let mut plaintext = Vec::new();
+    decrypt_into(
+        key,
+        prefix,
+        received_counter,
+        &frame[OUTER_HEADER_SIZE + NONCE_SIZE..],
+        aad_from_frame(frame).ok_or(SigilError::MalformedFrame)?,
+        &mut plaintext,
+    )?;
+    Ok(OpenedFrame {
+        plaintext,
+        next_rx_counter,
+    })
 }
 
 /// Encrypts plaintext using ChaCha20-Poly1305 AEAD (test convenience wrapper).
 /// Production paths use [`encrypt_append`] to avoid an extra stack buffer.
 /// # Errors
-/// - `CapacityExceeded` if `plaintext.len() + TAG_SIZE > 256`
+/// - `OutputBufferTooSmall` if `plaintext.len() + TAG_SIZE > 256`
 /// - `VerificationFailed` if the cipher reports an error
 #[cfg(test)]
 pub(crate) fn encrypt(
@@ -289,8 +380,8 @@ pub(crate) fn verify_and_advance_rx_counter(
 
     // mirror TX — never wrap the RX watermark at u64::MAX.
     received_counter
-.checked_add(1)
-.ok_or(SigilError::CounterExhausted { peer: [0u8; 17] })
+        .checked_add(1)
+        .ok_or(SigilError::CounterExhausted { peer: [0u8; 17] })
 }
 
 /// Checks if TX counter would overflow
@@ -334,14 +425,14 @@ pub(crate) fn build_commit_confirmed_frame<const MSG: usize>(
     let mut frame: heapless::Vec<u8, MSG> = heapless::Vec::new();
     let header = build_header(local_mac, frame_type);
     frame
-.extend_from_slice(&header)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(&header)
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     frame
-.extend_from_slice(prefix)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(prefix)
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     frame
-.extend_from_slice(&counter.to_be_bytes())
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(&counter.to_be_bytes())
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     encrypt_append(key, prefix, counter, &[], &aad, &mut frame)?;
     Ok(frame)
 }
@@ -359,18 +450,18 @@ pub(crate) fn verify_commit_confirmed(
     use crate::core::frame::{FRAME_TYPE_OFFSET, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET};
 
     if frame.len() < OUTER_HEADER_SIZE + 4 + 8 + TAG_SIZE {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
     if frame[PROTOCOL_VERSION_OFFSET] != PROTOCOL_VERSION
         || frame[FRAME_TYPE_OFFSET] != expected_type as u8
     {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
     let wire_prefix: &[u8; 4] = frame[OUTER_HEADER_SIZE..OUTER_HEADER_SIZE + 4]
-.try_into()
-.map_err(|_| SigilError::ParseError)?;
+        .try_into()
+        .map_err(|_| SigilError::MalformedFrame)?;
     if wire_prefix != prefix {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
     let mut counter_bytes = [0u8; 8];
     counter_bytes.copy_from_slice(&frame[OUTER_HEADER_SIZE + 4..OUTER_HEADER_SIZE + 12]);
@@ -388,7 +479,7 @@ pub(crate) fn verify_commit_confirmed(
         prefix,
         0,
         &frame[OUTER_HEADER_SIZE + 12..],
-        aad_from_frame(frame).ok_or(SigilError::ParseError)?,
+        aad_from_frame(frame).ok_or(SigilError::MalformedFrame)?,
         &mut plaintext,
     )?;
     if !plaintext.is_empty() {

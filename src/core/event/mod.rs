@@ -16,8 +16,54 @@
 //! use `MSG`. Do not size `DATA` for install wire lengths — `InstallChallenge`
 //! is 219 bytes while a typical LoRa data plaintext max is ~200.
 
-use crate::core::session::PeerId;
+use crate::core::session::{PeerId, ResumePsk};
+use core::fmt;
 use heapless::Vec;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Durable Resume PSK carried from the protocol core to the host persistence
+/// layer without exposing it through [`Debug`](fmt::Debug).
+///
+/// The bytes are zeroized when this value is dropped. Access is deliberately
+/// explicit so generic action logging cannot accidentally disclose the key.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct ResumePskSecret(ResumePsk);
+
+impl ResumePskSecret {
+    /// Wraps newly-derived enrollment material for host persistence.
+    pub(crate) fn new(value: ResumePsk) -> Self {
+        Self(value)
+    }
+
+    /// Borrows the secret bytes for the duration of the host NVRAM write.
+    /// Callers must not log or retain additional copies of this value.
+    pub fn expose_secret(&self) -> &ResumePsk {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ResumePskSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl PartialEq for ResumePskSecret {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.0.ct_eq(&other.0))
+    }
+}
+
+impl Eq for ResumePskSecret {}
+
+struct RedactedBytes(usize);
+
+impl fmt::Debug for RedactedBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "[REDACTED; {} bytes]", self.0)
+    }
+}
 
 /// Default maximum **decrypted** application payload size (excluding framing).
 /// Suitable for LoRa EU868 at spreading factor SF7 or lower. This is **not**
@@ -43,7 +89,7 @@ pub const MSG_MAX: usize = 256;
 ///   is the recommended default)
 ///
 /// For standard LoRa, use `SigilEvent<DATA_MAX, MSG_MAX>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum SigilEvent<const DATA: usize, const MSG: usize> {
     /// Decrypted application data received from peer
     Data {
@@ -140,8 +186,8 @@ pub enum SigilEvent<const DATA: usize, const MSG: usize> {
         frame: Vec<u8, MSG>,
     },
 
-    /// Renew **ack** — gateway: [`SessionManager::continue_renew`](crate::core::manager::SessionManager::continue_renew).
-    RenewAck {
+    /// Renew **confirm** — gateway: [`SessionManager::handle_renew_confirm`](crate::core::manager::SessionManager::handle_renew_confirm).
+    RenewConfirm {
         /// Peer identifier (sender)
         peer: PeerId,
         /// Raw frame bytes (including outer header)
@@ -200,6 +246,100 @@ pub enum SigilEvent<const DATA: usize, const MSG: usize> {
     },
 }
 
+impl<const DATA: usize, const MSG: usize> fmt::Debug for SigilEvent<DATA, MSG> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Data { peer, payload } => formatter
+                .debug_struct("Data")
+                .field("peer", peer)
+                .field("payload", &RedactedBytes(payload.len()))
+                .finish(),
+            Self::Event {
+                peer,
+                event_id,
+                payload,
+                duplicate,
+            } => formatter
+                .debug_struct("Event")
+                .field("peer", peer)
+                .field("event_id", event_id)
+                .field("payload", &RedactedBytes(payload.len()))
+                .field("duplicate", duplicate)
+                .finish(),
+            Self::EventAck { peer, event_id } => formatter
+                .debug_struct("EventAck")
+                .field("peer", peer)
+                .field("event_id", event_id)
+                .finish(),
+            Self::TimeSync {
+                peer,
+                gateway_time,
+                sync_sequence,
+                uncertainty_secs,
+            } => formatter
+                .debug_struct("TimeSync")
+                .field("peer", peer)
+                .field("gateway_time", gateway_time)
+                .field("sync_sequence", sync_sequence)
+                .field("uncertainty_secs", uncertainty_secs)
+                .finish(),
+            Self::TimeSyncRequest { peer } => formatter
+                .debug_struct("TimeSyncRequest")
+                .field("peer", peer)
+                .finish(),
+            Self::InstallRequest { peer, frame } => {
+                redacted_frame_debug(formatter, "InstallRequest", peer, frame.len())
+            }
+            Self::InstallChallenge { peer, frame } => {
+                redacted_frame_debug(formatter, "InstallChallenge", peer, frame.len())
+            }
+            Self::InstallConfirm { peer, frame } => {
+                redacted_frame_debug(formatter, "InstallConfirm", peer, frame.len())
+            }
+            Self::RenewRequest { peer, frame } => {
+                redacted_frame_debug(formatter, "RenewRequest", peer, frame.len())
+            }
+            Self::RenewChallenge { peer, frame } => {
+                redacted_frame_debug(formatter, "RenewChallenge", peer, frame.len())
+            }
+            Self::RenewConfirm { peer, frame } => {
+                redacted_frame_debug(formatter, "RenewConfirm", peer, frame.len())
+            }
+            Self::ResumeRequest { peer, frame } => {
+                redacted_frame_debug(formatter, "ResumeRequest", peer, frame.len())
+            }
+            Self::ResumeChallenge { peer, frame } => {
+                redacted_frame_debug(formatter, "ResumeChallenge", peer, frame.len())
+            }
+            Self::ResumeConfirm { peer, frame } => {
+                redacted_frame_debug(formatter, "ResumeConfirm", peer, frame.len())
+            }
+            Self::InstallCommitConfirmed { peer, frame } => {
+                redacted_frame_debug(formatter, "InstallCommitConfirmed", peer, frame.len())
+            }
+            Self::RenewCommitConfirmed { peer, frame } => {
+                redacted_frame_debug(formatter, "RenewCommitConfirmed", peer, frame.len())
+            }
+            Self::ResumeCommitConfirmed { peer, frame } => {
+                redacted_frame_debug(formatter, "ResumeCommitConfirmed", peer, frame.len())
+            }
+        }
+    }
+}
+
+fn redacted_frame_debug(
+    formatter: &mut fmt::Formatter<'_>,
+    name: &str,
+    peer: &PeerId,
+    len: usize,
+) -> fmt::Result {
+    formatter
+        .debug_struct(name)
+        .field("peer", peer)
+        .field("frame", &RedactedBytes(len))
+        .finish()
+}
+
 /// Actions that the host should take after processing a packet
 /// These actions are returned by the core to instruct the host on what to do next,
 /// such as transmitting a packet or persisting enrollment material.
@@ -212,7 +352,7 @@ pub enum SigilEvent<const DATA: usize, const MSG: usize> {
 /// There is no separate wait-only action: the library always pairs a wait hint
 /// with a frame to send (or returns [`Self::Success`] /
 /// [`Self::PersistPeerStaticKey`] when no further TX is needed).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SigilAction<const MSG: usize> {
     /// Transmit a packet to the specified peer.
     /// When [`Self::Transmit::wait_timeout_ms`] is `Some`, the host should start
@@ -261,8 +401,10 @@ pub enum SigilAction<const MSG: usize> {
         peer: PeerId,
         /// Peer's static public key to persist
         pubkey: [u8; 33],
-        /// Durable resume-request PSK (persist with the pubkey; required after reboot)
-        resume_psk: [u8; 32],
+        /// Durable resume-request PSK. Borrow it only for the NVRAM write via
+        /// [`ResumePskSecret::expose_secret`]; its `Debug` output is redacted
+        /// and its storage is zeroized on drop.
+        resume_psk: ResumePskSecret,
         /// Optional CommitConfirmed frame to TX after NVRAM persist.
         /// Empty = persist only (no further radio TX).
         transmit: Vec<u8, MSG>,

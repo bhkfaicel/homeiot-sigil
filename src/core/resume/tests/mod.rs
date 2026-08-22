@@ -2,7 +2,8 @@
 
 //! Unit tests for resume protocol
 
-use crate::core::ecdh_soft;
+mod transitions;
+
 use crate::core::error::SigilError;
 use crate::core::event::SigilAction;
 use crate::core::frame::{FRAME_TYPE_OFFSET, FrameType, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET};
@@ -14,7 +15,6 @@ use crate::core::resume::wire::{
 };
 use crate::core::session::{DirectionalMaterial, Session, SessionRole};
 use crate::core::test_support::{MockRandom, MockSecureElement};
-use crate::core::traits::RandomSource;
 
 const RESUME_PSK: [u8; 32] = [0x5Au8; 32];
 const SENSOR_MAC: [u8; 17] = [0x91u8; 17];
@@ -31,8 +31,8 @@ fn valid_resume_request_frame(sensor_nonce: &[u8; RESUME_NONCE_SIZE]) -> heaples
     let body = build_resume_request_body(sensor_nonce, &req_mac).unwrap();
     let mut frame: heapless::Vec<u8, 64> = heapless::Vec::new();
     frame
-.extend_from_slice(&build_header(&SENSOR_MAC, FrameType::ResumeRequest))
-.unwrap();
+        .extend_from_slice(&build_header(&SENSOR_MAC, FrameType::ResumeRequest))
+        .unwrap();
     frame.extend_from_slice(&body).unwrap();
     frame
 }
@@ -43,6 +43,73 @@ fn test_resume_request_cooldown_is_fifteen_seconds() {
     assert_eq!(crate::core::resume::RESUME_REQUEST_COOLDOWN, 15);
 }
 
+#[test]
+fn test_resume_gateway_rejects_null_static_ecdh_secret() {
+    let (mut sensor, mut gateway) = enrolled_pair();
+    let mut se_sensor = MockSecureElement::default();
+    let mut se_gateway = MockSecureElement::default();
+    se_gateway.return_zero_ecdh();
+    let mut rng_sensor = MockRandom::new();
+    let mut rng_gateway = MockRandom::new();
+
+    let request = match sensor
+        .start_resume::<256>(GW_MAC, &mut se_sensor, &mut rng_sensor, 1_000)
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("sensor should transmit"),
+    };
+    assert_eq!(
+        gateway.handle_resume_request::<256>(
+            &request,
+            &mut se_gateway,
+            &mut rng_gateway,
+            1_000,
+            RESUME_LIFETIME,
+        ),
+        Err(SigilError::EcdhFailed)
+    );
+    assert!(gateway.get_pending(&SENSOR_MAC).is_none());
+    assert!(!gateway.get(&SENSOR_MAC).unwrap().is_active(1_000));
+}
+
+#[test]
+fn test_resume_sensor_rejects_null_static_ecdh_secret() {
+    let (mut sensor, mut gateway) = enrolled_pair();
+    let mut se_sensor = MockSecureElement::default();
+    let mut se_gateway = MockSecureElement::default();
+    let mut rng_sensor = MockRandom::new();
+    let mut rng_gateway = MockRandom::new();
+
+    let request = match sensor
+        .start_resume::<256>(GW_MAC, &mut se_sensor, &mut rng_sensor, 1_000)
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("sensor should transmit"),
+    };
+    let challenge = match gateway
+        .handle_resume_request::<256>(
+            &request,
+            &mut se_gateway,
+            &mut rng_gateway,
+            1_000,
+            RESUME_LIFETIME,
+        )
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("gateway should transmit"),
+    };
+
+    se_sensor.return_zero_ecdh();
+    assert_eq!(
+        sensor.continue_resume::<256>(&challenge, &mut se_sensor, 1_000),
+        Err(SigilError::EcdhFailed)
+    );
+    assert!(!sensor.get(&GW_MAC).unwrap().is_active(1_000));
+}
+
 /// Two managers enrolled with the peer's static pubkey but no session key
 /// (simulates the post-reboot state).
 fn enrolled_pair() -> (SessionManager<16>, SessionManager<16>) {
@@ -51,23 +118,14 @@ fn enrolled_pair() -> (SessionManager<16>, SessionManager<16>) {
     let mut gateway: SessionManager<16> = crate::core::test_support::test_manager_with_mac(GW_MAC);
     // Sensor session keyed by gateway; gateway session keyed by sensor.
     sensor
-.insert(Session::new_enrolled(
-            GW_MAC,
-            STATIC_PUB,
-            RESUME_PSK,
-            86_400,
-            SessionRole::Sensor,
-        ))
-.unwrap();
+        .insert(Session::new_enrolled(GW_MAC, STATIC_PUB, RESUME_PSK, SessionRole::Sensor).unwrap())
+        .unwrap();
     gateway
-.insert(Session::new_enrolled(
-            SENSOR_MAC,
-            STATIC_PUB,
-            RESUME_PSK,
-            86_400,
-            SessionRole::Gateway,
-        ))
-.unwrap();
+        .insert(
+            Session::new_enrolled(SENSOR_MAC, STATIC_PUB, RESUME_PSK, SessionRole::Gateway)
+                .unwrap(),
+        )
+        .unwrap();
     (sensor, gateway)
 }
 
@@ -122,45 +180,45 @@ fn test_resume_pairwise_success() {
 
     // Step 1: sensor emits the resume request (clear text).
     let req_action = sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
-.unwrap();
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
+        .unwrap();
     let req_frame = match req_action {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!("sensor should transmit"),
     };
 
     // Step 2: gateway handles the request and emits the challenge.
     let chal_action = gateway
-.handle_resume_request::<256>(&req_frame, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
-.unwrap();
+        .handle_resume_request::<256>(&req_frame, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
+        .unwrap();
     let chal_frame = match chal_action {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!("gateway should transmit"),
     };
 
     // Step 3: sensor processes the challenge → stages keys + emits Final.
     let cfm_action = sensor
-.continue_resume::<256>(&chal_frame, &mut se_s, 1000)
-.unwrap();
+        .continue_resume::<256>(&chal_frame, &mut se_s, 1000)
+        .unwrap();
     let cfm_frame = match cfm_action {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!("sensor should transmit confirm"),
     };
     assert!(
         sensor.get(&GW_MAC).unwrap().session_key().is_none(),
         "No key until CommitConfirmed"
     );
-    assert_eq!(
-        sensor.get_pending(&GW_MAC).unwrap().step,
-        crate::core::pending::HandshakeStep::ResumeWaitingForCommitConfirmed
-    );
+    assert!(matches!(
+        sensor.get_pending(&GW_MAC).unwrap().state(),
+        crate::core::pending::PendingState::ResumeSensorFinalSent { .. }
+    ));
 
     // Step 4: gateway processes Final → commits + CommitConfirmed.
     let commit_action = gateway
-.continue_resume::<256>(&cfm_frame, &mut se_g, 1000)
-.unwrap();
+        .continue_resume::<256>(&cfm_frame, &mut se_g, 1000)
+        .unwrap();
     let commit_frame = match commit_action {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!("gateway should transmit CommitConfirmed"),
     };
     assert_eq!(
@@ -170,8 +228,8 @@ fn test_resume_pairwise_success() {
 
     // Step 5: sensor CommitConfirmed → commit.
     sensor
-.continue_resume::<256>(&commit_frame, &mut se_s, 1000)
-.unwrap();
+        .continue_resume::<256>(&commit_frame, &mut se_s, 1000)
+        .unwrap();
 
     let s = sensor.get(&GW_MAC).unwrap();
     let g = gateway.get(&SENSOR_MAC).unwrap();
@@ -216,15 +274,15 @@ fn test_forged_clear_resume_confirm_rejected() {
     let mut rng_g = MockRandom::new();
 
     let req_frame = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let _chal = gateway
-.handle_resume_request::<256>(&req_frame, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
-.unwrap();
+        .handle_resume_request::<256>(&req_frame, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
+        .unwrap();
 
     // Attacker sends an empty clear-text confirm (old insecure shape).
     let mut forged = [0u8; crate::core::frame::OUTER_HEADER_SIZE];
@@ -233,7 +291,9 @@ fn test_forged_clear_resume_confirm_rejected() {
     forged[FRAME_TYPE_OFFSET] = FrameType::ResumeConfirm as u8;
 
     let result = gateway.continue_resume::<256>(&forged, &mut se_g, 1000);
-    assert_eq!(result, Err(SigilError::ParseError));
+    // A clear-text frame with an empty authenticated body is malformed wire
+    // input, not a transition mismatch.
+    assert_eq!(result, Err(SigilError::MalformedFrame));
     // Gateway must still have no session key and keep pending.
     assert!(gateway.get(&SENSOR_MAC).unwrap().session_key().is_none());
     assert!(gateway.get_pending(&SENSOR_MAC).is_some());
@@ -250,17 +310,17 @@ fn test_resume_mitm_key_expire_at_rejected() {
     let mut rng_g = MockRandom::new();
 
     let req_frame = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let mut chal_frame = match gateway
-.handle_resume_request::<256>(&req_frame, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
-.unwrap()
+        .handle_resume_request::<256>(&req_frame, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
 
@@ -282,20 +342,10 @@ fn test_resume_mitm_key_expire_at_rejected() {
 
 #[test]
 fn test_resume_missing_static_key() {
-    let mut mgr: SessionManager<16> = crate::core::test_support::test_manager_with_mac(SENSOR_MAC);
-    mgr.insert(Session::new_enrolled(
-        GW_MAC,
-        [0u8; 33],
-        RESUME_PSK,
-        86_400,
-        SessionRole::Sensor,
-    ))
-.unwrap();
-    let mut se = MockSecureElement::default();
-    let mut rng = MockRandom::new();
-
-    let result = mgr.start_resume::<256>(GW_MAC, &mut se, &mut rng, 1000);
-    assert_eq!(result, Err(SigilError::InvalidStaticKey));
+    assert!(matches!(
+        Session::new_enrolled(GW_MAC, [0u8; 33], RESUME_PSK, SessionRole::Sensor),
+        Err(SigilError::InvalidStaticKey)
+    ));
 }
 
 #[test]
@@ -311,14 +361,14 @@ fn test_resume_unknown_peer() {
 fn test_gateway_resume_keeps_active_key_until_commit_for_reboot_recovery() {
     let (_sensor, mut gateway) = enrolled_pair();
     gateway
-.get_mut(&SENSOR_MAC)
-.unwrap()
-.update_key(
+        .get_mut(&SENSOR_MAC)
+        .unwrap()
+        .update_key(
             DirectionalMaterial::symmetric_for_test([0x11u8; 32], [0x22u8; 4]),
             86_400,
             0,
         )
-.unwrap();
+        .unwrap();
     let mut se = MockSecureElement::default();
     let mut rng = MockRandom::new();
 
@@ -328,9 +378,9 @@ fn test_gateway_resume_keeps_active_key_until_commit_for_reboot_recovery() {
     assert_eq!(req[FRAME_TYPE_OFFSET], FrameType::ResumeRequest as u8);
 
     let result = gateway
-.handle_resume_request::<256>(&req, &mut se, &mut rng, 1000, RESUME_LIFETIME)
-.unwrap();
-    assert!(matches!(result, SigilAction::Transmit {.. }));
+        .handle_resume_request::<256>(&req, &mut se, &mut rng, 1000, RESUME_LIFETIME)
+        .unwrap();
+    assert!(matches!(result, SigilAction::Transmit { .. }));
     assert_eq!(
         gateway.get(&SENSOR_MAC).unwrap().session_key(),
         Some(&[0x11u8; 32]),
@@ -342,21 +392,21 @@ fn test_gateway_resume_keeps_active_key_until_commit_for_reboot_recovery() {
 fn test_sensor_can_explicitly_resume_active_session_after_gateway_reboot() {
     let (mut sensor, _gateway) = enrolled_pair();
     sensor
-.get_mut(&GW_MAC)
-.unwrap()
-.update_key(
+        .get_mut(&GW_MAC)
+        .unwrap()
+        .update_key(
             DirectionalMaterial::symmetric_for_test([0x11u8; 32], [0x22u8; 4]),
             86_400,
             0,
         )
-.unwrap();
+        .unwrap();
     let mut se = MockSecureElement::default();
     let mut rng = MockRandom::new();
 
     let result = sensor
-.start_resume::<256>(GW_MAC, &mut se, &mut rng, 1000)
-.unwrap();
-    assert!(matches!(result, SigilAction::Transmit {.. }));
+        .start_resume::<256>(GW_MAC, &mut se, &mut rng, 1000)
+        .unwrap();
+    assert!(matches!(result, SigilAction::Transmit { .. }));
     assert_eq!(
         sensor.get(&GW_MAC).unwrap().session_key(),
         Some(&[0x11u8; 32])
@@ -368,21 +418,21 @@ fn test_sensor_can_explicitly_resume_active_session_after_gateway_reboot() {
 fn test_sensor_start_resume_retains_soft_expired_key_until_commit() {
     let (mut sensor, _gateway) = enrolled_pair();
     sensor
-.get_mut(&GW_MAC)
-.unwrap()
-.update_key(
+        .get_mut(&GW_MAC)
+        .unwrap()
+        .update_key(
             DirectionalMaterial::symmetric_for_test([0x11u8; 32], [0x22u8; 4]),
             500,
             0,
         )
-.unwrap();
+        .unwrap();
     let mut se = MockSecureElement::default();
     let mut rng = MockRandom::new();
 
     let action = sensor
-.start_resume::<256>(GW_MAC, &mut se, &mut rng, 1000)
-.unwrap();
-    assert!(matches!(action, SigilAction::Transmit {.. }));
+        .start_resume::<256>(GW_MAC, &mut se, &mut rng, 1000)
+        .unwrap();
+    assert!(matches!(action, SigilAction::Transmit { .. }));
     assert!(
         sensor.get(&GW_MAC).unwrap().session_key().is_some(),
         "old key material must not be destroyed before Resume commits"
@@ -393,7 +443,7 @@ fn test_sensor_start_resume_retains_soft_expired_key_until_commit() {
 // resume constraints (no ECDSA, no soft eph ECDH)
 // We assert the constraint at the type/API level: the resume modules do not
 // reference `SecureElement::sign_ecdsa` / `verify_ecdsa`, and they do not call
-// `ecdh_soft::generate_ephemeral_scalar` / `ecdh_from_scalar`. The wire bodies
+// the Renew ephemeral P-256 implementation. The wire bodies
 // carry no ephemeral public key field and no signature field. This test
 // documents and guards that invariant by checking the wire layouts.
 
@@ -412,27 +462,6 @@ fn test_resume_challenge_body_has_no_signature_or_eph_key() {
 }
 
 #[test]
-fn test_ecdh_soft_api_is_unused_by_resume_path() {
-    // The resume modules import `ecdh_soft` only transitively via `derive`,
-    // never calling the ephemeral helpers. This test ensures the helpers are
-    // still present (so the renew path keeps working) but documents that they
-    // are NOT part of resume.
-    let mut rng = MockRandom::new();
-    let scalar = ecdh_soft::generate_ephemeral_scalar(&mut rng).unwrap();
-    let pub1 = ecdh_soft::pubkey_from_scalar(&scalar).unwrap();
-    // Sanity: ECDH is symmetric for the soft path.
-    let mut other_rng = MockRandom::new();
-    // Advance the mock to get a different scalar.
-    let mut adv = MockRandom::new();
-    let _ = adv.fill_bytes(&mut [0u8; 4]);
-    let scalar2 = ecdh_soft::generate_ephemeral_scalar(&mut other_rng).unwrap();
-    let pub2 = ecdh_soft::pubkey_from_scalar(&scalar2).unwrap();
-    let shared1 = ecdh_soft::ecdh_from_scalar(&scalar, &pub2).unwrap();
-    let shared2 = ecdh_soft::ecdh_from_scalar(&scalar2, &pub1).unwrap();
-    assert_eq!(shared1, shared2);
-}
-
-#[test]
 fn test_resume_confirm_rejects_nonzero_counter() {
     let (mut sensor, mut gateway) = enrolled_pair();
     let mut se_s = MockSecureElement::default();
@@ -441,24 +470,24 @@ fn test_resume_confirm_rejects_nonzero_counter() {
     let mut rng_g = MockRandom::new();
 
     let req = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let chal = match gateway
-.handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
-.unwrap()
+        .handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let mut cfm = match sensor
-.continue_resume::<256>(&chal, &mut se_s, 1000)
-.unwrap()
+        .continue_resume::<256>(&chal, &mut se_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
 
@@ -471,25 +500,25 @@ fn test_resume_confirm_rejects_nonzero_counter() {
         Err(SigilError::Replay {
             expected: 0,
             received: 1,
-..
+            ..
         })
     ));
 }
 
 #[test]
 fn test_resume_allows_soft_expired_key() {
- // Soft-expired key must be clearable so resume can proceed.
+    // Soft-expired key must be clearable so resume can proceed.
 
     let (_sensor, mut gateway) = enrolled_pair();
     gateway
-.get_mut(&SENSOR_MAC)
-.unwrap()
-.update_key(
+        .get_mut(&SENSOR_MAC)
+        .unwrap()
+        .update_key(
             DirectionalMaterial::symmetric_for_test([0x11u8; 32], [0x22u8; 4]),
             500,
             0,
         )
-.unwrap();
+        .unwrap();
     let mut se = MockSecureElement::default();
     let mut rng = MockRandom::new();
 
@@ -500,9 +529,9 @@ fn test_resume_allows_soft_expired_key() {
 
     let now = 1000; // past key_expire_at = 500
     let action = gateway
-.handle_resume_request::<256>(&req, &mut se, &mut rng, now, RESUME_LIFETIME)
-.unwrap();
-    assert!(matches!(action, SigilAction::Transmit {.. }));
+        .handle_resume_request::<256>(&req, &mut se, &mut rng, now, RESUME_LIFETIME)
+        .unwrap();
+    assert!(matches!(action, SigilAction::Transmit { .. }));
     assert!(
         gateway.get(&SENSOR_MAC).unwrap().session_key().is_some(),
         "old key material must not be destroyed before Resume commits"
@@ -519,15 +548,15 @@ fn test_resume_rejects_inflight_pending() {
     let mut rng_g = MockRandom::new();
 
     let req = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     gateway
-.handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
-.unwrap();
+        .handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
+        .unwrap();
 
     let result =
         gateway.handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME);
@@ -546,15 +575,15 @@ fn test_resume_rate_limited_after_cancel() {
     let mut rng_g = MockRandom::new();
 
     let req = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     gateway
-.handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
-.unwrap();
+        .handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
+        .unwrap();
     gateway.cancel_pending(&SENSOR_MAC).unwrap();
 
     let result =
@@ -562,20 +591,20 @@ fn test_resume_rate_limited_after_cancel() {
     assert_eq!(result, Err(SigilError::RateLimited { peer: SENSOR_MAC }));
 
     let action = gateway
-.handle_resume_request::<256>(
+        .handle_resume_request::<256>(
             &req,
             &mut se_g,
             &mut rng_g,
             1000 + crate::core::resume::RESUME_REQUEST_COOLDOWN,
             RESUME_LIFETIME,
         )
-.unwrap();
-    assert!(matches!(action, SigilAction::Transmit {.. }));
+        .unwrap();
+    assert!(matches!(action, SigilAction::Transmit { .. }));
 }
 
 #[test]
 fn test_forged_resume_request_mac_rejected_before_ecdh() {
- // spoofed enrolled MAC with garbage req_mac must fail before SE-ECDH.
+    // spoofed enrolled MAC with garbage req_mac must fail before SE-ECDH.
 
     let (_sensor, mut gateway) = enrolled_pair();
     let mut se = MockSecureElement::default();
@@ -585,11 +614,11 @@ fn test_forged_resume_request_mac_rejected_before_ecdh() {
     use crate::core::frame::build_header;
     let mut forged: heapless::Vec<u8, 64> = heapless::Vec::new();
     forged
-.extend_from_slice(&build_header(&SENSOR_MAC, FrameType::ResumeRequest))
-.unwrap();
+        .extend_from_slice(&build_header(&SENSOR_MAC, FrameType::ResumeRequest))
+        .unwrap();
     forged
-.extend_from_slice(&[0xEEu8; RESUME_REQUEST_BODY_LEN])
-.unwrap();
+        .extend_from_slice(&[0xEEu8; RESUME_REQUEST_BODY_LEN])
+        .unwrap();
 
     let result =
         gateway.handle_resume_request::<256>(&forged, &mut se, &mut rng, 1000, RESUME_LIFETIME);
@@ -607,31 +636,31 @@ fn test_resume_commit_confirmed_loss_and_duplicate_confirm_retx() {
     let mut rng_g = MockRandom::new();
 
     let req = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let chal = match gateway
-.handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
-.unwrap()
+        .handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let cfm = match sensor
-.continue_resume::<256>(&chal, &mut se_s, 1000)
-.unwrap()
+        .continue_resume::<256>(&chal, &mut se_s, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let commit1 = match gateway
-.continue_resume::<256>(&cfm, &mut se_g, 1000)
-.unwrap()
+        .continue_resume::<256>(&cfm, &mut se_g, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     assert!(sensor.get(&GW_MAC).unwrap().session_key().is_none());
@@ -648,26 +677,26 @@ fn test_resume_commit_confirmed_loss_and_duplicate_confirm_retx() {
     );
 
     let commit2 = match gateway
-.continue_resume::<256>(&cfm, &mut se_g, 1000)
-.unwrap()
+        .continue_resume::<256>(&cfm, &mut se_g, 1000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     assert_eq!(commit1.as_slice(), commit2.as_slice());
 
     sensor
-.continue_resume::<256>(&commit2, &mut se_s, 1000)
-.unwrap();
+        .continue_resume::<256>(&commit2, &mut se_s, 1000)
+        .unwrap();
     assert!(sensor.get(&GW_MAC).unwrap().session_key().is_some());
     assert!(sensor.get_pending(&GW_MAC).is_none());
 
     let data = sensor
-.encrypt_data::<256>(&GW_MAC, b"commit-proof", 1000)
-.unwrap();
+        .encrypt_data::<256>(&GW_MAC, b"commit-proof", 1000)
+        .unwrap();
     gateway
-.process_incoming_packet::<200, 256>(&data, 1000)
-.unwrap();
+        .process_incoming_packet::<200, 256>(&data, 1000)
+        .unwrap();
     assert!(gateway.get_pending(&SENSOR_MAC).is_none());
 }
 
@@ -677,7 +706,9 @@ fn test_start_resume_rejects_gateway_role() {
     let mut se = MockSecureElement::default();
     let mut rng = MockRandom::new();
     let err = gateway.start_resume::<256>(SENSOR_MAC, &mut se, &mut rng, 1000);
-    assert_eq!(err, Err(SigilError::InvalidStep { peer: SENSOR_MAC }));
+    // Resume is sensor-initiated: a gateway-role manager is a static role
+    // mismatch, not an out-of-order transition.
+    assert_eq!(err, Err(SigilError::WrongRole { peer: SENSOR_MAC }));
 }
 
 #[test]
@@ -689,10 +720,10 @@ fn test_handle_resume_request_rejects_sensor_role_before_ecdh() {
     let mut rng_s = MockRandom::new();
     let mut rng_g = MockRandom::new();
     let request = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1_000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1_000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let result = gateway.handle_resume_request::<256>(
@@ -702,7 +733,9 @@ fn test_handle_resume_request_rejects_sensor_role_before_ecdh() {
         1_000,
         RESUME_LIFETIME,
     );
-    assert_eq!(result, Err(SigilError::InvalidStep { peer: SENSOR_MAC }));
+    // A gateway whose session role says "sensor" must refuse the request
+    // before any ECDH work: static role/config mismatch.
+    assert_eq!(result, Err(SigilError::WrongRole { peer: SENSOR_MAC }));
     assert!(gateway.get_pending(&SENSOR_MAC).is_none());
 }
 
@@ -717,42 +750,42 @@ fn test_resume_lifetime_uses_each_peers_local_clock_epoch() {
     let gateway_now = 1_000_000;
 
     let request = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, sensor_now)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, sensor_now)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let challenge = match gateway
-.handle_resume_request::<256>(
+        .handle_resume_request::<256>(
             &request,
             &mut se_g,
             &mut rng_g,
             gateway_now,
             RESUME_LIFETIME,
         )
-.unwrap()
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let confirm = match sensor
-.continue_resume::<256>(&challenge, &mut se_s, sensor_now)
-.unwrap()
+        .continue_resume::<256>(&challenge, &mut se_s, sensor_now)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let commit = match gateway
-.continue_resume::<256>(&confirm, &mut se_g, gateway_now)
-.unwrap()
+        .continue_resume::<256>(&confirm, &mut se_g, gateway_now)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     sensor
-.continue_resume::<256>(&commit, &mut se_s, sensor_now)
-.unwrap();
+        .continue_resume::<256>(&commit, &mut se_s, sensor_now)
+        .unwrap();
 
     assert_eq!(
         sensor.get(&GW_MAC).unwrap().key_expire_at(),
@@ -773,47 +806,47 @@ fn test_fresh_resume_replaces_commit_sent_only_after_new_crypto_succeeds() {
     let mut rng_g = MockRandom::new();
 
     let request = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1_000)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1_000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let challenge = match gateway
-.handle_resume_request::<256>(&request, &mut se_g, &mut rng_g, 1_000, RESUME_LIFETIME)
-.unwrap()
+        .handle_resume_request::<256>(&request, &mut se_g, &mut rng_g, 1_000, RESUME_LIFETIME)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     let confirm = match sensor
-.continue_resume::<256>(&challenge, &mut se_s, 1_000)
-.unwrap()
+        .continue_resume::<256>(&challenge, &mut se_s, 1_000)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
     gateway
-.continue_resume::<256>(&confirm, &mut se_g, 1_000)
-.unwrap();
-    assert_eq!(
-        gateway.get_pending(&SENSOR_MAC).unwrap().step,
-        crate::core::pending::HandshakeStep::ResumeCommitSent
-    );
+        .continue_resume::<256>(&confirm, &mut se_g, 1_000)
+        .unwrap();
+    assert!(matches!(
+        gateway.get_pending(&SENSOR_MAC).unwrap().state(),
+        crate::core::pending::PendingState::ResumeGatewayCommitSent { .. }
+    ));
 
     // Sensor explicitly starts over after losing CommitConfirmed. Its local
     // WaitingForCommit state is replaced by a fresh authenticated request.
     let retry_request = match sensor
-.start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1_015)
-.unwrap()
+        .start_resume::<256>(GW_MAC, &mut se_s, &mut rng_s, 1_015)
+        .unwrap()
     {
-        SigilAction::Transmit { payload,.. } => payload,
+        SigilAction::Transmit { payload, .. } => payload,
         _ => panic!(),
     };
-    assert_eq!(
-        sensor.get_pending(&GW_MAC).unwrap().step,
-        crate::core::pending::HandshakeStep::ResumeWaitingForChallenge
-    );
+    assert!(matches!(
+        sensor.get_pending(&GW_MAC).unwrap().state(),
+        crate::core::pending::PendingState::ResumeSensorAwaitChallenge { .. }
+    ));
 
     // A failed ATECC operation must not destroy the gateway's cached commit.
     let mut failing_se = MockSecureElement::default();
@@ -828,22 +861,22 @@ fn test_fresh_resume_replaces_commit_sent_only_after_new_crypto_succeeds() {
         ),
         Err(SigilError::EcdhFailed)
     );
-    assert_eq!(
-        gateway.get_pending(&SENSOR_MAC).unwrap().step,
-        crate::core::pending::HandshakeStep::ResumeCommitSent
-    );
+    assert!(matches!(
+        gateway.get_pending(&SENSOR_MAC).unwrap().state(),
+        crate::core::pending::PendingState::ResumeGatewayCommitSent { .. }
+    ));
 
     gateway
-.handle_resume_request::<256>(
+        .handle_resume_request::<256>(
             &retry_request,
             &mut se_g,
             &mut rng_g,
             1_015,
             RESUME_LIFETIME,
         )
-.unwrap();
-    assert_eq!(
-        gateway.get_pending(&SENSOR_MAC).unwrap().step,
-        crate::core::pending::HandshakeStep::ResumeWaitingForConfirm
-    );
+        .unwrap();
+    assert!(matches!(
+        gateway.get_pending(&SENSOR_MAC).unwrap().state(),
+        crate::core::pending::PendingState::ResumeGatewayAwaitConfirm { .. }
+    ));
 }

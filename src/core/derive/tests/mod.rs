@@ -1,4 +1,4 @@
-#![cfg(all(test, feature = "sensor", feature = "gateway"))]
+#![cfg(test)]
 
 //! Unit tests for HKDF session key derivation
 
@@ -25,7 +25,7 @@ fn test_derive_session_key() {
 
 #[test]
 fn test_derive_directional_session_keys() {
- // OKM expands to independent s2g / g2s halves.
+    // OKM expands to independent s2g / g2s halves.
 
     let shared = [0x42u8; 32];
     let m = derive_directional_session_keys(&shared, Some(b"sigil-test")).unwrap();

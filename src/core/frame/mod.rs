@@ -15,7 +15,7 @@
 //! |--------|----------|--------------------------------------------|
 //! | 0x00   | Data     | Application data (encrypted, no ACK)       |
 //! | 0x01-4 | Install  | Request, Challenge, Confirm, CommitConfirmed |
-//! | 0x11-4 | Renew    | Request, Challenge, Ack, CommitConfirmed   |
+//! | 0x11-4 | Renew    | Request, Challenge, Confirm, CommitConfirmed |
 //! | 0x21-4 | Resume   | Request, Challenge, Confirm, CommitConfirmed |
 //! | 0x31-2 | Event    | Reliable Event, EventAck                    |
 //! | 0x33   | Time     | TimeSyncRequest (sensor → gateway, AEAD)    |
@@ -56,8 +56,8 @@ pub enum FrameType {
     RenewRequest = 0x11,
     /// Renew Step 2 (gateway → sensor, encrypted under **old** session key)
     RenewChallenge = 0x12,
-    /// Renew Step 3 (sensor → gateway, encrypted under **new** session key)
-    RenewAck = 0x13,
+    /// Renew Step 3 (sensor → gateway, encrypted under **old** session key)
+    RenewConfirm = 0x13,
     /// Renew Step 4 (gateway → sensor, AEAD under **new** session key)
     RenewCommitConfirmed = 0x14,
     /// Resume Step 1 (sensor → gateway, clear text)
@@ -90,7 +90,7 @@ impl FrameType {
             0x04 => Some(Self::InstallCommitConfirmed),
             0x11 => Some(Self::RenewRequest),
             0x12 => Some(Self::RenewChallenge),
-            0x13 => Some(Self::RenewAck),
+            0x13 => Some(Self::RenewConfirm),
             0x14 => Some(Self::RenewCommitConfirmed),
             0x21 => Some(Self::ResumeRequest),
             0x22 => Some(Self::ResumeChallenge),
@@ -109,14 +109,14 @@ impl FrameType {
     /// `[nonce_prefix:4] [counter:8] [ciphertext+tag]`).
     /// Data, all renew messages, ResumeConfirm / ResumeCommitConfirmed, and
     /// InstallCommitConfirmed use this encrypted format (CommitConfirmed under
-    /// the new session key for wire-v2 consistency).
+    /// the new session key for consistency across the protocol).
     pub fn is_encrypted_payload(&self) -> bool {
         matches!(
             self,
             Self::Data
                 | Self::RenewRequest
                 | Self::RenewChallenge
-                | Self::RenewAck
+                | Self::RenewConfirm
                 | Self::RenewCommitConfirmed
                 | Self::ResumeConfirm
                 | Self::ResumeCommitConfirmed
@@ -143,7 +143,10 @@ impl FrameType {
     pub fn is_renew(&self) -> bool {
         matches!(
             self,
-            Self::RenewRequest | Self::RenewChallenge | Self::RenewAck | Self::RenewCommitConfirmed
+            Self::RenewRequest
+                | Self::RenewChallenge
+                | Self::RenewConfirm
+                | Self::RenewCommitConfirmed
         )
     }
 

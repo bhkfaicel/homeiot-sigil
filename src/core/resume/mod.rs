@@ -49,20 +49,19 @@ use crate::core::event::SigilAction;
 use crate::core::frame::{
     FRAME_TYPE_OFFSET, FrameType, OUTER_HEADER_SIZE, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET,
 };
-use crate::core::resume::wire::RESUME_NONCE_SIZE;
 use crate::core::manager::SessionManager;
-use crate::core::pending::{HandshakeRole, HandshakeStep};
 #[cfg(feature = "sensor")]
 use crate::core::pending::PendingHandshake;
+use crate::core::pending::PendingState;
 #[cfg(feature = "sensor")]
 use crate::core::resume::sensor::{
-    build_resume_request_frame, handle_resume_challenge,
-    handle_resume_commit_confirmed,
+    build_resume_request_frame, handle_resume_challenge, handle_resume_commit_confirmed,
 };
-#[cfg(feature = "sensor")]
-use crate::core::session::SessionRole;
+use crate::core::resume::wire::RESUME_NONCE_SIZE;
 #[cfg(feature = "sensor")]
 use crate::core::session::PeerId;
+#[cfg(feature = "sensor")]
+use crate::core::session::SessionRole;
 use crate::core::traits::{RandomSource, SecureElement};
 
 /// Suggested radio wait for resume handshake steps (milliseconds).
@@ -74,7 +73,7 @@ pub const RESUME_TIMEOUT_MS: u32 = 5000;
 
 /// Minimum gap between accepted gateway `ResumeRequest` ECDH work, in **seconds**.
 /// # Host timebase contract
-/// Product convention: [`SessionManager`](crate::core::manager::SessionManager)
+/// Product convention: [`SessionManager`]
 /// APIs use **seconds** for local `now`, `key_lifetime_secs`, and this cooldown.
 /// `RESUME_REQUEST_COOLDOWN = 15` therefore means **15 seconds**.
 /// A second request for the same peer before this delta elapses returns
@@ -99,13 +98,13 @@ pub(crate) fn resume_hkdf_info(
 ) -> Result<heapless::Vec<u8, 64>, SigilError> {
     let mut info = heapless::Vec::<u8, 64>::new();
     info.extend_from_slice(b"sigil-resume")
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(sensor_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(gateway_nonce)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(&key_lifetime_secs.to_be_bytes())
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(info)
 }
 
@@ -125,57 +124,55 @@ pub(crate) fn start_resume_internal<const N: usize, const MSG: usize>(
     now: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
     let _ = se; // resume request does not need the SE; ECDH happens at challenge time
-    let replacing_stale_commit = if let Some(pending) = manager.get_pending(&peer) {
-        let recoverable = pending.role == HandshakeRole::Sensor
-            && matches!(
-                pending.step,
-                HandshakeStep::RenewWaitingForCommitConfirmed
-                    | HandshakeStep::ResumeWaitingForCommitConfirmed
-                    | HandshakeStep::InstallWaitingForCommitConfirmed
-            );
-        if !recoverable {
-            return Err(SigilError::PendingAlreadyExists { peer });
-        }
-        true
-    } else {
-        false
-    };
-    if !manager.pending_slot_available(&peer) {
-        return Err(SigilError::CapacityExceeded);
+    // Lend the storage capabilities once: every pending / session access
+    // below goes through the narrow store view instead of manager internals.
+    // Field mutation flows through the view's own `&mut` store references.
+    let stores = manager.protocol_stores();
+    // A stale post-Final sensor recovery state (cached Final the gateway never
+    // acknowledged) may be replaced by a fresh authenticated request; every
+    // other pending for this peer blocks a new handshake.
+    let replacing_stale_commit = stores
+        .pending
+        .get(&peer)
+        .is_some_and(|pending| pending.state().is_sensor_final_sent());
+    if stores.pending.get(&peer).is_some() && !replacing_stale_commit {
+        return Err(SigilError::PendingAlreadyExists { peer });
+    }
+    if !stores.pending.slot_available(&peer) {
+        return Err(SigilError::PendingTableFull);
     }
 
     {
-        let session = manager
-.get_mut(&peer)
-.ok_or(SigilError::UnknownSession { peer })?;
+        let session = stores
+            .sessions
+            .get_mut(&peer)
+            .ok_or(SigilError::UnknownSession { peer })?;
         // Only the sensor role may initiate resume.
         if session.role() != SessionRole::Sensor {
-            return Err(SigilError::InvalidStep { peer });
+            return Err(SigilError::WrongRole { peer });
         }
-        if session.peer_static_pubkey == [0u8; 33] {
+        if session.peer_static_pubkey() == &[0u8; 33] {
             return Err(SigilError::InvalidStaticKey);
         }
     }
 
-    let resume_psk = manager
-.get(&peer)
-.ok_or(SigilError::UnknownSession { peer })?
-.require_resume_psk()?;
+    let resume_psk = stores
+        .sessions
+        .get(&peer)
+        .ok_or(SigilError::UnknownSession { peer })?
+        .require_resume_psk()?;
 
     let (frame, sensor_nonce) =
-        build_resume_request_frame::<MSG>(manager.local_mac(), &resume_psk, rng)?;
+        build_resume_request_frame::<MSG>(stores.local_mac, resume_psk, rng)?;
 
- // Stash the sensor nonce as typed PendingSecrets::Nonce16.
-
-    let mut pending =
-        PendingHandshake::new_resume(peer, HandshakeRole::Sensor, RESUME_TIMEOUT_MS, now);
-    pending.set_nonce16(sensor_nonce);
+    // The tagged sensor state stashes the request nonce until the challenge.
+    let pending = PendingHandshake::new_resume_sensor(peer, sensor_nonce, RESUME_TIMEOUT_MS, now);
     // Preserve staged post-Final material until validation/RNG/frame building
     // for the explicit recovery request have all succeeded.
     if replacing_stale_commit {
-        let _ = manager.remove_pending(&peer);
+        let _ = stores.pending.remove(&peer);
     }
-    manager.insert_pending(peer, pending)?;
+    stores.pending.insert(peer, pending)?;
 
     Ok(SigilAction::Transmit {
         dest: peer,
@@ -202,11 +199,12 @@ pub(crate) fn handle_resume_request_internal<const N: usize, const MSG: usize>(
     key_lifetime_secs: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
     if packet.len() < 17 {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
     let mut peer = [0u8; 17];
     peer.copy_from_slice(&packet[..17]);
-    gateway::handle_resume_request(manager, &peer, packet, se, rng, now, key_lifetime_secs)
+    let mut stores = manager.protocol_stores();
+    gateway::handle_resume_request(&mut stores, &peer, packet, se, rng, now, key_lifetime_secs)
 }
 
 /// Internal implementation of [`SessionManager::continue_resume`].
@@ -224,7 +222,7 @@ pub(crate) fn continue_resume_internal<const N: usize, const MSG: usize>(
     #[cfg(not(feature = "sensor"))]
     let _ = se;
     if packet.len() < 17 {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
     let mut peer = [0u8; 17];
     peer.copy_from_slice(&packet[..17]);
@@ -232,53 +230,91 @@ pub(crate) fn continue_resume_internal<const N: usize, const MSG: usize>(
     // Validate the frame_type matches a resume protocol message.
     if packet.len() < OUTER_HEADER_SIZE
         || !FrameType::from_byte(packet[FRAME_TYPE_OFFSET])
-.map(|ft| ft.is_resume())
-.unwrap_or(false)
+            .map(|ft| ft.is_resume())
+            .unwrap_or(false)
         || packet[PROTOCOL_VERSION_OFFSET] != PROTOCOL_VERSION
     {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
 
     let frame_type =
-        FrameType::from_byte(packet[FRAME_TYPE_OFFSET]).ok_or(SigilError::ParseError)?;
-    let pending = manager
-.get_pending(&peer)
-.ok_or(SigilError::NoPending { peer })?;
-    let role = pending.role;
-    let step = pending.step;
+        FrameType::from_byte(packet[FRAME_TYPE_OFFSET]).ok_or(SigilError::MalformedFrame)?;
 
-    match (role, step, frame_type) {
+    // Lend the storage capabilities once: the dispatch peek and the handlers
+    // all work on this narrow view.
+    let mut stores = manager.protocol_stores();
+
+    /// Dispatch decision derived from the tagged pending state plus the
+    /// incoming frame type. Kept as a local Copy enum so the immutable
+    /// pending borrow ends before the handlers take `&mut stores`.
+    enum ResumeDispatch {
+        /// Sensor: challenge arrived while awaiting it → verify + stage Final
+        /// (carries the stashed request nonce).
         #[cfg(feature = "sensor")]
-        (
-            HandshakeRole::Sensor,
-            HandshakeStep::ResumeWaitingForChallenge,
-            FrameType::ResumeChallenge,
-        ) => {
-            let sensor_nonce = *pending.nonce16().ok_or(SigilError::InvalidHandshakeState)?;
-            handle_resume_challenge(manager, &peer, packet, se, &sensor_nonce, now)
-        }
+        Challenge {
+            /// Request nonce stashed in `ResumeSensorAwaitChallenge`.
+            sensor_nonce: [u8; RESUME_NONCE_SIZE],
+        },
+        /// Sensor: CommitConfirmed arrived after Final → commit the session.
         #[cfg(feature = "sensor")]
-        (
-            HandshakeRole::Sensor,
-            HandshakeStep::ResumeWaitingForCommitConfirmed,
-            FrameType::ResumeCommitConfirmed,
-        ) => handle_resume_commit_confirmed(manager, &peer, packet, now),
+        CommitConfirmed,
+        /// Sensor: duplicate challenge after Final → retransmit cached Final.
         #[cfg(feature = "sensor")]
-        (
-            HandshakeRole::Sensor,
-            HandshakeStep::ResumeWaitingForCommitConfirmed,
-            FrameType::ResumeChallenge,
-        ) => manager.retransmit_pending_cached(&peer),
+        RetransmitFinal,
+        /// Gateway: Confirm (or duplicate Confirm while CommitSent) → commit
+        /// or retransmit cached CommitConfirmed.
         #[cfg(feature = "gateway")]
-        (
-            HandshakeRole::Gateway,
-            HandshakeStep::ResumeWaitingForConfirm,
-            FrameType::ResumeConfirm,
-        )
-        | (HandshakeRole::Gateway, HandshakeStep::ResumeCommitSent, FrameType::ResumeConfirm) => {
-            gateway::handle_resume_confirm(manager, &peer, packet, now)
+        GatewayConfirm,
+        /// No (state, frame) pair matches: fail closed.
+        Invalid,
+    }
+
+    let dispatch = {
+        let pending = stores
+            .pending
+            .get(&peer)
+            .ok_or(SigilError::NoPending { peer })?;
+        match (pending.state(), frame_type) {
+            #[cfg(feature = "sensor")]
+            (
+                PendingState::ResumeSensorAwaitChallenge { sensor_nonce },
+                FrameType::ResumeChallenge,
+            ) => ResumeDispatch::Challenge {
+                sensor_nonce: *sensor_nonce.as_array(),
+            },
+            #[cfg(feature = "sensor")]
+            (PendingState::ResumeSensorFinalSent { .. }, FrameType::ResumeCommitConfirmed) => {
+                ResumeDispatch::CommitConfirmed
+            }
+            #[cfg(feature = "sensor")]
+            (PendingState::ResumeSensorFinalSent { .. }, FrameType::ResumeChallenge) => {
+                ResumeDispatch::RetransmitFinal
+            }
+            #[cfg(feature = "gateway")]
+            (PendingState::ResumeGatewayAwaitConfirm { .. }, FrameType::ResumeConfirm)
+            | (PendingState::ResumeGatewayCommitSent { .. }, FrameType::ResumeConfirm) => {
+                ResumeDispatch::GatewayConfirm
+            }
+            _ => ResumeDispatch::Invalid,
         }
-        _ => Err(SigilError::InvalidStep { peer }),
+    };
+
+    match dispatch {
+        #[cfg(feature = "sensor")]
+        ResumeDispatch::Challenge { sensor_nonce } => {
+            handle_resume_challenge(&mut stores, &peer, packet, se, &sensor_nonce, now)
+        }
+        #[cfg(feature = "sensor")]
+        ResumeDispatch::CommitConfirmed => {
+            handle_resume_commit_confirmed(&mut stores, &peer, packet, now)
+        }
+        #[cfg(feature = "sensor")]
+        ResumeDispatch::RetransmitFinal => stores.pending.retransmit_cached_action::<MSG>(&peer),
+        #[cfg(feature = "gateway")]
+        ResumeDispatch::GatewayConfirm => {
+            gateway::handle_resume_confirm(&mut stores, &peer, packet, now)
+        }
+        ResumeDispatch::Invalid => Err(SigilError::InvalidStep { peer }),
     }
 }
 

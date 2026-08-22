@@ -39,8 +39,8 @@ use crate::core::install::wire::{
     EcdsaSig, InstallConfirm, InstallRequest, build_install_confirm, build_install_request,
     parse_install_challenge,
 };
-use crate::core::manager::SessionManager;
-use crate::core::pending::HandshakeStep;
+use crate::core::manager::ProtocolStores;
+use crate::core::pending::PendingState;
 use crate::core::session::{PeerId, Session, SessionRole};
 use crate::core::traits::{FactoryCertificateMetadata, RandomSource, SecureElement};
 
@@ -58,6 +58,7 @@ pub(crate) fn build_install_request_action<const MSG: usize>(
     rng: &mut impl RandomSource,
 ) -> Result<(heapless::Vec<u8, MSG>, [u8; 16]), SigilError> {
     let sensor_static_pubkey = se.get_static_pubkey()?;
+    crate::core::session::validate_static_public_key_encoding(&sensor_static_pubkey)?;
     let factory_cert_sig = se.get_factory_cert()?;
     let factory_metadata = se.get_factory_cert_metadata()?;
 
@@ -86,47 +87,50 @@ pub(crate) fn build_install_request_action<const MSG: usize>(
     let packet = build_install_request(&request)?;
     let mut out: heapless::Vec<u8, MSG> = heapless::Vec::new();
     out.extend_from_slice(&packet)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok((out, sensor_nonce))
 }
 
 /// Processes an install challenge packet on the sensor side.
 /// Verifies attestation / signatures, derives keys, emits Final (`InstallConfirm`),
 /// and **stages** material in pending without inserting a session.
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
 /// # Returns
 /// `SigilAction::Transmit` carrying the `InstallConfirm` on success.
 pub(crate) fn handle_install_challenge<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+    stores: &mut ProtocolStores<'_, N>,
     peer: &PeerId,
     packet: &[u8],
     se: &mut impl SecureElement,
     now: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    let challenge = parse_install_challenge(packet).ok_or(SigilError::ParseError)?;
-
+    let challenge = parse_install_challenge(packet).ok_or(SigilError::MalformedFrame)?;
     // Outer header MAC must match the body gateway MAC.
     if !crate::core::install::outer_peer_matches_body(packet, &challenge.gateway_peer_mac) {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
 
     // Pending is keyed by the remote gateway MAC.
     if challenge.gateway_peer_mac != *peer {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
-    if manager.is_full() && manager.get(peer).is_none() {
-        return Err(SigilError::CapacityExceeded);
+    crate::core::session::validate_static_public_key_encoding(&challenge.gateway_static_pubkey)?;
+    if stores.sessions.is_full() && stores.sessions.get(peer).is_none() {
+        return Err(SigilError::SessionTableFull);
     }
 
-    let pending = manager
-        .get_pending(peer)
-        .ok_or(SigilError::NoPending { peer: *peer })?;
-    if pending.step != HandshakeStep::InstallWaitingForChallenge {
-        return Err(SigilError::InvalidStep { peer: *peer });
-    }
-    let sensor_nonce = pending
-        .transcript_initiator_nonce
-        .ok_or(SigilError::InvalidHandshakeState)?;
-    let local = *manager.local_mac();
+    // The tagged state both gates the step and carries the stashed initiator
+    // nonce needed for the HKDF info and the challenge signature transcript.
+    let sensor_nonce = match stores
+        .pending
+        .get(peer)
+        .ok_or(SigilError::NoPending { peer: *peer })?
+        .state()
+    {
+        PendingState::InstallSensorAwaitChallenge { sensor_nonce } => *sensor_nonce.as_array(),
+        _ => return Err(SigilError::InvalidStep { peer: *peer }),
+    };
+    let local = *stores.local_mac;
 
     // Factory attestation: cert binds gateway PeerId ‖ pubkey.
 
@@ -140,7 +144,7 @@ pub(crate) fn handle_install_challenge<const N: usize, const MSG: usize>(
         &challenge.gateway_static_pubkey,
     )?;
     se.verify_ecdsa(
-        manager.factory_pubkey(),
+        stores.factory_pubkey,
         &cert_msg,
         &challenge.factory_cert_sig,
     )
@@ -174,8 +178,9 @@ pub(crate) fn handle_install_challenge<const N: usize, const MSG: usize>(
 
     // ECDH(static_priv, gateway_static_pub) → shared secret (ZeroizeOnDrop).
 
-    let shared =
-        crate::core::secret::SharedSecretBuf::new(se.ecdh(&challenge.gateway_static_pubkey)?);
+    let shared = crate::core::secret::validated_ecdh_shared_secret(
+        se.ecdh(&challenge.gateway_static_pubkey)?,
+    )?;
 
     // Derive directional AEAD material with both handshake nonces in HKDF info.
     let info = crate::core::install::install_hkdf_info(&sensor_nonce, &challenge.gateway_nonce)?;
@@ -205,20 +210,24 @@ pub(crate) fn handle_install_challenge<const N: usize, const MSG: usize>(
     let confirm_packet = build_install_confirm(&cfm)?;
     let mut out: heapless::Vec<u8, MSG> = heapless::Vec::new();
     out.extend_from_slice(&confirm_packet)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
 
-    // stage keys + resume PSK + peer pubkey; no session insert yet.
-
-    let pending = manager
-        .get_pending_mut(peer)
+    // Stage keys + resume PSK + peer pubkey via the checked transition; no
+    // session insert yet. Swapping the variant atomically wipes the stashed
+    // initiator nonce, stages the new secrets, caches the Final frame, and
+    // refreshes the deadline — fail-atomic on any error.
+    let pending = stores
+        .pending
+        .get_mut(peer)
         .ok_or(SigilError::NoPending { peer: *peer })?;
-    pending.set_directional_keys(material);
-    pending.resume_psk = Some(resume_psk);
-    pending.transcript_pubkey = Some(challenge.gateway_static_pubkey);
-    pending.transcript_expire = Some(challenge.key_lifetime_secs);
-    pending.set_cached_wire(&out)?;
-    pending.update_step(HandshakeStep::InstallWaitingForCommitConfirmed);
-    pending.update_timeout(INSTALL_TIMEOUT_MS, now);
+    pending.install_sensor_stage_final(
+        material,
+        resume_psk,
+        challenge.gateway_static_pubkey,
+        challenge.key_lifetime_secs,
+        &out,
+        now,
+    )?;
 
     Ok(SigilAction::Transmit {
         dest: *peer,
@@ -228,31 +237,35 @@ pub(crate) fn handle_install_challenge<const N: usize, const MSG: usize>(
 }
 
 /// Handles `InstallCommitConfirmed`: verify staged keys, insert session, persist.
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
 pub(crate) fn handle_install_commit_confirmed<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+    stores: &mut ProtocolStores<'_, N>,
     peer: &PeerId,
     frame: &[u8],
     now: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    let pending = manager
-        .get_pending(peer)
-        .ok_or(SigilError::NoPending { peer: *peer })?;
-    if pending.step != HandshakeStep::InstallWaitingForCommitConfirmed {
-        return Err(SigilError::InvalidStep { peer: *peer });
-    }
-    let material = pending
-        .directional_keys()
-        .ok_or(SigilError::InvalidHandshakeState)?
-        .clone();
-    let resume_psk = pending
-        .resume_psk
-        .ok_or(SigilError::InvalidHandshakeState)?;
-    let gateway_pubkey = pending
-        .transcript_pubkey
-        .ok_or(SigilError::InvalidHandshakeState)?;
-    let key_lifetime_secs = pending
-        .transcript_expire
-        .ok_or(SigilError::InvalidHandshakeState)?;
+    // The tagged FinalSent recovery state carries exactly the staged commit
+    // material; any other state fails closed with InvalidStep.
+    let (material, resume_psk, gateway_pubkey, key_lifetime_secs) = match stores
+        .pending
+        .get(peer)
+        .ok_or(SigilError::NoPending { peer: *peer })?
+        .state()
+    {
+        PendingState::InstallSensorFinalSent {
+            keys,
+            resume_psk,
+            gateway_static_pubkey,
+            key_lifetime_secs,
+            ..
+        } => (
+            keys.clone(),
+            *resume_psk.as_array(),
+            *gateway_static_pubkey,
+            *key_lifetime_secs,
+        ),
+        _ => return Err(SigilError::InvalidStep { peer: *peer }),
+    };
 
     aead::verify_commit_confirmed(
         frame,
@@ -284,13 +297,13 @@ pub(crate) fn handle_install_commit_confirmed<const N: usize, const MSG: usize>(
     // CommitConfirmed used g2s counter 0; install Final was clear-text (no s2g TX).
     let mut session = session;
     session.rx_counter = 1;
-    manager.insert(session)?;
-    let _ = manager.remove_pending(peer);
+    stores.sessions.insert(session)?;
+    let _ = stores.pending.remove(peer);
 
     Ok(SigilAction::PersistPeerStaticKey {
         peer: *peer,
         pubkey: gateway_pubkey,
-        resume_psk,
+        resume_psk: crate::core::event::ResumePskSecret::new(resume_psk),
         transmit: heapless::Vec::new(),
         wait_timeout_ms: None,
     })

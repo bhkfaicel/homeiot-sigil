@@ -2,6 +2,8 @@
 
 //! Unit tests for session management
 
+mod type_size_bounds;
+
 use crate::core::error::SigilError;
 use crate::core::session::{
     DirectionalMaterial, MAX_SESSION_LIFETIME_SECS, Session, SessionRole, validate_key_expire_at,
@@ -24,7 +26,7 @@ fn test_require_key_material_returns_refs() {
         10_000,
         0,
     )
-.unwrap();
+    .unwrap();
     let (k, p) = session.require_key_material(&peer).unwrap();
     assert_eq!(k, &key);
     assert_eq!(p, &prefix);
@@ -84,7 +86,7 @@ fn test_new_active_and_update_key_validate_expire() {
         now + 60,
         now,
     )
-.unwrap();
+    .unwrap();
     match session.update_key(
         DirectionalMaterial::symmetric_for_test([5u8; 32], [6u8; 4]),
         too_far,
@@ -100,12 +102,12 @@ fn test_new_active_and_update_key_validate_expire() {
         _ => panic!("expected InvalidKeyExpire on update_key"),
     }
     session
-.update_key(
+        .update_key(
             DirectionalMaterial::symmetric_for_test([5u8; 32], [6u8; 4]),
             now + 120,
             now,
         )
-.unwrap();
+        .unwrap();
     assert_eq!(session.key_expire_at(), now + 120);
 }
 
@@ -143,24 +145,22 @@ fn test_validate_key_expire_at() {
 fn test_new_enrolled_session() {
     let peer_mac = [1u8; 17];
     let peer_static_pubkey = [2u8; 33];
-    let key_expire_at = 1000;
-
     let session = Session::new_enrolled(
         peer_mac,
         peer_static_pubkey,
         RESUME_PSK,
-        key_expire_at,
         SessionRole::Sensor,
-    );
+    )
+    .unwrap();
 
-    assert_eq!(session.peer_mac, peer_mac);
-    assert_eq!(session.peer_static_pubkey, peer_static_pubkey);
+    assert_eq!(session.peer_mac(), &peer_mac);
+    assert_eq!(session.peer_static_pubkey(), &peer_static_pubkey);
     assert!(session.session_key().is_none());
     assert!(session.nonce_prefix().is_none());
     assert_eq!(session.resume_psk(), Some(&RESUME_PSK));
     assert_eq!(session.tx_counter(), 0);
     assert_eq!(session.rx_counter(), 0);
-    assert_eq!(session.key_expire_at(), key_expire_at);
+    assert_eq!(session.key_expire_at(), 0);
 }
 
 #[test]
@@ -168,18 +168,25 @@ fn test_post_reboot_public_api_is_new_enrolled() {
     // After NVRAM load the host must create an enrolled shell
     // without AEAD keys. Active keys are crate-internal (`new_active` /
     // `update_key`) and only installed by install/renew/resume.
-    let session = Session::new_enrolled(
-        [9u8; 17],
-        [8u8; 33],
-        RESUME_PSK,
-        86_400,
-        SessionRole::Gateway,
-    );
+    let session =
+        Session::new_enrolled([9u8; 17], [2u8; 33], RESUME_PSK, SessionRole::Gateway).unwrap();
     assert!(!session.is_active(0), "enrolled shell has no live AEAD key");
     assert!(session.session_key().is_none());
     assert!(session.rx_session_key().is_none());
     assert_eq!(session.role(), SessionRole::Gateway);
     assert_eq!(session.resume_psk(), Some(&RESUME_PSK));
+}
+
+#[test]
+fn test_new_enrolled_rejects_corrupt_nvram_material() {
+    assert!(matches!(
+        Session::new_enrolled([9u8; 17], [0u8; 33], RESUME_PSK, SessionRole::Sensor,),
+        Err(SigilError::InvalidStaticKey)
+    ));
+    assert!(matches!(
+        Session::new_enrolled([9u8; 17], [2u8; 33], [0u8; 32], SessionRole::Sensor,),
+        Err(SigilError::InvalidResumePsk)
+    ));
 }
 
 #[test]
@@ -199,10 +206,10 @@ fn test_new_active_session() {
         key_expire_at,
         0,
     )
-.unwrap();
+    .unwrap();
 
-    assert_eq!(session.peer_mac, peer_mac);
-    assert_eq!(session.peer_static_pubkey, peer_static_pubkey);
+    assert_eq!(session.peer_mac(), &peer_mac);
+    assert_eq!(session.peer_static_pubkey(), &peer_static_pubkey);
     assert_eq!(session.session_key(), Some(&session_key));
     assert_eq!(session.nonce_prefix(), Some(&nonce_prefix));
     assert_eq!(session.tx_counter(), 0);
@@ -222,14 +229,14 @@ fn test_resume_psk_survives_update_and_clear() {
         1000,
         0,
     )
-.unwrap();
+    .unwrap();
     session
-.update_key(
+        .update_key(
             DirectionalMaterial::symmetric_for_test([5u8; 32], [6u8; 4]),
             2000,
             0,
         )
-.unwrap();
+        .unwrap();
     assert_eq!(session.resume_psk(), Some(&RESUME_PSK));
     session.clear_expired_key(2000).unwrap();
     assert_eq!(session.resume_psk(), Some(&RESUME_PSK));
@@ -253,7 +260,7 @@ fn test_is_active() {
         key_expire_at,
         0,
     )
-.unwrap();
+    .unwrap();
 
     // Session should be active before expiry
     assert!(session.is_active(500));
@@ -280,7 +287,7 @@ fn test_is_expired() {
         key_expire_at,
         0,
     )
-.unwrap();
+    .unwrap();
 
     assert!(!session.is_expired(500));
     assert!(session.is_expired(1000));
@@ -307,7 +314,7 @@ fn test_update_key() {
         old_expire,
         0,
     )
-.unwrap();
+    .unwrap();
 
     // Set some counters
     session.tx_counter = 100;
@@ -315,12 +322,12 @@ fn test_update_key() {
 
     // Update the key
     session
-.update_key(
+        .update_key(
             DirectionalMaterial::symmetric_for_test(new_key, new_prefix),
             new_expire,
             0,
         )
-.unwrap();
+        .unwrap();
 
     assert_eq!(session.session_key(), Some(&new_key));
     assert_eq!(session.nonce_prefix(), Some(&new_prefix));
@@ -341,7 +348,7 @@ fn test_clear_expired_key() {
         1000,
         0,
     )
-.unwrap();
+    .unwrap();
 
     // Still active → refuse
     assert_eq!(
@@ -376,14 +383,14 @@ fn test_session_zeroize_on_drop() {
         1000,
         0,
     )
-.unwrap();
+    .unwrap();
     session
-.update_key(
+        .update_key(
             DirectionalMaterial::symmetric_for_test([0x11u8; 32], [0x22u8; 4]),
             2000,
             0,
         )
-.unwrap();
+        .unwrap();
     assert_eq!(session.session_key(), Some(&[0x11u8; 32]));
     drop(session);
 }

@@ -20,8 +20,8 @@ use crate::core::derive::derive_directional_session_keys;
 use crate::core::error::SigilError;
 use crate::core::event::SigilAction;
 use crate::core::frame::FrameType;
-use crate::core::manager::SessionManager;
-use crate::core::pending::HandshakeStep;
+use crate::core::manager::ProtocolStores;
+use crate::core::pending::PendingState;
 use crate::core::resume::RESUME_TIMEOUT_MS;
 use crate::core::resume::wire::{
     build_resume_confirm_body, build_resume_request_body, parse_resume_challenge_body,
@@ -51,17 +51,18 @@ pub(crate) fn build_resume_request_frame<const MSG: usize>(
     let mut frame: heapless::Vec<u8, MSG> = heapless::Vec::new();
     let header = frame::build_header(local_mac, FrameType::ResumeRequest);
     frame
-.extend_from_slice(&header)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(&header)
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     frame
-.extend_from_slice(&body)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(&body)
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok((frame, sensor_nonce))
 }
 
 /// Processes a resume challenge on the sensor side: stages keys + emits Final.
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
 pub(crate) fn handle_resume_challenge<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+    stores: &mut ProtocolStores<'_, N>,
     peer: &PeerId,
     packet: &[u8],
     se: &mut impl SecureElement,
@@ -74,22 +75,24 @@ pub(crate) fn handle_resume_challenge<const N: usize, const MSG: usize>(
     use crate::core::resume::wire::RESUME_CHALLENGE_BODY_LEN;
 
     if packet.len() < OUTER_HEADER_SIZE + RESUME_CHALLENGE_BODY_LEN {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
     if packet[PROTOCOL_VERSION_OFFSET] != PROTOCOL_VERSION
         || packet[FRAME_TYPE_OFFSET] != FrameType::ResumeChallenge as u8
     {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
     let body = &packet[OUTER_HEADER_SIZE..];
-    let challenge = parse_resume_challenge_body(body).ok_or(SigilError::ParseError)?;
+    let challenge = parse_resume_challenge_body(body).ok_or(SigilError::MalformedFrame)?;
 
-    let session = manager
-.get(peer)
-.ok_or(SigilError::UnknownSession { peer: *peer })?;
+    let session = stores
+        .sessions
+        .get(peer)
+        .ok_or(SigilError::UnknownSession { peer: *peer })?;
 
     // Wipe shared on Drop (MAC fail, validate, HKDF, or encrypt errors).
-    let shared = crate::core::secret::SharedSecretBuf::new(se.ecdh(&session.peer_static_pubkey)?);
+    let shared =
+        crate::core::secret::validated_ecdh_shared_secret(se.ecdh(session.peer_static_pubkey())?)?;
 
     let expected_mac = resume_challenge_mac(
         shared.as_array(),
@@ -114,21 +117,21 @@ pub(crate) fn handle_resume_challenge<const N: usize, const MSG: usize>(
     drop(shared);
 
     let confirm_body = build_resume_confirm_body()?;
-    let local = *manager.local_mac();
+    let local = *stores.local_mac;
     let confirm_aad = aead::build_aad(&local, FrameType::ResumeConfirm);
 
     // Encrypt confirm under the new s2g half **before** staging.
     let mut frame: heapless::Vec<u8, MSG> = heapless::Vec::new();
     let confirm_header = crate::core::frame::build_header(&local, FrameType::ResumeConfirm);
     frame
-.extend_from_slice(&confirm_header)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(&confirm_header)
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     frame
-.extend_from_slice(&material.s2g_prefix)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(&material.s2g_prefix)
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     frame
-.extend_from_slice(&0u64.to_be_bytes())
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(&0u64.to_be_bytes())
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     aead::encrypt_append(
         &material.s2g_key,
         &material.s2g_prefix,
@@ -138,15 +141,15 @@ pub(crate) fn handle_resume_challenge<const N: usize, const MSG: usize>(
         &mut frame,
     )?;
 
-    // Stage keys + cache Final; do not update_key yet.
-    let pending = manager
-.get_pending_mut(peer)
-.ok_or(SigilError::NoPending { peer: *peer })?;
-    pending.set_directional_keys(material);
-    pending.transcript_expire = Some(challenge.key_lifetime_secs);
-    pending.set_cached_wire(&frame)?;
-    pending.update_step(HandshakeStep::ResumeWaitingForCommitConfirmed);
-    pending.update_timeout(RESUME_TIMEOUT_MS, now);
+    // Checked transition to the FinalSent recovery state: stages the resumed
+    // directional material, caches the Final frame, refreshes the deadline,
+    // and wipes the stashed request nonce — all atomically (fail-atomic on
+    // any error). Do not update_key yet.
+    let pending = stores
+        .pending
+        .get_mut(peer)
+        .ok_or(SigilError::NoPending { peer: *peer })?;
+    pending.resume_sensor_stage_final(material, challenge.key_lifetime_secs, &frame, now)?;
 
     Ok(SigilAction::Transmit {
         dest: *peer,
@@ -156,25 +159,28 @@ pub(crate) fn handle_resume_challenge<const N: usize, const MSG: usize>(
 }
 
 /// Handles `ResumeCommitConfirmed`: verify staged keys, then commit.
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
 pub(crate) fn handle_resume_commit_confirmed<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+    stores: &mut ProtocolStores<'_, N>,
     peer: &PeerId,
     frame: &[u8],
     now: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    let pending = manager
-.get_pending(peer)
-.ok_or(SigilError::NoPending { peer: *peer })?;
-    if pending.step != HandshakeStep::ResumeWaitingForCommitConfirmed {
-        return Err(SigilError::InvalidStep { peer: *peer });
-    }
-    let material = pending
-.directional_keys()
-.ok_or(SigilError::InvalidHandshakeState)?
-.clone();
-    let lifetime = pending
-.transcript_expire
-.ok_or(SigilError::InvalidHandshakeState)?;
+    // The tagged FinalSent recovery state carries exactly the staged resume
+    // material and lifetime; any other state fails closed with InvalidStep.
+    let (material, lifetime) = match stores
+        .pending
+        .get(peer)
+        .ok_or(SigilError::NoPending { peer: *peer })?
+        .state()
+    {
+        PendingState::ResumeSensorFinalSent {
+            keys,
+            key_lifetime_secs,
+            ..
+        } => (keys.clone(), *key_lifetime_secs),
+        _ => return Err(SigilError::InvalidStep { peer: *peer }),
+    };
 
     aead::verify_commit_confirmed(
         frame,
@@ -182,9 +188,9 @@ pub(crate) fn handle_resume_commit_confirmed<const N: usize, const MSG: usize>(
         &material.g2s_key,
         &material.g2s_prefix,
     )
-.map_err(|e| match e {
+    .map_err(|e| match e {
         SigilError::Replay {
-            expected, received,..
+            expected, received, ..
         } => SigilError::Replay {
             peer: *peer,
             expected,
@@ -193,14 +199,15 @@ pub(crate) fn handle_resume_commit_confirmed<const N: usize, const MSG: usize>(
         other => other,
     })?;
 
-    let session = manager
-.get_mut(peer)
-.ok_or(SigilError::UnknownSession { peer: *peer })?;
+    let session = stores
+        .sessions
+        .get_mut(peer)
+        .ok_or(SigilError::UnknownSession { peer: *peer })?;
     let expire = crate::core::session::expire_from_lifetime(now, lifetime)?;
     session.update_key(material, expire, now)?;
     session.tx_counter = 1;
     session.rx_counter = 1;
-    let _ = manager.remove_pending(peer);
+    let _ = stores.pending.remove(peer);
 
     Ok(SigilAction::Success { peer: *peer })
 }

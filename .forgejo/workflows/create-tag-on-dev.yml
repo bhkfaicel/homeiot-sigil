@@ -1,18 +1,53 @@
-# On push to `dev`: create and push prerelease tag `vX.Y.Z-rc`.
-# Implementation: faicel/central_ci create_tag_on_dev.yml
-# Repository is auto-detected from github.repository (caller).
-
 name: Create tag on dev
 
 on:
   push:
-    branches:
-      - dev
+    branches: [dev]
 
 jobs:
-  tag:
-    uses: faicel/central_ci/.forgejo/workflows/create_tag_on_dev.yml@main
-    with:
-      enable_deny: false
+  checks:
+    uses: ./.forgejo/workflows/_rust-crate-checks.yml
     secrets:
       RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+
+  tag:
+    needs: checks
+    runs-on: docker
+    container:
+      image: code.bhk-itsolutions.com/homeiot/ci-rust-embedded:rust-1.97.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          token: ${{ secrets.RUNNER_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Create and push prerelease tag
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$VERSION" ] || [[ "$VERSION" == *-rc* ]]; then
+            echo "error: Cargo.toml must contain a stable base version" >&2
+            exit 1
+          fi
+          TAG_NAME="v${VERSION}-rc"
+          git config user.name CI
+          git config user.email ci@forgejo
+          git remote set-url origin "https://code.bhk-itsolutions.com/${REPOSITORY}.git"
+          ASKPASS="$(mktemp)"
+          trap 'rm -f "$ASKPASS"' EXIT
+          printf '%s\n' '#!/bin/sh' 'case "$1" in' \
+            '  *Username*) printf "%s\n" git ;;' \
+            '  *) printf "%s\n" "$REPO_ACCESS_TOKEN" ;;' 'esac' > "$ASKPASS"
+          chmod 700 "$ASKPASS"
+          if git ls-remote --tags origin "refs/tags/${TAG_NAME}" | grep -q .; then
+            echo "error: ${TAG_NAME} already exists; bump the version" >&2
+            exit 1
+          fi
+          git tag "$TAG_NAME"
+          GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$ASKPASS" git push origin "$TAG_NAME"

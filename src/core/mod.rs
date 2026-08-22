@@ -21,9 +21,11 @@
 //!
 //! ## Non-Blocking Design
 //!
-//! All public APIs are non-blocking and return immediately. Waiting for responses is expressed
-//! through [`SigilAction::Transmit`](crate::core::event::SigilAction::Transmit) with
+//! Public APIs never wait for radio traffic and never sleep. Waiting for responses is expressed
+//! through [`SigilAction::Transmit`] with
 //! `wait_timeout_ms: Some(...)`, allowing the host to manage scheduling and I/O timing.
+//! Handshake calls invoke the host's synchronous [`SecureElement`]
+//! methods and therefore occupy the calling task until those hardware operations complete.
 //! Pending reclaim is also host-driven: manual [`SessionManager::cancel_pending`](crate::core::manager::SessionManager::cancel_pending)
 //! and/or optional [`SessionManager::tick`](crate::core::manager::SessionManager::tick).
 
@@ -45,35 +47,66 @@
 //! (radio wait hints only) and must not be mixed with `now`.
 
 // Internal crypto / protocol helpers (not part of the host-facing API)
+// These require the full `session` feature set.
+#[cfg(feature = "session")]
 pub(crate) mod aead;
+#[cfg(feature = "session")]
 pub(crate) mod derive;
-pub(crate) mod ecdh_soft;
+#[cfg(feature = "session")]
 pub(crate) mod pending;
+#[cfg(feature = "session")]
 pub(crate) mod secret;
 
+// The manufacturing / provisioning wire contract is enabled via `wire`.
+// Session-enabled builds pull `wire` implicitly.
+#[cfg(feature = "wire")]
+pub mod factory_cert;
+
+// The session protocol implementation (and its deps) is behind `session`.
+#[cfg(feature = "session")]
 pub mod error;
+#[cfg(feature = "session")]
 pub mod event;
+#[cfg(feature = "session")]
 pub mod frame;
+#[cfg(feature = "session")]
 pub mod install;
+#[cfg(feature = "session")]
 pub mod manager;
+#[cfg(feature = "session")]
 pub mod pipeline;
+#[cfg(feature = "session")]
 pub mod renew;
+#[cfg(feature = "session")]
 pub mod resume;
+#[cfg(feature = "session")]
 pub mod session;
+#[cfg(feature = "session")]
 pub mod traits;
 
-// Shared mock implementations for unit tests (only compiled under cfg(test))
-#[cfg(all(test, feature = "sensor", feature = "gateway"))]
+// Shared mock implementations and mono-role configuration tests for unit
+// tests. They exercise the session-protocol modules, so they must never
+// compile when `session` is disabled: the empty configuration is rejected in
+// src/lib.rs, and wire-only test runs contain only the factory_cert tests.
+#[cfg(all(test, feature = "session"))]
+mod role_config_tests;
+#[cfg(all(test, feature = "session"))]
 mod test_support;
 
 // Re-export commonly used types for convenience
+#[cfg(feature = "session")]
 pub use error::SigilError;
-pub use event::{DATA_MAX, MSG_MAX, SigilAction, SigilEvent};
+#[cfg(feature = "session")]
+pub use event::{DATA_MAX, MSG_MAX, ResumePskSecret, SigilAction, SigilEvent};
+#[cfg(feature = "session")]
 pub use manager::SessionManager;
-pub use pipeline::EVENT_ID_SIZE;
 #[cfg(feature = "sensor")]
 pub use pipeline::EVENT_ACK_TIMEOUT_MS;
+#[cfg(feature = "session")]
+pub use pipeline::EVENT_ID_SIZE;
 #[cfg(feature = "gateway")]
 pub use pipeline::{EVENT_ACK_WIRE_LEN, TIME_SYNC_REQUEST_COOLDOWN_SECS};
+#[cfg(feature = "session")]
 pub use session::{Session, SessionRole};
+#[cfg(feature = "session")]
 pub use traits::{FactoryCertificateMetadata, RandomSource, SecureElement};

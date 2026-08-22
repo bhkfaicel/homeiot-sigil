@@ -1,6 +1,6 @@
 //! Unit tests for frame type discriminator and outer header parsing
 
-#![cfg(all(test, feature = "sensor", feature = "gateway"))]
+#![cfg(test)]
 
 use super::*;
 
@@ -20,7 +20,7 @@ fn test_frame_type_from_byte_all_variants() {
     );
     assert_eq!(FrameType::from_byte(0x11), Some(FrameType::RenewRequest));
     assert_eq!(FrameType::from_byte(0x12), Some(FrameType::RenewChallenge));
-    assert_eq!(FrameType::from_byte(0x13), Some(FrameType::RenewAck));
+    assert_eq!(FrameType::from_byte(0x13), Some(FrameType::RenewConfirm));
     assert_eq!(
         FrameType::from_byte(0x14),
         Some(FrameType::RenewCommitConfirmed)
@@ -59,7 +59,7 @@ fn test_frame_type_roundtrip() {
         FrameType::InstallCommitConfirmed,
         FrameType::RenewRequest,
         FrameType::RenewChallenge,
-        FrameType::RenewAck,
+        FrameType::RenewConfirm,
         FrameType::RenewCommitConfirmed,
         FrameType::ResumeRequest,
         FrameType::ResumeChallenge,
@@ -83,7 +83,7 @@ fn test_is_encrypted_payload() {
     assert!(FrameType::Data.is_encrypted_payload());
     assert!(FrameType::RenewRequest.is_encrypted_payload());
     assert!(FrameType::RenewChallenge.is_encrypted_payload());
-    assert!(FrameType::RenewAck.is_encrypted_payload());
+    assert!(FrameType::RenewConfirm.is_encrypted_payload());
     assert!(FrameType::RenewCommitConfirmed.is_encrypted_payload());
     assert!(FrameType::ResumeConfirm.is_encrypted_payload());
     assert!(FrameType::ResumeCommitConfirmed.is_encrypted_payload());
@@ -116,7 +116,7 @@ fn test_is_install() {
 fn test_is_renew() {
     assert!(FrameType::RenewRequest.is_renew());
     assert!(FrameType::RenewChallenge.is_renew());
-    assert!(FrameType::RenewAck.is_renew());
+    assert!(FrameType::RenewConfirm.is_renew());
     assert!(FrameType::RenewCommitConfirmed.is_renew());
     assert!(!FrameType::Data.is_renew());
     assert!(!FrameType::InstallRequest.is_renew());

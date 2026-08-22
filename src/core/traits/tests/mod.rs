@@ -21,7 +21,7 @@ fn test_secure_element_trait_documents_sensing_priority() {
 
 #[test]
 fn test_mock_secure_element() {
-    let static_pubkey = [1u8; 33];
+    let static_pubkey = [2u8; 33];
     let mut se = MockSecureElement::new(static_pubkey);
 
     let peer_pubkey = [2u8; 33];

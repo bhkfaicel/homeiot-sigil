@@ -141,7 +141,7 @@ fn push_all<const N: usize>(packet: &mut Vec<u8, N>, chunks: &[&[u8]]) -> Result
     for chunk in chunks {
         packet
             .extend_from_slice(chunk)
-            .map_err(|_| SigilError::CapacityExceeded)?;
+            .map_err(|_| SigilError::OutputBufferTooSmall)?;
     }
     Ok(())
 }
@@ -152,7 +152,7 @@ fn push_all<const N: usize>(packet: &mut Vec<u8, N>, chunks: &[&[u8]]) -> Result
 ///  [hardware_profile_id:1] [factory_key_id:1] [pubkey:33] [factory_cert:64]
 ///  [nonce:16] [sig:64]`
 /// Buffer capacity is exactly [`INSTALL_REQUEST_LEN`].
-#[cfg(feature = "sensor")]
+#[cfg(any(feature = "sensor", test))]
 pub(crate) fn build_install_request(
     req: &InstallRequest,
 ) -> Result<Vec<u8, INSTALL_REQUEST_LEN>, SigilError> {

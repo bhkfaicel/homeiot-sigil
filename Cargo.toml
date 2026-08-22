@@ -1,25 +1,55 @@
 [package]
 name = "sigil"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
+rust-version = "1.85"
+license-file = "LICENSE"
+description = "no_std secure session engine for embedded sensor/gateway communication"
+repository = "https://code.bhk-itsolutions.com/homeiot/sigil"
 
 [features]
-# Development/tests keep both roles. Products should disable defaults and
-# select only the role they ship.
-default = ["sensor", "gateway"]
-sensor = []
-gateway = []
+# Supported feature configurations (gated by scripts/test-feature-matrix.sh):
+#   - empty:          UNSUPPORTED. Rejected at compile time by the deliberate
+#                     diagnostic in src/lib.rs.
+#   - wire:           SUPPORTED. Manufacturing-only contract; its test run
+#                     legitimately contains only the factory_cert tests.
+#   - sensor:         SUPPORTED. Single-role session build.
+#   - gateway:        SUPPORTED. Single-role session build.
+#   - sensor,gateway: SUPPORTED. Explicit two-role composition.
+# Safe smallest default for sensor firmware. Gateways must disable defaults and
+# select `gateway`; pairwise development uses `--all-features` explicitly.
+default = ["sensor"]
+#
+# `wire` is the minimal, manufacturing-tool contract (factory_cert / ProductId)
+# that should compile without the full session stack.
+wire = []
+#
+# `session` enables the full Sigil non-blocking session protocol implementation.
+session = [
+    "wire",
+    "dep:chacha20poly1305",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:zeroize",
+    "dep:subtle",
+    "dep:heapless",
+]
+sensor = ["session"]
+gateway = ["session"]
 
 [dependencies]
 # Cryptographic primitives
-chacha20poly1305 = { version = "0.10.1", default-features = false }
-hkdf = { version = "0.12", default-features = false }
-sha2 = { version = "0.10", default-features = false }
-# Renew eph↔eph only. Install/resume identity ECDH stays on SecureElement (P-256).
-x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
-zeroize = { version = "1.8", default-features = false, features = ["derive"] }
-# Direct dep for constant-time MAC compares (already transitive via AEAD / dalek).
-subtle = { version = "2.6", default-features = false }
+chacha20poly1305 = { version = "0.10.1", default-features = false, optional = true }
+hkdf = { version = "0.12", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+zeroize = { version = "1.8", default-features = false, features = ["derive"], optional = true }
+# Direct dependency for constant-time proof and MAC comparisons.
+subtle = { version = "2.6", default-features = false, optional = true }
 
 # Data structures and encoding
-heapless = "0.8"
+heapless = { version = "0.8", optional = true }
+
+[dev-dependencies]
+# Reference backend used only by tests. Production gateways implement the
+# gateway P-256 methods of SecureElement using their chosen crypto provider.
+p256 = { version = "0.13", default-features = false, features = ["ecdh"] }

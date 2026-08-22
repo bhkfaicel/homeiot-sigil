@@ -11,6 +11,14 @@ pub type StaticPublicKey = [u8; 33];
 /// ECDH shared secret type (32 bytes)
 pub type EcdhSharedSecret = [u8; 32];
 
+/// Compressed SEC1 P-256 public key used by ephemeral Renew.
+pub type EphemeralP256PublicKey = [u8; 33];
+
+/// Opaque gateway state retained between RenewChallenge and RenewConfirm.
+/// A software backend may store a scalar; a hardware backend may store a
+/// handle. Sigil always treats it as secret and zeroizes it.
+pub type GatewayEphemeralP256Context = [u8; 32];
+
 /// ECDSA signature type (64 bytes for P-256)
 pub type EcdsaSignature = [u8; 64];
 
@@ -53,9 +61,48 @@ pub trait SecureElement {
     /// # Returns
     /// The ECDH shared secret (32 bytes) on success, or an error if the operation fails
     /// # Security
-    /// The private key used for ECDH must remain inside the secure element and never
-    /// be extracted into RAM.
+    /// The private key used for ECDH must remain inside the secure element and
+    /// never be extracted into RAM. Implementations must reject malformed,
+    /// non-canonical, off-curve, infinity or non-compressed peer keys and must
+    /// never return an all-zero shared secret. Sigil independently rejects a
+    /// null result at every protocol call site as defense in depth.
     fn ecdh(&mut self, peer_static_pubkey: &[u8; 33]) -> Result<EcdhSharedSecret, SigilError>;
+
+    /// Atomically generates a P-256 private key in volatile secure-element
+    /// memory and immediately performs ECDH with `peer_ephemeral_pubkey`.
+    ///
+    /// The sensor implementation must execute ATECC `GenKey` with
+    /// `KeyID=0xFFFF` followed immediately by ECDH from `TempKey`, without
+    /// yielding, sleeping the ATECC, or writing a Data Slot between commands.
+    /// It returns the local compressed SEC1 public key and raw 32-byte ECDH
+    /// secret. The ephemeral private key must never leave the secure element.
+    /// The implementation must reject invalid, non-canonical, off-curve or
+    /// non-compressed peer keys.
+    #[cfg(feature = "sensor")]
+    fn ephemeral_p256_ecdh(
+        &mut self,
+        peer_ephemeral_pubkey: &EphemeralP256PublicKey,
+    ) -> Result<(EphemeralP256PublicKey, EcdhSharedSecret), SigilError>;
+
+    /// Gateway Renew step 1: creates a fresh P-256 keypair using host entropy
+    /// and returns the compressed public key plus opaque continuation state.
+    /// A software implementation may return its scalar as context; hardware
+    /// may return a handle. Sigil zeroizes the context after use.
+    #[cfg(feature = "gateway")]
+    fn generate_ephemeral_p256_keypair(
+        &mut self,
+        rng: &mut impl RandomSource,
+    ) -> Result<(EphemeralP256PublicKey, GatewayEphemeralP256Context), SigilError>;
+
+    /// Gateway Renew step 2: completes ECDH with the context created at Request
+    /// time. Implementations must reject malformed, non-canonical, off-curve or
+    /// infinity peer keys and reject a null shared secret.
+    #[cfg(feature = "gateway")]
+    fn complete_ephemeral_p256_ecdh(
+        &mut self,
+        context: &GatewayEphemeralP256Context,
+        peer_ephemeral_pubkey: &EphemeralP256PublicKey,
+    ) -> Result<EcdhSharedSecret, SigilError>;
 
     /// Signs a message using the device's static identity key
     /// # Arguments
@@ -76,6 +123,9 @@ pub trait SecureElement {
     ///
     /// # Returns
     /// `Ok(())` if the signature is valid, `Err(SigilError::VerificationFailed)` if invalid
+    /// # Security
+    /// Implementations must reject malformed, non-canonical, non-compressed,
+    /// off-curve or infinity public keys before signature verification.
     fn verify_ecdsa(
         &mut self,
         peer_static_pubkey: &[u8; 33],
@@ -86,6 +136,9 @@ pub trait SecureElement {
     /// Returns the device's static public key
     /// # Returns
     /// The device's static public key (33-byte compressed SEC1 format)
+    /// # Security
+    /// The returned value must be a canonical compressed P-256 point with a
+    /// `0x02` or `0x03` prefix. Sentinel or malformed keys must be rejected.
     fn get_static_pubkey(&mut self) -> Result<StaticPublicKey, SigilError>;
 
     /// Returns the factory certificate signature for this device.
@@ -125,11 +178,6 @@ pub trait RandomSource {
     /// # Security
     /// The random source must be cryptographically secure (CSPRNG) and must not be
     /// predictable or repeatable across reboots.
-    /// When invoked by renew's X25519 path, the library always passes a buffer of
-    /// **exactly 32 bytes**. Host implementations must fill the entire slice with
-    /// fresh entropy (never truncate to 31 bytes or pad to 33). The library then
-    /// applies RFC 7748 clamping; hosts must not pre-clamp or force bits to zero
-    /// beyond what their CSPRNG already produces.
     fn fill_bytes(&mut self, buffer: &mut [u8]) -> Result<(), SigilError>;
 }
 

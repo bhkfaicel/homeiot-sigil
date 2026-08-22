@@ -7,6 +7,130 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+- Reconcile the host-facing documentation with the shipped code: the README now
+  states that `sensor` is the default feature and describes every supported
+  configuration (`wire`, `sensor`, `gateway`, `sensor,gateway`) together with
+  the exact compile-time diagnostic emitted for an unsupported empty feature
+  set; protocol-version wording is unified on the `0x03` outer header; renew
+  guidance matches the P-256 ephemeral ECDH implementation; French passages are
+  translated to English and broken list formatting repaired; documentation no
+  longer links files removed from the git index (the specs tree) and instead
+  points integrators at this document plus the crate rustdoc. Error guidance
+  references the refined capacity variants, and footprint budgeting stays a
+  generic host responsibility. Documentation-only change.
+
+- Refine the host-visible error taxonomy: new `SigilError` variants distinguish
+  fixed caller-buffer sizing (`OutputBufferTooSmall`), session-table saturation
+  (`SessionTableFull`), pending-handshake-table saturation (`PendingTableFull`),
+  gateway admission/cooldown-table saturation (`AdmissionTableFull`), malformed
+  wire input (`MalformedFrame`), session-role mismatches (`WrongRole { peer }`),
+  and internally unrepresentable states (`InvariantViolation`). Every variant
+  documents exactly one deterministic host policy category — reject input, fix
+  integration, back off / reclaim capacity, or report invariant failure — and an
+  exhaustive test pins every variant to its documented category while keeping
+  `Display` output free of key material, MAC tags, PSKs, and shared secrets. The
+  former coarse capacity/parsing/handshake-state variants are removed outright
+  instead of being retained as deprecated aliases: a conscious breaking change
+  approved by the crate owner before any production use of this crate, with
+  version-bump discipline left to the owner's choice at release time. Hosts that
+  match exhaustively on `SigilError` must drop the removed arms.
+  `InvalidStep { peer }` stays the canonical transition-mismatch error. No
+  payload, `Display`, or wire behavior changed beyond the variant set itself.
+
+- Split the internal packet pipeline into cohesive semantic handlers: Data
+  plus the shared authenticated egress AEAD primitive live in a data module,
+  the Event/EventAck durable-delivery transaction in an event module, and
+  TimeSync/TimeSyncRequest handling with its per-session request cooldown in
+  a timesync module. The single authenticated, replay-checked ingress
+  primitive keeps session lookup, direction checks, expiry, AEAD open, RX
+  counter advance, and commit release in one place; handlers receive only
+  already-authenticated context. Every counter/state mutation point is
+  documented, and isolated handler-level tests now cover the Event delivery
+  transitions and the TimeSync cooldown independently of full radio
+  scenarios. Internal refactor only: no wire format or public API change.
+- Refactor the internal pending-handshake representation into a tagged
+  `PendingState` enum whose twelve role-gated variants (install, renew, and
+  resume across sensor and gateway roles) carry only the fields valid for that
+  phase, role, and step, replacing the former independent phase/role/step
+  product. Handshake transitions are now checked against the tagged state,
+  commit-criticality and cached-retransmission capability are derived in one
+  place, and secret-bearing stashes keep their zeroizing types. The
+  gateway-exclusive P-256 context stash is compiled only for gateway builds,
+  keeping sensor-only builds free of dead code. Internal refactor only: no
+  wire format or public API change.
+- Repair the baseline quality gates: `scripts/test.sh` now delegates the test
+  matrix to the authoritative `scripts/test-feature-matrix.sh` gate (approved
+  empty-feature diagnostic plus `wire`, `sensor`, `gateway`, `sensor,gateway`,
+  and all-features locked suites) and its remaining cargo invocations are
+  locked; CI format and lint steps run the same locked commands as local
+  validation.
+- Fix the pre-existing import-order formatting drift in `src/core/mod.rs` so
+  `cargo fmt --all -- --check` passes again without unrelated reformatting.
+- Pin `lychee` 0.24.2 as the offline markdown link checker for local and CI
+  use, installed with `cargo install --locked --version 0.24.2 lychee` and
+  provisioned identically in the CI workflow.
+- Add library-owned `size_of` regression bounds for `Session`,
+  `PendingHandshake`, `SessionManager<2>`, `SessionManager<128>`,
+  `SigilEvent<200, 256>`, and `SigilAction<256>`, with per-feature-configuration
+  measured sizes and documented crate-owner approval path for raising a bound.
+- Document the generic footprint contract at crate level: final flash, static
+  RAM, and stack budgeting is the host firmware's responsibility on its final
+  linked image; the library bounds are planning inputs only.
+- Reject the empty feature configuration at compile time with an explicit
+  diagnostic directing integrators to `wire`, `sensor`, or `gateway`.
+- Fix the wire-only test target: shared session test support no longer
+  compiles without the `session` feature, so the manufacturing (factory
+  certificate) tests run again under `cargo test --no-default-features
+  --features wire`.
+- Document the supported feature matrix (`wire`, `sensor`, `gateway`, and the
+  explicit `sensor,gateway` composition) and add
+  `scripts/test-feature-matrix.sh` as the authoritative locked feature-matrix
+  gate covering every supported configuration and asserting the approved
+  empty-feature diagnostic.
+- Protect enrollment PSKs with a redacted, zeroizing `ResumePskSecret`; actions
+  and decrypted events no longer derive `Clone`, and event debug output redacts
+  payload/frame bytes.
+- Validate restored enrollment material and factory-root key encodings at API
+  boundaries. `Session::new_enrolled` and `SessionManager::new` now return
+  `Result`; enrolled shells no longer accept or retain a meaningless expiry.
+- Make `sensor` the safe, smallest default role, declare Rust 1.85 as the MSRV,
+  and execute role-specific protocol smoke tests in each mono-role
+  configuration.
+- Extract the session manager's inline storage into crate-private, cohesive
+  components: a session table keyed by remote peer MAC, an independent pending
+  table for in-progress handshakes and post-commit loss recovery, and a
+  gateway-only per-peer install-cooldown table. The manager facade now lends a
+  narrow multi-store view to the encrypted pipeline and the install, renew,
+  and resume handshake implementations, so protocol code mutates only the
+  storage capabilities it needs instead of reaching into manager internals.
+  Facade helpers left without production callers by this migration moved
+  behind test-only compilation gates, and new store-level saturation tests pin
+  each capacity domain as an independently observable signal: known-peer
+  replacement versus unknown-peer rejection in the session table, duplicate
+  pending versus pending saturation, and time-healed admission cooldowns. No
+  public API or wire change; type-size bounds are unchanged. Gateway builds explicitly disable defaults.
+
+### Architecture hardening
+
+- Test the `sensor` and `gateway` production feature sets independently and
+  compile the sensor feature for `thumbv6m-none-eabi` in the standard test script.
+- Centralize encrypted-frame identity, type, nonce-prefix, replay and AEAD
+  verification in one internal fail-closed path.
+- Add observable, bounded post-commit recovery with `pending_len`,
+  `pending_peers`, `commit_recovery_peers` and `abandon_commit_recovery`.
+- Stop exporting active AEAD keys/nonces from `Session`; enrollment material is
+  delivered only through `PersistPeerStaticKey`.
+- Reject null provider ECDH results consistently across Install, Renew and
+  Resume, and strengthen the static-ECDH provider contract for malformed keys.
+- Make `Session` peer identity and factory-attested static key immutable through
+  public getters so mutable manager access cannot corrupt the lookup invariant.
+- Zeroize every temporary HKDF output used to construct Resume challenge MACs.
+- Vendor security-sensitive Forgejo workflows locally, pin `actions/checkout`
+  to an immutable revision, and enable `cargo deny`; the remaining external
+  branch-flow validator is immutable and receives no secret.
+- Clarify that protocol/radio waits are non-blocking while secure-element calls
+  are synchronous and occupy the calling task.
+
 ### Time synchronization request
 
 - Add authenticated sensor→gateway `TimeSyncRequest` (`0x33`) and the

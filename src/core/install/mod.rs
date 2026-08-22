@@ -27,14 +27,15 @@
 //!
 //! **Gateway hosts must also enforce a global handshake admission policy**
 //!: library install/resume cooldowns are per-peer only, and the
-//! `pending` table can fill independently of `sessions`. See
-//! `contracts/session-api.md` and CLAUDE.md.
+//! `pending` table can fill independently of `sessions`. This guidance is
+//! restated in the repository README and in the `SessionManager` type-level
+//! docs.
 //!
 //! # Factory attestation
 //!
 //! Before accepting a peer identity, both sides verify that the peer's static
 //! public key **and wire PeerId** were signed by the shared factory root stored
-//! on [`SessionManager`](crate::core::manager::SessionManager) at construction.
+//! on [`SessionManager`] at construction.
 //! Canonical message: [`factory_cert_message`] —
 //! `version ‖ product_id ‖ hardware_profile_id ‖ factory_key_id ‖ peer_mac ‖
 //! pubkey`. The signature travels on the wire
@@ -97,7 +98,6 @@ use crate::core::event::SigilAction;
 use crate::core::install::sensor::build_install_request_action;
 use crate::core::install::wire::{CompressedPub, INSTALL_NONCE_SIZE};
 use crate::core::manager::SessionManager;
-use crate::core::pending::HandshakeRole;
 #[cfg(feature = "sensor")]
 use crate::core::pending::PendingHandshake;
 use crate::core::session::PeerId;
@@ -164,19 +164,20 @@ pub fn factory_cert_message(
     peer_mac: &PeerId,
     pubkey: &CompressedPub,
 ) -> Result<heapless::Vec<u8, FACTORY_CERT_MSG_LEN>, SigilError> {
+    crate::core::session::validate_static_public_key_encoding(pubkey)?;
     let mut msg = heapless::Vec::<u8, FACTORY_CERT_MSG_LEN>::new();
     msg.push(FACTORY_CERT_VERSION)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(&product_id.to_be_bytes())
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.push(metadata.hardware_profile_id)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.push(metadata.factory_key_id)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(peer_mac)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(pubkey)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(msg)
 }
 
@@ -197,17 +198,17 @@ pub(crate) fn install_request_sign_message(
 ) -> Result<heapless::Vec<u8, INSTALL_REQUEST_SIGN_LEN>, SigilError> {
     let mut msg = heapless::Vec::<u8, INSTALL_REQUEST_SIGN_LEN>::new();
     msg.extend_from_slice(INSTALL_REQUEST_SIGN_DOMAIN)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(peer_mac)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.push(metadata.hardware_profile_id)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.push(metadata.factory_key_id)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(pubkey)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(sensor_nonce)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(msg)
 }
 
@@ -225,23 +226,23 @@ pub(crate) fn install_challenge_sign_message(
 ) -> Result<heapless::Vec<u8, 160>, SigilError> {
     let mut msg = heapless::Vec::<u8, 160>::new();
     msg.extend_from_slice(b"sigil-install-challenge-v3")
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(sensor_mac)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(sensor_nonce)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(peer_mac)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.push(metadata.hardware_profile_id)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.push(metadata.factory_key_id)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(pubkey)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(gateway_nonce)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     msg.extend_from_slice(&key_lifetime_secs.to_be_bytes())
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(msg)
 }
 
@@ -263,7 +264,7 @@ pub(crate) fn install_confirm_sign_message(
         &key_lifetime_secs.to_be_bytes(),
     ] {
         msg.extend_from_slice(part)
-            .map_err(|_| SigilError::CapacityExceeded)?;
+            .map_err(|_| SigilError::OutputBufferTooSmall)?;
     }
     Ok(msg)
 }
@@ -284,11 +285,11 @@ pub(crate) fn install_hkdf_info(
 ) -> Result<heapless::Vec<u8, 64>, SigilError> {
     let mut info = heapless::Vec::<u8, 64>::new();
     info.extend_from_slice(b"sigil-install")
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(sensor_nonce)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     info.extend_from_slice(gateway_nonce)
-        .map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(info)
 }
 
@@ -309,26 +310,30 @@ pub(crate) fn start_install_sensor_internal<const N: usize, const MSG: usize>(
     rng: &mut impl RandomSource,
     now: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    if manager.get_pending(&peer).is_some() {
+    // Lend the storage capabilities once: every pending / identity access
+    // below goes through the narrow store view instead of manager internals.
+    // Field mutation flows through the view's own `&mut` store references.
+    let stores = manager.protocol_stores();
+
+    if stores.pending.get(&peer).is_some() {
         return Err(SigilError::PendingAlreadyExists { peer });
     }
-    if !manager.pending_slot_available(&peer) {
-        return Err(SigilError::CapacityExceeded);
+    if !stores.pending.slot_available(&peer) {
+        return Err(SigilError::PendingTableFull);
     }
 
-    let local = *manager.local_mac();
+    let local = *stores.local_mac;
     // Build the signed request first — may fail on SE/RNG before we commit state.
     let (payload, sensor_nonce) = build_install_request_action::<MSG>(local, se, rng)?;
 
     // Explicit reboot recovery: retain the previous staged Commit state until
     // the replacement request has been completely constructed.
-    manager.clear_sensor_install_commit_recovery();
+    stores.pending.clear_sensor_install_commit_recovery();
 
-    let mut handshake =
-        PendingHandshake::new_install(peer, HandshakeRole::Sensor, INSTALL_TIMEOUT_MS, now);
-    // Stash sensor_nonce so the challenge step can mix it into HKDF.
-    handshake.transcript_initiator_nonce = Some(sensor_nonce);
-    manager.insert_pending(peer, handshake)?;
+    // The tagged sensor state stashes sensor_nonce for the challenge-step HKDF.
+    let handshake =
+        PendingHandshake::new_install_sensor(peer, sensor_nonce, INSTALL_TIMEOUT_MS, now);
+    stores.pending.insert(peer, handshake)?;
 
     Ok(SigilAction::Transmit {
         dest: peer,
@@ -349,7 +354,8 @@ pub(crate) fn handle_install_request_internal<const N: usize, const MSG: usize>(
     now: u32,
     key_lifetime_secs: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    gateway::handle_install_request(manager, packet, se, rng, now, key_lifetime_secs)
+    let mut stores = manager.protocol_stores();
+    gateway::handle_install_request(&mut stores, packet, se, rng, now, key_lifetime_secs)
 }
 
 /// Internal implementation of [`SessionManager::continue_install`].
@@ -374,22 +380,48 @@ pub(crate) fn continue_install_internal<const N: usize, const MSG: usize>(
 ) -> Result<SigilAction<MSG>, SigilError> {
     use crate::core::frame::OUTER_HEADER_SIZE;
     use crate::core::install::wire::parse_install_message_type;
-    use crate::core::pending::HandshakeStep;
-    let msg_type = parse_install_message_type(packet).ok_or(SigilError::ParseError)?;
+    use crate::core::pending::PendingState;
+
+    /// Dispatch decision derived from the tagged pending state plus the
+    /// incoming message type. Kept as a local Copy enum so the immutable
+    /// pending borrow ends before the handlers take `&mut manager`.
+    enum InstallDispatch {
+        /// Sensor: challenge arrived while awaiting it → verify + stage Final.
+        #[cfg(feature = "sensor")]
+        SensorChallenge,
+        /// Sensor: CommitConfirmed arrived after Final → commit session.
+        #[cfg(feature = "sensor")]
+        SensorCommitConfirmed,
+        /// Sensor: duplicate challenge after Final → retransmit cached Final.
+        #[cfg(feature = "sensor")]
+        SensorRetransmitFinal,
+        /// Gateway: Confirm (or duplicate Confirm while CommitSent) → commit
+        /// or retransmit cached CommitConfirmed.
+        #[cfg(feature = "gateway")]
+        GatewayConfirm,
+        /// No (state, message) pair matches: fail closed.
+        Invalid,
+    }
+
+    // Lend the storage capabilities once: the dispatch peek, the rebind /
+    // rollback helpers and the role handlers all work on this narrow view.
+    let mut stores = manager.protocol_stores();
+
+    let msg_type = parse_install_message_type(packet).ok_or(SigilError::MalformedFrame)?;
 
     // CommitConfirmed is AEAD — peer is only in the outer header (no body MAC).
     let peer = if matches!(msg_type, wire::InstallMessageType::CommitConfirmed) {
         if packet.len() < OUTER_HEADER_SIZE {
-            return Err(SigilError::ParseError);
+            return Err(SigilError::MalformedFrame);
         }
         let mut peer = [0u8; 17];
         peer.copy_from_slice(&packet[..17]);
         peer
     } else {
         // Peek the peer from the body (bytes OUTER_HEADER_SIZE..OUTER_HEADER_SIZE+17
-        // for install clear-text messages, after the 19-byte wire-v2 outer header).
+        // for install clear-text messages, after the 19-byte outer header).
         if packet.len() < OUTER_HEADER_SIZE + 17 {
-            return Err(SigilError::ParseError);
+            return Err(SigilError::MalformedFrame);
         }
         let mut peer = [0u8; 17];
         peer.copy_from_slice(&packet[OUTER_HEADER_SIZE..OUTER_HEADER_SIZE + 17]);
@@ -400,7 +432,7 @@ pub(crate) fn continue_install_internal<const N: usize, const MSG: usize>(
     if matches!(msg_type, wire::InstallMessageType::Challenge)
         && !crate::core::install::outer_peer_matches_body(packet, &peer)
     {
-        return Err(SigilError::ParseError);
+        return Err(SigilError::MalformedFrame);
     }
 
     // Mandatory discovery: pending may still be keyed by INSTALL_DISCOVERY_DEST
@@ -409,50 +441,78 @@ pub(crate) fn continue_install_internal<const N: usize, const MSG: usize>(
     let mut rebound_from: Option<PeerId> = None;
     #[cfg(feature = "sensor")]
     if matches!(msg_type, wire::InstallMessageType::Challenge)
-        && manager.get_pending(&peer).is_none()
+        && stores.pending.get(&peer).is_none()
     {
-        rebound_from = manager.rebind_sole_sensor_install_pending(peer)?;
+        rebound_from = stores.pending.rebind_sole_sensor_install_pending(peer)?;
     }
 
-    let pending = manager
-        .get_pending(&peer)
-        .ok_or(SigilError::NoPending { peer })?;
-    let role = pending.role;
-    let step = pending.step;
+    // Clone the cached Final out of the tagged sensor recovery state for the
+    // idempotent retransmission arm (sensor builds only). The immutable
+    // pending borrow ends right after the clone.
     #[cfg(feature = "sensor")]
-    let cached_retx = if step == HandshakeStep::InstallWaitingForCommitConfirmed
-        && matches!(msg_type, wire::InstallMessageType::Challenge)
-    {
-        pending.cached_wire.clone()
-    } else {
-        None
+    let cached_retx = match (
+        stores
+            .pending
+            .get(&peer)
+            .ok_or(SigilError::NoPending { peer })?
+            .state(),
+        msg_type,
+    ) {
+        (
+            PendingState::InstallSensorFinalSent { cached, .. },
+            wire::InstallMessageType::Challenge,
+        ) => Some(cached.clone()),
+        _ => None,
     };
-    // drop(pending) is a no-op on a reference; role/step already copied.
 
-    let result = match (role, step, msg_type) {
+    // Classify from the tagged state while the pending borrow is live; the
+    // dispatch enum releases the borrow before handlers take `&mut stores`.
+    let dispatch = {
+        let pending = stores
+            .pending
+            .get(&peer)
+            .ok_or(SigilError::NoPending { peer })?;
+        match (pending.state(), msg_type) {
+            #[cfg(feature = "sensor")]
+            (
+                PendingState::InstallSensorAwaitChallenge { .. },
+                wire::InstallMessageType::Challenge,
+            ) => InstallDispatch::SensorChallenge,
+            #[cfg(feature = "sensor")]
+            (
+                PendingState::InstallSensorFinalSent { .. },
+                wire::InstallMessageType::CommitConfirmed,
+            ) => InstallDispatch::SensorCommitConfirmed,
+            #[cfg(feature = "sensor")]
+            (PendingState::InstallSensorFinalSent { .. }, wire::InstallMessageType::Challenge) => {
+                InstallDispatch::SensorRetransmitFinal
+            }
+            #[cfg(feature = "gateway")]
+            (PendingState::InstallGatewayAwaitConfirm(_), wire::InstallMessageType::Confirm)
+            | (PendingState::InstallGatewayCommitSent { .. }, wire::InstallMessageType::Confirm) => {
+                InstallDispatch::GatewayConfirm
+            }
+            _ => InstallDispatch::Invalid,
+        }
+    };
+
+    let result = match dispatch {
         #[cfg(feature = "sensor")]
-        (
-            HandshakeRole::Sensor,
-            HandshakeStep::InstallWaitingForChallenge,
-            wire::InstallMessageType::Challenge,
-        ) => sensor::handle_install_challenge(manager, &peer, packet, se, now),
+        InstallDispatch::SensorChallenge => {
+            sensor::handle_install_challenge(&mut stores, &peer, packet, se, now)
+        }
         #[cfg(feature = "sensor")]
-        (
-            HandshakeRole::Sensor,
-            HandshakeStep::InstallWaitingForCommitConfirmed,
-            wire::InstallMessageType::CommitConfirmed,
-        ) => sensor::handle_install_commit_confirmed(manager, &peer, packet, now),
+        InstallDispatch::SensorCommitConfirmed => {
+            sensor::handle_install_commit_confirmed(&mut stores, &peer, packet, now)
+        }
         #[cfg(feature = "sensor")]
-        (
-            HandshakeRole::Sensor,
-            HandshakeStep::InstallWaitingForCommitConfirmed,
-            wire::InstallMessageType::Challenge,
-        ) => {
-            let cached = cached_retx.ok_or(SigilError::InvalidHandshakeState)?;
+        InstallDispatch::SensorRetransmitFinal => {
+            // Idempotent Final reTX from the tagged recovery state's cache.
+            let cached = cached_retx.ok_or(SigilError::InvariantViolation)?;
             let mut payload: heapless::Vec<u8, MSG> = heapless::Vec::new();
             payload
                 .extend_from_slice(&cached)
-                .map_err(|_| SigilError::CapacityExceeded)?;
+                .map_err(|_| SigilError::OutputBufferTooSmall)?;
             Ok(SigilAction::Transmit {
                 dest: peer,
                 payload,
@@ -460,17 +520,10 @@ pub(crate) fn continue_install_internal<const N: usize, const MSG: usize>(
             })
         }
         #[cfg(feature = "gateway")]
-        (
-            HandshakeRole::Gateway,
-            HandshakeStep::InstallWaitingForConfirm,
-            wire::InstallMessageType::Confirm,
-        )
-        | (
-            HandshakeRole::Gateway,
-            HandshakeStep::InstallCommitSent,
-            wire::InstallMessageType::Confirm,
-        ) => gateway::handle_install_confirm(manager, packet, se, now),
-        _ => Err(SigilError::InvalidStep { peer }),
+        InstallDispatch::GatewayConfirm => {
+            gateway::handle_install_confirm(&mut stores, packet, se, now)
+        }
+        InstallDispatch::Invalid => Err(SigilError::InvalidStep { peer }),
     };
 
     // If challenge crypto failed after a discovery rebind, restore the
@@ -479,7 +532,7 @@ pub(crate) fn continue_install_internal<const N: usize, const MSG: usize>(
     if result.is_err()
         && let Some(old) = rebound_from
     {
-        let _ = manager.rollback_install_pending_rebind(peer, old);
+        let _ = stores.pending.rollback_install_pending_rebind(peer, old);
     }
 
     result

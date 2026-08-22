@@ -2,6 +2,8 @@
 
 //! Unit tests for install protocol
 
+mod transitions;
+
 use crate::core::error::SigilError;
 use crate::core::event::SigilAction;
 use crate::core::frame::{
@@ -16,7 +18,7 @@ use crate::core::install::wire::{
     parse_install_message_type, parse_install_request,
 };
 use crate::core::manager::SessionManager;
-use crate::core::pending::{HandshakePhase, HandshakeRole, HandshakeStep, PendingHandshake};
+use crate::core::pending::{PendingHandshake, PendingState};
 use crate::core::session::{Session, SessionRole};
 use crate::core::test_support::{MockRandom, MockSecureElement, test_manager};
 use crate::core::traits::SecureElement;
@@ -32,7 +34,8 @@ fn test_factory_cert_canonical_message_includes_metadata() {
         hardware_profile_id: 0xA1,
         factory_key_id: 0xB2,
     };
-    let pubkey = [0xC3u8; 33];
+    let mut pubkey = [0xC3u8; 33];
+    pubkey[0] = 0x03;
     let message = crate::core::install::factory_cert_message(
         crate::core::install::FACTORY_PRODUCT_ID_SENSOR,
         metadata,
@@ -48,6 +51,71 @@ fn test_factory_cert_canonical_message_includes_metadata() {
     assert_eq!(message[4], metadata.factory_key_id);
     assert_eq!(&message[5..22], &PEER);
     assert_eq!(&message[22..55], &pubkey);
+}
+
+#[test]
+fn test_install_gateway_rejects_null_static_ecdh_secret() {
+    let mut sensor: SessionManager<16> =
+        crate::core::test_support::test_manager_with_mac(SENSOR_MAC);
+    let mut gateway: SessionManager<16> = crate::core::test_support::test_manager_with_mac(GW_MAC);
+    let mut se_sensor = MockSecureElement::sensor(1, SENSOR_MAC);
+    let mut se_gateway = MockSecureElement::gateway(2, GW_MAC);
+    se_gateway.return_zero_ecdh();
+    let mut rng_sensor = MockRandom::new();
+    let mut rng_gateway = MockRandom::new();
+
+    let request = match sensor
+        .start_install::<256>(GW_MAC, &mut se_sensor, &mut rng_sensor, 1_000)
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("sensor should transmit"),
+    };
+    assert_eq!(
+        gateway.handle_install_request::<256>(
+            &request,
+            &mut se_gateway,
+            &mut rng_gateway,
+            1_000,
+            86_400,
+        ),
+        Err(SigilError::EcdhFailed)
+    );
+    assert!(gateway.get_pending(&SENSOR_MAC).is_none());
+    assert!(gateway.get(&SENSOR_MAC).is_none());
+}
+
+#[test]
+fn test_install_sensor_rejects_null_static_ecdh_secret() {
+    let mut sensor: SessionManager<16> =
+        crate::core::test_support::test_manager_with_mac(SENSOR_MAC);
+    let mut gateway: SessionManager<16> = crate::core::test_support::test_manager_with_mac(GW_MAC);
+    let mut se_sensor = MockSecureElement::sensor(1, SENSOR_MAC);
+    let mut se_gateway = MockSecureElement::gateway(2, GW_MAC);
+    let mut rng_sensor = MockRandom::new();
+    let mut rng_gateway = MockRandom::new();
+
+    let request = match sensor
+        .start_install::<256>(GW_MAC, &mut se_sensor, &mut rng_sensor, 1_000)
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("sensor should transmit"),
+    };
+    let challenge = match gateway
+        .handle_install_request::<256>(&request, &mut se_gateway, &mut rng_gateway, 1_000, 86_400)
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("gateway should transmit"),
+    };
+
+    se_sensor.return_zero_ecdh();
+    assert_eq!(
+        sensor.continue_install::<256>(&challenge, &mut se_sensor, 1_000),
+        Err(SigilError::EcdhFailed)
+    );
+    assert!(sensor.get(&GW_MAC).is_none());
 }
 
 /// Completes steps 4–5 after the sensor has built InstallConfirm.
@@ -238,12 +306,13 @@ fn test_start_install_sensor() {
     }
 
     // Pending handshake must exist and be at the waiting-for-challenge step.
-    // sensor_nonce must be stashed for HKDF at the challenge step.
+    // The tagged variant itself carries the stashed sensor_nonce (for HKDF at
+    // the challenge step), so matching it covers both the step and the nonce.
     let pending = manager.get_pending(&PEER).unwrap();
-    assert_eq!(pending.phase, HandshakePhase::Install);
-    assert_eq!(pending.role, HandshakeRole::Sensor);
-    assert_eq!(pending.step, HandshakeStep::InstallWaitingForChallenge);
-    assert!(pending.transcript_initiator_nonce.is_some());
+    assert!(matches!(
+        pending.state(),
+        PendingState::InstallSensorAwaitChallenge { .. }
+    ));
 }
 
 #[test]
@@ -277,8 +346,10 @@ fn test_rebind_sole_sensor_install_pending_for_broadcast_discovery() {
     assert!(manager.get_pending(&INSTALL_DISCOVERY_DEST).is_none());
     let pending = manager.get_pending(&PEER).unwrap();
     assert_eq!(pending.peer_mac, PEER);
-    assert_eq!(pending.step, HandshakeStep::InstallWaitingForChallenge);
-    assert!(pending.transcript_initiator_nonce.is_some());
+    assert!(matches!(
+        pending.state(),
+        PendingState::InstallSensorAwaitChallenge { .. }
+    ));
 }
 
 #[test]
@@ -298,13 +369,14 @@ fn test_rebind_noop_when_pending_already_at_gateway() {
 #[test]
 fn test_rebind_rejects_multiple_waiting_sensor_pendings() {
     let mut manager: SessionManager<16> = test_manager();
-    // Two WaitingForChallenge sensor entries (artificially).
+    // Two WaitingForChallenge sensor entries (artificially). The nonce bytes
+    // are irrelevant here; only the tagged await-challenge state matters.
     manager
         .insert_pending(
             INSTALL_DISCOVERY_DEST,
-            PendingHandshake::new_install(
+            PendingHandshake::new_install_sensor(
                 INSTALL_DISCOVERY_DEST,
-                HandshakeRole::Sensor,
+                [0x11u8; 16],
                 INSTALL_TIMEOUT_MS,
                 1_000,
             ),
@@ -313,9 +385,9 @@ fn test_rebind_rejects_multiple_waiting_sensor_pendings() {
     manager
         .insert_pending(
             [0xEEu8; 17],
-            PendingHandshake::new_install(
+            PendingHandshake::new_install_sensor(
                 [0xEEu8; 17],
-                HandshakeRole::Sensor,
+                [0x22u8; 16],
                 INSTALL_TIMEOUT_MS,
                 1_000,
             ),
@@ -323,7 +395,9 @@ fn test_rebind_rejects_multiple_waiting_sensor_pendings() {
         .unwrap();
     assert_eq!(
         manager.rebind_sole_sensor_install_pending(PEER),
-        Err(SigilError::InvalidHandshakeState)
+        // A rebind targeting a non-waiting pending state is unrepresentable
+        // through the tagged pending API: internal invariant failure.
+        Err(SigilError::InvariantViolation)
     );
 }
 
@@ -362,7 +436,11 @@ fn test_discovery_failed_challenge_rolls_back_pending_key() {
         gateway_peer_mac: attacker,
         hardware_profile_id: 1,
         factory_key_id: 1,
-        gateway_static_pubkey: [0xAAu8; 33],
+        gateway_static_pubkey: {
+            let mut key = [0xAAu8; 33];
+            key[0] = 0x02;
+            key
+        },
         factory_cert_sig: [0u8; 64], // invalid vs factory root
         gateway_nonce: [1u8; 16],
         key_lifetime_secs: 86_400,
@@ -373,7 +451,7 @@ fn test_discovery_failed_challenge_rolls_back_pending_key() {
     let result = sensor.continue_install::<256>(&forged_bytes, &mut se, 1000);
     assert!(matches!(
         result,
-        Err(SigilError::VerificationFailed) | Err(SigilError::ParseError)
+        Err(SigilError::VerificationFailed) | Err(SigilError::MalformedFrame)
     ));
     // Pending must be back under discovery dest, not attacker MAC.
     assert!(sensor.get_pending(&attacker).is_none());
@@ -406,7 +484,8 @@ fn test_discovery_challenge_outer_body_mismatch_does_not_rebind() {
 
     assert_eq!(
         sensor.continue_install::<256>(&packet, &mut se, 1000),
-        Err(SigilError::ParseError)
+        // Outer/body identity mismatch is malformed wire input; no rebind.
+        Err(SigilError::MalformedFrame)
     );
     assert!(sensor.get_pending(&INSTALL_DISCOVERY_DEST).is_some());
     assert!(sensor.get_pending(&GW_MAC).is_none());
@@ -449,14 +528,13 @@ fn test_install_pairwise_success() {
     // Gateway must have created a pending handshake at WaitingForConfirm
     // and stashed the gateway challenge nonce for confirm verification.
     let gw_pending = gateway.get_pending(&SENSOR_MAC).unwrap();
-    assert_eq!(gw_pending.step, HandshakeStep::InstallWaitingForConfirm);
-    assert!(gw_pending.transcript_challenge_nonce.is_some());
+    let stashed_nonce = match gw_pending.state() {
+        PendingState::InstallGatewayAwaitConfirm(staged) => *staged.gateway_nonce.as_array(),
+        _ => panic!("gateway pending must be awaiting the sensor Final"),
+    };
     // The stashed nonce must equal the nonce carried in the challenge body.
     let chal = parse_install_challenge(&challenge_bytes).unwrap();
-    assert_eq!(
-        gw_pending.transcript_challenge_nonce.unwrap(),
-        chal.gateway_nonce
-    );
+    assert_eq!(stashed_nonce, chal.gateway_nonce);
 
     // Step 3: sensor processes challenge → emits Final + stages keys (no session yet).
     let cfm_action = sensor
@@ -473,10 +551,10 @@ fn test_install_pairwise_success() {
 
     // Sensor has no session until CommitConfirmed.
     assert!(sensor.get(&GW_MAC).is_none());
-    assert_eq!(
-        sensor.get_pending(&GW_MAC).unwrap().step,
-        HandshakeStep::InstallWaitingForCommitConfirmed
-    );
+    assert!(matches!(
+        sensor.get_pending(&GW_MAC).unwrap().state(),
+        PendingState::InstallSensorFinalSent { .. }
+    ));
 
     // Step 4: gateway processes Final → commits + Persist with CommitConfirmed TX.
     let confirm_bytes = match cfm_action {
@@ -495,9 +573,10 @@ fn test_install_pairwise_success() {
             wait_timeout_ms,
         } => {
             assert_eq!(peer, SENSOR_MAC);
-            assert_eq!(pubkey, [1u8; 33]);
+            assert_eq!(pubkey[0], 0x03);
+            assert!(pubkey[1..].iter().all(|byte| *byte == 1));
             assert_eq!(
-                Some(resume_psk),
+                Some(*resume_psk.expose_secret()),
                 gateway.get(&SENSOR_MAC).unwrap().resume_psk().copied()
             );
             assert!(!transmit.is_empty());
@@ -510,10 +589,10 @@ fn test_install_pairwise_success() {
         }
         _ => panic!("gateway should emit PersistPeerStaticKey with CommitConfirmed"),
     };
-    assert_eq!(
-        gateway.get_pending(&SENSOR_MAC).unwrap().step,
-        HandshakeStep::InstallCommitSent
-    );
+    assert!(matches!(
+        gateway.get_pending(&SENSOR_MAC).unwrap().state(),
+        PendingState::InstallGatewayCommitSent { .. }
+    ));
 
     // Step 5: sensor CommitConfirmed → insert session + Persist.
     let sensor_persist = sensor
@@ -531,7 +610,7 @@ fn test_install_pairwise_success() {
             assert_eq!(pubkey, [2u8; 33]); // gateway mock pubkey
             assert!(transmit.is_empty());
             assert_eq!(
-                Some(resume_psk),
+                Some(*resume_psk.expose_secret()),
                 sensor.get(&GW_MAC).unwrap().resume_psk().copied()
             );
         }
@@ -826,12 +905,33 @@ fn test_cancel_clears_pending() {
 
 #[test]
 fn test_cancel_zeroizes_ephemeral_secret() {
-    // Directly exercise the PendingHandshake zeroize path used by cancel.
-    let mut hs = PendingHandshake::new_renew(PEER, HandshakeRole::Sensor, [0xABu8; 32], 1000, 0);
-    assert_eq!(hs.eph_scalar(), Some(&[0xABu8; 32]));
-    hs.zeroize_secrets();
-    assert!(hs.eph_scalar().is_none());
-    assert!(hs.secrets.is_none());
+    // Cancel/removal drops the typed pending variant; its zeroizing wrappers
+    // (P256ContextStash and friends) wipe the ephemeral material on Drop.
+    // There is no manual `zeroize_secrets` step anymore: the observable
+    // contract is that the secret-bearing variant exists while staged and is
+    // gone once the host cancels the pending entry.
+    let mut manager: SessionManager<2> = crate::core::test_support::test_manager();
+    let hs = PendingHandshake::new_renew_gateway_await_confirm(
+        PEER,
+        [0xABu8; 32],
+        [0x02u8; 33],
+        86_400,
+        1_000,
+        0,
+    );
+    // The provider context is observable only in the secret-bearing variant.
+    match hs.state() {
+        PendingState::RenewGatewayAwaitConfirm { p256_context, .. } => {
+            assert_eq!(p256_context.as_array(), &[0xABu8; 32]);
+        }
+        _ => panic!("expected RenewGatewayAwaitConfirm with a staged provider context"),
+    }
+    manager.insert_pending(PEER, hs).unwrap();
+
+    // Host aborts via the public cancel path: the variant and its secret are
+    // dropped (zeroized by the wrapper Drop impls).
+    manager.cancel_pending(&PEER).unwrap();
+    assert!(manager.get_pending(&PEER).is_none());
 }
 
 #[test]
@@ -1152,7 +1252,12 @@ fn test_install_rejects_outer_body_mac_mismatch() {
         1000,
         86_400,
     );
-    assert_eq!(result, Err(SigilError::ParseError));
+    assert_eq!(
+        result,
+        // Outer-header MAC contradicting the authenticated body MAC is
+        // malformed wire input.
+        Err(SigilError::MalformedFrame)
+    );
     assert!(gateway.get_pending(&SENSOR_MAC).is_none());
 }
 
@@ -1233,7 +1338,7 @@ fn test_install_rejects_key_expire_at_over_max_lifetime() {
 #[test]
 fn test_session_require_key_material_when_incomplete() {
     // A4: enrolled session without key → SessionNotActive, not panic.
-    let session = Session::new_enrolled(PEER, [1u8; 33], RESUME_PSK, 1000, SessionRole::Sensor);
+    let session = Session::new_enrolled(PEER, [2u8; 33], RESUME_PSK, SessionRole::Sensor).unwrap();
     let err = session.require_key_material(&PEER).unwrap_err();
     assert_eq!(err, SigilError::SessionNotActive { peer: PEER });
 }
@@ -1364,6 +1469,43 @@ fn test_factory_cert_binds_peer_mac() {
     };
     let admitted = gateway
         .handle_install_request::<256>(&valid, &mut se_gw, &mut rng_gw, 1000, 86_400)
+        .unwrap();
+    assert!(matches!(admitted, SigilAction::Transmit { .. }));
+}
+
+#[test]
+fn test_invalid_device_signature_does_not_poison_install_cooldown() {
+    // The factory certificate is public and valid, but possession of the
+    // certified device key is proved only by the dynamic request signature.
+    // Rejecting that proof must not consume the legitimate peer's cooldown.
+    let mut sensor: SessionManager<16> =
+        crate::core::test_support::test_manager_with_mac(SENSOR_MAC);
+    let mut gateway: SessionManager<16> = crate::core::test_support::test_manager_with_mac(GW_MAC);
+    let mut se_sensor = MockSecureElement::sensor(1, SENSOR_MAC);
+    let mut se_gw = MockSecureElement::gateway(2, GW_MAC);
+    let mut rng_sensor = MockRandom::new();
+    let mut rng_gw = MockRandom::new();
+
+    let valid = match sensor
+        .start_install::<256>(GW_MAC, &mut se_sensor, &mut rng_sensor, 1_000)
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("sensor should transmit"),
+    };
+    let mut forged = valid.clone();
+    *forged
+        .last_mut()
+        .expect("InstallRequest contains a device signature") ^= 0x01;
+
+    let rejected =
+        gateway.handle_install_request::<256>(&forged, &mut se_gw, &mut rng_gw, 1_000, 86_400);
+    assert_eq!(rejected, Err(SigilError::VerificationFailed));
+    assert!(gateway.get_pending(&SENSOR_MAC).is_none());
+
+    // The authentic request at the exact same timestamp must still be admitted.
+    let admitted = gateway
+        .handle_install_request::<256>(&valid, &mut se_gw, &mut rng_gw, 1_000, 86_400)
         .unwrap();
     assert!(matches!(admitted, SigilAction::Transmit { .. }));
 }
@@ -1538,26 +1680,16 @@ fn test_install_commit_capacity_failure_preserves_recovery_state() {
     };
 
     sensor
-        .insert(Session::new_enrolled(
-            OTHER,
-            [2; 33],
-            RESUME_PSK,
-            0,
-            SessionRole::Sensor,
-        ))
+        .insert(Session::new_enrolled(OTHER, [2; 33], RESUME_PSK, SessionRole::Sensor).unwrap())
         .unwrap();
     sensor
-        .insert(Session::new_enrolled(
-            OTHER_2,
-            [3; 33],
-            [4; 32],
-            0,
-            SessionRole::Sensor,
-        ))
+        .insert(Session::new_enrolled(OTHER_2, [3; 33], [4; 32], SessionRole::Sensor).unwrap())
         .unwrap();
     assert_eq!(
         sensor.continue_install::<256>(&commit, &mut se_s, 1000),
-        Err(SigilError::CapacityExceeded)
+        // The established-session table is saturated: a session-domain
+        // capacity error, distinct from pending/admission saturation.
+        Err(SigilError::SessionTableFull)
     );
     assert!(sensor.get_pending(&GW_MAC).is_some());
 
@@ -1602,10 +1734,10 @@ fn test_fresh_install_recovers_gateway_from_install_commit_sent() {
     gateway
         .continue_install::<256>(&confirm, &mut se_g, 1_000)
         .unwrap();
-    assert_eq!(
-        gateway.get_pending(&SENSOR_MAC).unwrap().step,
-        crate::core::pending::HandshakeStep::InstallCommitSent
-    );
+    assert!(matches!(
+        gateway.get_pending(&SENSOR_MAC).unwrap().state(),
+        PendingState::InstallGatewayCommitSent { .. }
+    ));
 
     // Simulate a sensor reboot before it received CommitConfirmed. Its fresh
     // factory-authenticated install request must replace stale gateway state.
@@ -1622,8 +1754,8 @@ fn test_fresh_install_recovers_gateway_from_install_commit_sent() {
     gateway
         .handle_install_request::<256>(&retry, &mut se_g, &mut rng_g, 1_015, 86_400)
         .unwrap();
-    assert_eq!(
-        gateway.get_pending(&SENSOR_MAC).unwrap().step,
-        crate::core::pending::HandshakeStep::InstallWaitingForConfirm
-    );
+    assert!(matches!(
+        gateway.get_pending(&SENSOR_MAC).unwrap().state(),
+        PendingState::InstallGatewayAwaitConfirm(_)
+    ));
 }

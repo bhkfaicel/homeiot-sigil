@@ -1,274 +1,205 @@
-//! Gateway-side renew implementation
-//!
-//! Implements the gateway steps of the renew handshake (4-message).
-//! The gateway only **responds** — there is no `start_renew` on the gateway side.
-//!
-//! Outer headers carry **local_mac** (gateway). HKDF binds the **sensor** MAC
-//! (`peer` session key). Ephemeral scalars are zeroized after ECDH.
-//!
-//! Decrypt uses RX (sensor→gateway half); challenge encrypt uses TX
-//! (gateway→sensor half). The ack (Final) is decrypted under the **new** s2g
-//! half; CommitConfirmed is encrypted under the **new** g2s half.
-//!
-//! # TX counter ordering
-//!
-//! The challenge is encrypted and pending inserted **before** advancing
-//! `tx_counter`, so a capacity failure does not burn a nonce without emitting
-//! a challenge.
-//!
-//! # Commit
-//!
-//! On valid Final (`RenewAck`) the gateway commits (`update_key`), builds
-//! `RenewCommitConfirmed`, caches it, and keeps pending at `RenewCommitSent`
-//! for idempotent reTX of a duplicate ack.
+//! Gateway side of Renew P-256.
 
 use crate::core::aead;
 use crate::core::derive::derive_directional_session_keys;
-use crate::core::ecdh_soft::{
-    ecdh_from_scalar, generate_ephemeral_scalar, pubkey_from_scalar, zeroize_secret,
-};
 use crate::core::error::SigilError;
 use crate::core::event::SigilAction;
-use crate::core::manager::SessionManager;
-use crate::core::pending::{HandshakeStep, PendingHandshake};
+use crate::core::frame::FrameType;
+use crate::core::manager::ProtocolStores;
+use crate::core::pending::{PendingHandshake, PendingState};
 use crate::core::renew::RENEW_TIMEOUT_MS;
 use crate::core::renew::wire::{
-    build_renew_challenge_body, parse_renew_ack_body, parse_renew_request_body,
+    build_renew_challenge_body, parse_renew_confirm_body, parse_renew_request_body,
 };
 use crate::core::session::{PeerId, SessionRole};
-use crate::core::traits::RandomSource;
+use crate::core::traits::{RandomSource, SecureElement};
+use subtle::ConstantTimeEq;
 
-/// Handles a renew request frame on the gateway side.
-/// Decrypts the request, runs ECDH, derives directional keys (stored in pending),
-/// and returns the encrypted `RenewChallenge` frame.
+/// Authenticates an empty request under the old key, asks the host backend for
+/// a P-256 keypair and returns the Challenge under the old key.
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
 pub(crate) fn handle_renew_request<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+    stores: &mut ProtocolStores<'_, N>,
     peer: &PeerId,
     frame: &[u8],
+    se: &mut impl SecureElement,
     rng: &mut impl RandomSource,
     now: u32,
     key_lifetime_secs: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    use crate::core::frame::{
-        FRAME_TYPE_OFFSET, FrameType, OUTER_HEADER_SIZE, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET,
-    };
-
- // reject past / over-long expiries before decrypt / ECDH.
-
     crate::core::session::validate_key_lifetime(key_lifetime_secs)?;
+    if stores.pending.get(peer).is_some() {
+        return Err(SigilError::PendingAlreadyExists { peer: *peer });
+    }
+    if !stores.pending.slot_available(peer) {
+        return Err(SigilError::PendingTableFull);
+    }
 
-    let (sensor_eph_pub, old_tx_key, old_tx_prefix, challenge_counter, new_rx) = {
-        let session = manager
-.get_mut(peer)
-.ok_or(SigilError::UnknownSession { peer: *peer })?;
-
-        // Inbound renew is a gateway-only operation. Reject a
-        // misconfigured sensor manager before decrypting or advancing counters.
+    let (old_tx_key, old_tx_prefix, challenge_counter, new_rx) = {
+        let session = stores
+            .sessions
+            .get_mut(peer)
+            .ok_or(SigilError::UnknownSession { peer: *peer })?;
         if session.role() != SessionRole::Gateway {
-            return Err(SigilError::InvalidStep { peer: *peer });
+            return Err(SigilError::WrongRole { peer: *peer });
         }
-
         if !session.is_active(now) {
             return Err(SigilError::SessionExpired { peer: *peer });
         }
-
-        if frame.len() < OUTER_HEADER_SIZE + 4 + 8 + aead::TAG_SIZE {
-            return Err(SigilError::ParseError);
+        let (rx_key, rx_prefix) = session.require_rx_material(peer)?;
+        let opened = aead::open_frame::<{ aead::HANDSHAKE_PLAINTEXT_CAP }>(
+            peer,
+            FrameType::RenewRequest,
+            frame,
+            rx_key,
+            rx_prefix,
+            aead::RxCounterPolicy::Window {
+                current: session.rx_counter,
+            },
+        )?;
+        if !parse_renew_request_body(&opened.plaintext) {
+            return Err(SigilError::MalformedFrame);
         }
-        if frame[PROTOCOL_VERSION_OFFSET] != PROTOCOL_VERSION
-            || frame[FRAME_TYPE_OFFSET] != FrameType::RenewRequest as u8
-        {
-            return Err(SigilError::ParseError);
-        }
-        let wire_prefix: &[u8; 4] = frame[OUTER_HEADER_SIZE..OUTER_HEADER_SIZE + 4]
-.try_into()
-.map_err(|_| SigilError::ParseError)?;
-        let mut counter_bytes = [0u8; 8];
-        counter_bytes.copy_from_slice(&frame[OUTER_HEADER_SIZE + 4..OUTER_HEADER_SIZE + 12]);
-        let received_counter = u64::from_be_bytes(counter_bytes);
-
-        let new_rx = aead::verify_and_advance_rx_counter(session.rx_counter, received_counter)
-.map_err(|_| SigilError::Replay {
-                peer: *peer,
-                expected: session.rx_counter,
-                received: received_counter,
-            })?;
-
-        let mut plaintext: heapless::Vec<u8, { aead::HANDSHAKE_PLAINTEXT_CAP }> =
-            heapless::Vec::new();
-        let (sensor_eph_pub, old_tx_key, old_tx_prefix, challenge_counter) = {
-            // Request decrypt = RX (s2g); challenge encrypt = TX (g2s).
-            let (rx_key, rx_prefix) = session.require_rx_material(peer)?;
-            if wire_prefix != rx_prefix {
-                return Err(SigilError::ParseError);
-            }
-            aead::decrypt_into(
-                rx_key,
-                rx_prefix,
-                received_counter,
-                &frame[OUTER_HEADER_SIZE + 12..],
-                aead::aad_from_frame(frame).ok_or(SigilError::ParseError)?,
-                &mut plaintext,
-            )?;
-            let sensor_eph_pub =
-                parse_renew_request_body(&plaintext).ok_or(SigilError::ParseError)?;
-            let challenge_counter = session.tx_counter;
-            let (tx_key, tx_prefix) = session.require_tx_material(peer)?;
-            // ZeroizeOnDrop copies — wiped if encrypt / ECDH / capacity fails.
-            (
-                sensor_eph_pub,
-                crate::core::secret::SharedSecretBuf::new(*tx_key),
-                crate::core::secret::NoncePrefixBuf::new(*tx_prefix),
-                challenge_counter,
-            )
-        };
+        let (tx_key, tx_prefix) = session.require_tx_material(peer)?;
         (
-            sensor_eph_pub,
-            old_tx_key,
-            old_tx_prefix,
-            challenge_counter,
-            new_rx,
+            crate::core::secret::SharedSecretBuf::new(*tx_key),
+            crate::core::secret::NoncePrefixBuf::new(*tx_prefix),
+            session.tx_counter,
+            opened.next_rx_counter,
         )
     };
 
-    let mut gw_scalar = generate_ephemeral_scalar(rng)?;
-    let gw_pub = pubkey_from_scalar(&gw_scalar)?;
-    // Shared wiped on Drop if HKDF / frame build fails after ECDH.
-    let shared =
-        crate::core::secret::SharedSecretBuf::new(ecdh_from_scalar(&gw_scalar, &sensor_eph_pub)?);
-    // HKDF binds the sensor MAC (session table key on the gateway).
-    let info =
-        crate::core::renew::renew_hkdf_info(peer, &sensor_eph_pub, &gw_pub, key_lifetime_secs)?;
-    let material = derive_directional_session_keys(shared.as_array(), Some(&info))?;
-    drop(shared);
-    zeroize_secret(&mut gw_scalar);
-
-    let local = *manager.local_mac();
-    let challenge_body = build_renew_challenge_body(&gw_pub, key_lifetime_secs)?;
-    let challenge_aad = aead::build_aad(&local, FrameType::RenewChallenge);
+    let (gateway_public_key, gateway_context) = se.generate_ephemeral_p256_keypair(rng)?;
+    crate::core::session::validate_static_public_key_encoding(&gateway_public_key)?;
+    let challenge_body = build_renew_challenge_body(&gateway_public_key, key_lifetime_secs)?;
     let next_tx = aead::check_tx_counter(challenge_counter)
-.map_err(|_| SigilError::CounterExhausted { peer: *peer })?;
-
-    // Encrypt + stash pending **before** advancing TX.
-    let mut out: heapless::Vec<u8, MSG> = heapless::Vec::new();
-    let chal_header = crate::core::frame::build_header(&local, FrameType::RenewChallenge);
-    out.extend_from_slice(&chal_header)
-.map_err(|_| SigilError::CapacityExceeded)?;
-    out.extend_from_slice(old_tx_prefix.as_array())
-.map_err(|_| SigilError::CapacityExceeded)?;
-    out.extend_from_slice(&challenge_counter.to_be_bytes())
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .map_err(|_| SigilError::CounterExhausted { peer: *peer })?;
+    let local = *stores.local_mac;
+    let mut challenge_frame = heapless::Vec::new();
+    challenge_frame
+        .extend_from_slice(&crate::core::frame::build_header(
+            &local,
+            FrameType::RenewChallenge,
+        ))
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
+    challenge_frame
+        .extend_from_slice(old_tx_prefix.as_array())
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
+    challenge_frame
+        .extend_from_slice(&challenge_counter.to_be_bytes())
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     aead::encrypt_append(
         old_tx_key.as_array(),
         old_tx_prefix.as_array(),
         challenge_counter,
         &challenge_body,
-        &challenge_aad,
-        &mut out,
+        &aead::build_aad(&local, FrameType::RenewChallenge),
+        &mut challenge_frame,
     )?;
-    drop(old_tx_key);
-    drop(old_tx_prefix);
 
-    let mut pending = PendingHandshake::new_renew_gateway(*peer, material, RENEW_TIMEOUT_MS, now);
-    pending.transcript_expire = Some(key_lifetime_secs);
-    let _ = manager.remove_pending(peer);
-    manager.insert_pending(*peer, pending)?;
-
-    if let Some(s) = manager.get_mut(peer) {
-        // Commit both old-key counters only after the complete challenge and
-        // replacement pending state exist. A transient RNG/ECDH/capacity error
-        // leaves the exact request retransmittable instead of classed replay.
-        s.rx_counter = new_rx;
-        s.tx_counter = next_tx;
-    }
+    // The tagged gateway state carries the backend P-256 context, the
+    // challenge public key, and the agreed lifetime until the sensor Final
+    // arrives. The challenge frame itself is not cached: only the post-commit
+    // state owns a retransmittable frame.
+    let pending = PendingHandshake::new_renew_gateway_await_confirm(
+        *peer,
+        gateway_context,
+        gateway_public_key,
+        key_lifetime_secs,
+        RENEW_TIMEOUT_MS,
+        now,
+    );
+    // Gateway TX advance happens only after the challenge encrypt **and**
+    // the pending insert both succeeded (no counter rollback on failure).
+    stores.pending.insert(*peer, pending)?;
+    let session = stores
+        .sessions
+        .get_mut(peer)
+        .ok_or(SigilError::UnknownSession { peer: *peer })?;
+    session.rx_counter = new_rx;
+    session.tx_counter = next_tx;
 
     Ok(SigilAction::Transmit {
         dest: *peer,
-        payload: out,
+        payload: challenge_frame,
         wait_timeout_ms: Some(RENEW_TIMEOUT_MS),
     })
 }
 
-/// Handles the renew ack (Final) on the gateway: decrypts under the new s2g half,
-/// commits the session, sends CommitConfirmed, and keeps pending at CommitSent.
-/// Duplicate Final while `RenewCommitSent` retransmits the cached CommitConfirmed
-/// without re-committing.
-pub(crate) fn handle_renew_ack<const N: usize, const MSG: usize>(
-    manager: &mut SessionManager<N>,
+/// Validates RenewConfirm under the old key, derives the candidate material,
+/// checks the sensor proof in constant time and only then commits.
+/// Operates on the lent [`ProtocolStores`] view, not the manager facade.
+pub(crate) fn handle_renew_confirm<const N: usize, const MSG: usize>(
+    stores: &mut ProtocolStores<'_, N>,
     peer: &PeerId,
     frame: &[u8],
+    se: &mut impl SecureElement,
     now: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    use crate::core::frame::{
-        FRAME_TYPE_OFFSET, FrameType, OUTER_HEADER_SIZE, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET,
+    // Extract the renewal inputs from the tagged state while the pending
+    // borrow is immutable; the clone/copy ends the borrow before mutations.
+    // A duplicate Final after commit retransmits the cached CommitConfirmed.
+    let (gateway_context, gateway_public_key, lifetime) = {
+        let pending = stores
+            .pending
+            .get(peer)
+            .ok_or(SigilError::NoPending { peer: *peer })?;
+        match pending.state() {
+            PendingState::RenewGatewayCommitSent { .. } => {
+                // Duplicate Final after commit → idempotent reTX below.
+                return retransmit_cached(stores, peer, RENEW_TIMEOUT_MS);
+            }
+            PendingState::RenewGatewayAwaitConfirm {
+                p256_context,
+                gateway_ephemeral_pubkey,
+                key_lifetime_secs,
+            } => (
+                crate::core::secret::SharedSecretBuf::new(*p256_context.as_array()),
+                *gateway_ephemeral_pubkey,
+                *key_lifetime_secs,
+            ),
+            _ => return Err(SigilError::InvalidStep { peer: *peer }),
+        }
     };
 
-    let pending = manager
-.get_pending(peer)
-.ok_or(SigilError::NoPending { peer: *peer })?;
-
-    // Idempotent reTX of CommitConfirmed on duplicate Final.
-    if pending.step == HandshakeStep::RenewCommitSent {
-        return retransmit_cached(manager, peer, RENEW_TIMEOUT_MS);
-    }
-
-    if pending.step != HandshakeStep::RenewWaitingForAck {
-        return Err(SigilError::InvalidStep { peer: *peer });
-    }
-    let material = pending
-.directional_keys()
-.ok_or(SigilError::ParseError)?
-.clone();
-    let lifetime = pending.transcript_expire.ok_or(SigilError::ParseError)?;
-
-    // Ack is sensor→gateway traffic under the *new* s2g half.
-    let ack_key = &material.s2g_key;
-    let ack_prefix = &material.s2g_prefix;
-
-    if frame.len() < OUTER_HEADER_SIZE + 4 + 8 + aead::TAG_SIZE {
-        return Err(SigilError::ParseError);
-    }
-    if frame[PROTOCOL_VERSION_OFFSET] != PROTOCOL_VERSION
-        || frame[FRAME_TYPE_OFFSET] != FrameType::RenewAck as u8
-    {
-        return Err(SigilError::ParseError);
-    }
-    let wire_prefix: &[u8; 4] = frame[OUTER_HEADER_SIZE..OUTER_HEADER_SIZE + 4]
-.try_into()
-.map_err(|_| SigilError::ParseError)?;
-    if wire_prefix != ack_prefix {
-        return Err(SigilError::ParseError);
-    }
-    let mut counter_bytes = [0u8; 8];
-    counter_bytes.copy_from_slice(&frame[OUTER_HEADER_SIZE + 4..OUTER_HEADER_SIZE + 12]);
-    let received_counter = u64::from_be_bytes(counter_bytes);
-    if received_counter != 0 {
-        return Err(SigilError::Replay {
-            peer: *peer,
-            expected: 0,
-            received: received_counter,
-        });
-    }
-
-    {
-        let mut plaintext: heapless::Vec<u8, { aead::HANDSHAKE_PLAINTEXT_CAP }> =
-            heapless::Vec::new();
-        aead::decrypt_into(
-            ack_key,
-            ack_prefix,
-            0,
-            &frame[OUTER_HEADER_SIZE + 12..],
-            aead::aad_from_frame(frame).ok_or(SigilError::ParseError)?,
-            &mut plaintext,
+    let confirm = {
+        let session = stores
+            .sessions
+            .get(peer)
+            .ok_or(SigilError::UnknownSession { peer: *peer })?;
+        let (rx_key, rx_prefix) = session.require_rx_material(peer)?;
+        let opened = aead::open_frame::<{ aead::HANDSHAKE_PLAINTEXT_CAP }>(
+            peer,
+            FrameType::RenewConfirm,
+            frame,
+            rx_key,
+            rx_prefix,
+            aead::RxCounterPolicy::Window {
+                current: session.rx_counter,
+            },
         )?;
-        if !parse_renew_ack_body(&plaintext) {
-            return Err(SigilError::VerificationFailed);
-        }
+        parse_renew_confirm_body(&opened.plaintext).ok_or(SigilError::MalformedFrame)?
+    };
+
+    let shared =
+        crate::core::secret::validated_ecdh_shared_secret(se.complete_ephemeral_p256_ecdh(
+            gateway_context.as_array(),
+            &confirm.sensor_ephemeral_pubkey,
+        )?)?;
+    let transcript = crate::core::renew::renew_hkdf_info(
+        peer,
+        &confirm.sensor_ephemeral_pubkey,
+        &gateway_public_key,
+        lifetime,
+    )?;
+    let material = derive_directional_session_keys(shared.as_array(), Some(&transcript))?;
+    drop(shared);
+    let expected_proof = crate::core::renew::renew_sensor_proof(&material.s2g_key, &transcript)?;
+    if expected_proof.ct_eq(&confirm.proof).unwrap_u8() != 1 {
+        return Err(SigilError::VerificationFailed);
     }
 
-    let local = *manager.local_mac();
-    // Build CommitConfirmed under new g2s (gateway TX) counter 0 **before**
-    // mutating session, using material copies.
+    let local = *stores.local_mac;
     let commit_frame = aead::build_commit_confirmed_frame::<MSG>(
         &local,
         FrameType::RenewCommitConfirmed,
@@ -276,27 +207,25 @@ pub(crate) fn handle_renew_ack<const N: usize, const MSG: usize>(
         &material.g2s_prefix,
         0,
     )?;
-
-    let session = manager
-.get_mut(peer)
-.ok_or(SigilError::UnknownSession { peer: *peer })?;
+    let session = stores
+        .sessions
+        .get_mut(peer)
+        .ok_or(SigilError::UnknownSession { peer: *peer })?;
     let expire = crate::core::session::expire_from_lifetime(now, lifetime)?;
     session.update_key(material, expire, now)?;
-    // Final used s2g counter 0; CommitConfirmed used g2s counter 0.
-    session.rx_counter = 1;
+    // Confirm consumed only an old-key counter. CommitConfirmed consumes new
+    // g2s counter 0; no new s2g frame has been received yet.
+    session.rx_counter = 0;
     session.tx_counter = 1;
 
-    let pending = manager
-.get_pending_mut(peer)
-.ok_or(SigilError::NoPending { peer: *peer })?;
-    // Directional keys already committed into the session; clear pending secrets
-    // but keep cached CommitConfirmed for reTX.
-    if let Some(mut secrets) = pending.secrets.take() {
-        secrets.zeroize();
-    }
-    pending.set_cached_wire(&commit_frame)?;
-    pending.update_step(HandshakeStep::RenewCommitSent);
-    pending.update_timeout(RENEW_TIMEOUT_MS, now);
+    // Checked transition to the recovery state: swapping the variant consumes
+    // (zeroizes) the backend P-256 provider context by construction while
+    // keeping the cached CommitConfirmed for idempotent retransmission.
+    let pending = stores
+        .pending
+        .get_mut(peer)
+        .ok_or(SigilError::NoPending { peer: *peer })?;
+    pending.renew_gateway_commit_sent(&commit_frame, now)?;
 
     Ok(SigilAction::Transmit {
         dest: *peer,
@@ -305,23 +234,22 @@ pub(crate) fn handle_renew_ack<const N: usize, const MSG: usize>(
     })
 }
 
-/// Retransmits `pending.cached_wire` as a `Transmit` action.
 pub(crate) fn retransmit_cached<const N: usize, const MSG: usize>(
-    manager: &SessionManager<N>,
+    stores: &ProtocolStores<'_, N>,
     peer: &PeerId,
     timeout_ms: u32,
 ) -> Result<SigilAction<MSG>, SigilError> {
-    let pending = manager
-.get_pending(peer)
-.ok_or(SigilError::NoPending { peer: *peer })?;
-    let cached = pending
-.cached_wire
-.as_ref()
-.ok_or(SigilError::InvalidHandshakeState)?;
-    let mut payload: heapless::Vec<u8, MSG> = heapless::Vec::new();
+    let cached = stores
+        .pending
+        .get(peer)
+        .ok_or(SigilError::NoPending { peer: *peer })?
+        .state()
+        .cached_retransmission_frame()
+        .ok_or(SigilError::InvariantViolation)?;
+    let mut payload = heapless::Vec::new();
     payload
-.extend_from_slice(cached)
-.map_err(|_| SigilError::CapacityExceeded)?;
+        .extend_from_slice(cached)
+        .map_err(|_| SigilError::OutputBufferTooSmall)?;
     Ok(SigilAction::Transmit {
         dest: *peer,
         payload,

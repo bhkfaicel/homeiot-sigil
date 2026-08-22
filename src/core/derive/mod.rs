@@ -47,7 +47,7 @@ pub(crate) fn derive_session_key(
 
     let mut okm = [0u8; DIRECTIONAL_HALF_SIZE];
     hk.expand(context.unwrap_or(b""), &mut okm)
-.map_err(|_| SigilError::EcdhFailed)?;
+        .map_err(|_| SigilError::EcdhFailed)?;
 
     let mut session_key = [0u8; SESSION_KEY_SIZE];
     let mut nonce_prefix = [0u8; NONCE_PREFIX_SIZE];
@@ -70,7 +70,7 @@ pub(crate) fn derive_directional_session_keys(
 
     let mut okm = [0u8; DIRECTIONAL_OKM_SIZE];
     hk.expand(context.unwrap_or(b""), &mut okm)
-.map_err(|_| SigilError::EcdhFailed)?;
+        .map_err(|_| SigilError::EcdhFailed)?;
 
     let mut s2g_key = [0u8; SESSION_KEY_SIZE];
     let mut s2g_prefix = [0u8; NONCE_PREFIX_SIZE];

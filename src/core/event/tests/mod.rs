@@ -1,4 +1,4 @@
-#![cfg(all(test, feature = "sensor", feature = "gateway"))]
+#![cfg(test)]
 
 //! Unit tests for event and action types
 //!
@@ -6,7 +6,9 @@
 //! generic capacities, demonstrating the configurability of the event/action
 //! types for different transport maximums.
 
-use crate::core::event::{DATA_MAX, MSG_MAX, SigilAction, SigilEvent};
+mod type_size_bounds;
+
+use crate::core::event::{DATA_MAX, MSG_MAX, ResumePskSecret, SigilAction, SigilEvent};
 use heapless::Vec;
 
 #[test]
@@ -77,10 +79,7 @@ fn test_reliable_event_and_ack_types() {
             ..
         } if p == peer
     ));
-    let ack = SigilEvent::<DATA_MAX, MSG_MAX>::EventAck {
-        peer,
-        event_id: 42,
-    };
+    let ack = SigilEvent::<DATA_MAX, MSG_MAX>::EventAck { peer, event_id: 42 };
     assert!(matches!(ack, SigilEvent::EventAck { event_id: 42, .. }));
 }
 
@@ -166,7 +165,7 @@ fn test_action_persist_peer_static_key() {
     let action = SigilAction::<MSG_MAX>::PersistPeerStaticKey {
         peer,
         pubkey,
-        resume_psk,
+        resume_psk: ResumePskSecret::new(resume_psk),
         transmit: heapless::Vec::new(),
         wait_timeout_ms: None,
     };
@@ -181,11 +180,112 @@ fn test_action_persist_peer_static_key() {
         } => {
             assert_eq!(p, peer);
             assert_eq!(pk, pubkey);
-            assert_eq!(psk, resume_psk);
+            assert_eq!(psk.expose_secret(), &resume_psk);
             assert!(transmit.is_empty());
             assert!(wait_timeout_ms.is_none());
         }
         _ => panic!("Unexpected action type"),
+    }
+}
+
+#[test]
+fn test_debug_redacts_resume_psk_and_plaintext_payloads() {
+    let secret = [0x5Au8; 32];
+    let action = SigilAction::<MSG_MAX>::PersistPeerStaticKey {
+        peer: [1u8; 17],
+        pubkey: [2u8; 33],
+        resume_psk: ResumePskSecret::new(secret),
+        transmit: heapless::Vec::new(),
+        wait_timeout_ms: None,
+    };
+    let action_debug = alloc::format!("{action:?}");
+    assert!(action_debug.contains("[REDACTED]"));
+    assert!(!action_debug.contains("90, 90, 90"));
+
+    let mut payload = Vec::<u8, DATA_MAX>::new();
+    payload.extend_from_slice(b"private-door-state").unwrap();
+    let event = SigilEvent::<DATA_MAX, MSG_MAX>::Data {
+        peer: [3u8; 17],
+        payload,
+    };
+    let event_debug = alloc::format!("{event:?}");
+    assert!(event_debug.contains("[REDACTED; 18 bytes]"));
+    assert!(!event_debug.contains("private-door-state"));
+}
+
+#[test]
+fn test_debug_covers_every_event_variant_without_exposing_frames() {
+    let peer = [7u8; 17];
+    let mut frame = Vec::<u8, MSG_MAX>::new();
+    frame.extend_from_slice(b"wire-secret-marker").unwrap();
+    let events = alloc::vec![
+        SigilEvent::<DATA_MAX, MSG_MAX>::Event {
+            peer,
+            event_id: 1,
+            payload: Vec::new(),
+            duplicate: false,
+        },
+        SigilEvent::EventAck { peer, event_id: 1 },
+        SigilEvent::TimeSync {
+            peer,
+            gateway_time: 2,
+            sync_sequence: 3,
+            uncertainty_secs: 4,
+        },
+        SigilEvent::TimeSyncRequest { peer },
+        SigilEvent::InstallRequest {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::InstallChallenge {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::InstallConfirm {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::RenewRequest {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::RenewChallenge {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::RenewConfirm {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::ResumeRequest {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::ResumeChallenge {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::ResumeConfirm {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::InstallCommitConfirmed {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::RenewCommitConfirmed {
+            peer,
+            frame: frame.clone(),
+        },
+        SigilEvent::ResumeCommitConfirmed { peer, frame },
+    ];
+
+    for event in events {
+        let output = alloc::format!("{event:?}");
+        assert!(!output.contains("wire-secret-marker"));
+        if output.contains("frame") {
+            assert!(output.contains("[REDACTED; 18 bytes]"));
+        }
     }
 }
 
@@ -228,13 +328,13 @@ fn test_event_install_steps() {
         }
         _ => panic!("Unexpected event type"),
     }
-    assert!(matches!(chal, SigilEvent::InstallChallenge {.. }));
-    assert!(matches!(conf, SigilEvent::InstallConfirm {.. }));
+    assert!(matches!(chal, SigilEvent::InstallChallenge { .. }));
+    assert!(matches!(conf, SigilEvent::InstallConfirm { .. }));
     let commit = SigilEvent::<DATA_MAX, MSG_MAX>::InstallCommitConfirmed {
         peer,
         frame: frame.clone(),
     };
-    assert!(matches!(commit, SigilEvent::InstallCommitConfirmed {.. }));
+    assert!(matches!(commit, SigilEvent::InstallCommitConfirmed { .. }));
 }
 
 #[test]
@@ -251,7 +351,7 @@ fn test_event_renew_steps() {
         peer,
         frame: frame.clone(),
     };
-    let ack = SigilEvent::<DATA_MAX, MSG_MAX>::RenewAck {
+    let ack = SigilEvent::<DATA_MAX, MSG_MAX>::RenewConfirm {
         peer,
         frame: frame.clone(),
     };
@@ -263,13 +363,13 @@ fn test_event_renew_steps() {
         }
         _ => panic!("Unexpected event type"),
     }
-    assert!(matches!(chal, SigilEvent::RenewChallenge {.. }));
-    assert!(matches!(ack, SigilEvent::RenewAck {.. }));
+    assert!(matches!(chal, SigilEvent::RenewChallenge { .. }));
+    assert!(matches!(ack, SigilEvent::RenewConfirm { .. }));
     let commit = SigilEvent::<DATA_MAX, MSG_MAX>::RenewCommitConfirmed {
         peer,
         frame: frame.clone(),
     };
-    assert!(matches!(commit, SigilEvent::RenewCommitConfirmed {.. }));
+    assert!(matches!(commit, SigilEvent::RenewCommitConfirmed { .. }));
 }
 
 #[test]
@@ -298,11 +398,11 @@ fn test_event_resume_steps() {
         }
         _ => panic!("Unexpected event type"),
     }
-    assert!(matches!(chal, SigilEvent::ResumeChallenge {.. }));
-    assert!(matches!(conf, SigilEvent::ResumeConfirm {.. }));
+    assert!(matches!(chal, SigilEvent::ResumeChallenge { .. }));
+    assert!(matches!(conf, SigilEvent::ResumeConfirm { .. }));
     let commit = SigilEvent::<DATA_MAX, MSG_MAX>::ResumeCommitConfirmed {
         peer,
         frame: frame.clone(),
     };
-    assert!(matches!(commit, SigilEvent::ResumeCommitConfirmed {.. }));
+    assert!(matches!(commit, SigilEvent::ResumeCommitConfirmed { .. }));
 }

@@ -1,4 +1,4 @@
-#![cfg(all(test, feature = "sensor", feature = "gateway"))]
+#![cfg(test)]
 
 //! Unit tests for AEAD encryption and decryption
 
@@ -58,7 +58,7 @@ fn test_encrypt_rejects_oversized_plaintext() {
     let aad = build_aad(&PEER, FrameType::Data);
     let too_big = [0u8; 241]; // 241 + 16 tag = 257 > 256
     let result = encrypt(&key, &prefix, 0, &too_big, &aad);
-    assert_eq!(result, Err(SigilError::CapacityExceeded));
+    assert_eq!(result, Err(SigilError::OutputBufferTooSmall));
 }
 
 #[test]
@@ -71,8 +71,8 @@ fn test_encrypt_append_into_prebuilt_header() {
 
     let mut frame: Vec<u8, 128> = Vec::new();
     frame
-.extend_from_slice(&build_header(&PEER, FrameType::Data))
-.unwrap();
+        .extend_from_slice(&build_header(&PEER, FrameType::Data))
+        .unwrap();
     frame.extend_from_slice(&prefix).unwrap();
     frame.extend_from_slice(&0u64.to_be_bytes()).unwrap();
     encrypt_append(&key, &prefix, 0, plaintext, &aad, &mut frame).unwrap();
@@ -93,7 +93,7 @@ fn test_decrypt_into_rejects_oversized_plaintext() {
 
     let mut out: Vec<u8, HANDSHAKE_PLAINTEXT_CAP> = Vec::new();
     let result = decrypt_into(&key, &prefix, 0, &ct, &aad, &mut out);
-    assert_eq!(result, Err(SigilError::CapacityExceeded));
+    assert_eq!(result, Err(SigilError::OutputBufferTooSmall));
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn test_frame_type_flip_fails_aad() {
     // Simulate an attacker flipping the frame_type byte after encryption.
     let key = [0x42u8; 32];
     let prefix = [0x01, 0x02, 0x03, 0x04];
-    let plaintext = [0xABu8; 32]; // RenewRequest body size class (X25519 pubkey)
+    let plaintext = [0xABu8; 32]; // representative handshake plaintext size
     let aad_data = build_aad(&PEER, FrameType::Data);
 
     let ciphertext = encrypt(&key, &prefix, 0, &plaintext, &aad_data).unwrap();
@@ -138,8 +138,8 @@ fn test_frame_type_flip_fails_aad() {
     // Build a full frame as Data, then flip frame_type to RenewRequest.
     let mut frame = heapless::Vec::<u8, 256>::new();
     frame
-.extend_from_slice(&build_header(&PEER, FrameType::Data))
-.unwrap();
+        .extend_from_slice(&build_header(&PEER, FrameType::Data))
+        .unwrap();
     frame.extend_from_slice(&prefix).unwrap();
     frame.extend_from_slice(&0u64.to_be_bytes()).unwrap();
     frame.extend_from_slice(&ciphertext).unwrap();
@@ -189,7 +189,7 @@ fn test_verify_rx_counter_gap_too_large_rejected() {
     let current = 10;
     let received = current + RX_COUNTER_MAX_GAP + 1;
     let result = verify_and_advance_rx_counter(current, received);
-    assert!(matches!(result, Err(SigilError::Replay {.. })));
+    assert!(matches!(result, Err(SigilError::Replay { .. })));
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn test_verify_rx_counter_huge_jump_rejected() {
     let current = 0;
     let received = u64::MAX / 2;
     let result = verify_and_advance_rx_counter(current, received);
-    assert!(matches!(result, Err(SigilError::Replay {.. })));
+    assert!(matches!(result, Err(SigilError::Replay { .. })));
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn test_verify_rx_counter_replay() {
     let received = 5; // Lower than current → stale / replay
 
     let result = verify_and_advance_rx_counter(current, received);
-    assert!(matches!(result, Err(SigilError::Replay {.. })));
+    assert!(matches!(result, Err(SigilError::Replay { .. })));
 }
 
 #[test]
@@ -227,12 +227,12 @@ fn test_verify_rx_counter_duplicate_rejected() {
     let received = 10;
 
     let result = verify_and_advance_rx_counter(current, received);
-    assert!(matches!(result, Err(SigilError::Replay {.. })));
+    assert!(matches!(result, Err(SigilError::Replay { .. })));
 }
 
 #[test]
 fn test_verify_rx_counter_max_rejects_wrap() {
- // accepting received == u64::MAX would wrap next watermark.
+    // accepting received == u64::MAX would wrap next watermark.
 
     let current = u64::MAX - 10;
     let received = u64::MAX;

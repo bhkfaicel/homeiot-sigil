@@ -2,6 +2,34 @@
 //!
 //! This module defines all error types that can be returned by the core APIs,
 //! providing clear and specific error information for host applications.
+//!
+//! # Host policy categories
+//!
+//! Every [`SigilError`] maps to exactly **one** deterministic host policy
+//! category, so firmware can `match` once and act:
+//!
+//! - **Reject input**: the received frame or requested operation is invalid;
+//!   drop it (optionally log). Never retry as-is.
+//! - **Fix integration**: a static integration problem (buffer sizing, wrong
+//!   role, bad configuration, secure-element/RNG health, corrupt NVRAM).
+//!   Correct the firmware; retrying cannot help.
+//! - **Back off / reclaim capacity**: transient resource pressure. Free the
+//!   resource (`tick`, `cancel_pending`, key rotation) or back off, then retry.
+//! - **Report invariant failure**: an unrepresentable internal state was
+//!   reached — this is always a library bug; capture diagnostics and report.
+//!
+//! The taxonomy distinguishes fixed-buffer sizing ([`SigilError::OutputBufferTooSmall`]),
+//! session-table saturation ([`SigilError::SessionTableFull`]), pending-table
+//! saturation ([`SigilError::PendingTableFull`]), admission-table saturation
+//! ([`SigilError::AdmissionTableFull`]), malformed wire input
+//! ([`SigilError::MalformedFrame`]), wrong role ([`SigilError::WrongRole`]),
+//! invalid transitions ([`SigilError::InvalidStep`]) and internal invariant
+//! failures ([`SigilError::InvariantViolation`]).
+//!
+//! # Secrecy
+//!
+//! `Display` never renders key material, MAC tags, PSKs or shared secrets.
+//! Peer MACs are acceptable: they are clear-text on every wire frame header.
 
 use core::fmt;
 
@@ -9,18 +37,24 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SigilError {
     /// No session exists for the specified peer
+    /// Host policy: reject input (drop the frame / skip the operation until
+    /// the peer is enrolled; for TX this means the peer handle is stale).
     UnknownSession {
         /// Peer identifier
         peer: [u8; 17],
     },
 
     /// Session key has expired
+    /// Host policy: reject input (do not use the expired key; re-key with
+    /// renew or resume).
     SessionExpired {
         /// Peer identifier
         peer: [u8; 17],
     },
 
     /// Replayed or non-monotonic packet counter detected
+    /// Host policy: reject input (drop the frame; the replay window already
+    /// rejected it).
     Replay {
         /// Peer identifier
         peer: [u8; 17],
@@ -31,42 +65,54 @@ pub enum SigilError {
     },
 
     /// TX counter would overflow (exhausted)
+    /// Host policy: back off / reclaim capacity (rotate the session keys via
+    /// renew or resume to reset the counters).
     CounterExhausted {
         /// Peer identifier
         peer: [u8; 17],
     },
 
     /// Cryptographic verification failed (ECDSA, AEAD tag, etc.)
+    /// Host policy: reject input (the frame or signature failed
+    /// authentication; drop it).
     VerificationFailed,
 
-    /// Session manager capacity exceeded
-    CapacityExceeded,
-
-    /// Failed to parse incoming packet (truncated or malformed)
-    ParseError,
-
     /// No pending handshake for the specified peer
+    /// Host policy: fix integration (sequence the handshake calls correctly;
+    /// the pending entry may have been cancelled, tick-purged or committed —
+    /// restart the handshake when needed).
     NoPending {
         /// Peer identifier
         peer: [u8; 17],
     },
 
     /// A pending handshake already exists for the specified peer
+    /// Host policy: reject input (a handshake is already in flight for this
+    /// peer; reclaim with `cancel_pending`/`tick` before starting another).
     PendingAlreadyExists {
         /// Peer identifier
         peer: [u8; 17],
     },
 
     /// ECDH operation failed
+    /// Host policy: fix integration (secure-element/driver health or wiring).
     EcdhFailed,
 
     /// Random source operation failed
+    /// Host policy: fix integration (RNG driver/hardware must be healthy
+    /// before any cryptographic operation).
     RandomFailed,
 
     /// Invalid static public key format
+    /// Host policy: fix integration (provisioned key encoding is invalid).
     InvalidStaticKey,
 
+    /// Durable Resume PSK is invalid (currently: all-zero enrollment secret)
+    /// Host policy: fix integration (NVRAM content missing/corrupt — re-enroll).
+    InvalidResumePsk,
+
     /// Session not active (no session key or expired)
+    /// Host policy: reject input (no usable key; establish keys first).
     SessionNotActive {
         /// Peer identifier
         peer: [u8; 17],
@@ -75,19 +121,23 @@ pub enum SigilError {
     /// Resume rejected because a session key is already **active** (not expired)
     /// Use renew to rotate an active key; resume is for cold enrolled peers
     /// (static pubkey known, session key absent or soft-expired).
+    /// Host policy: reject input (wrong recovery path — use renew instead).
     SessionAlreadyActive {
         /// Peer identifier
         peer: [u8; 17],
     },
 
     /// Invalid handshake step or state for the specified peer
+    ///
+    /// Canonical transition-mismatch error: a frame arrived out of order for
+    /// the pending protocol state, or a facade API was called in a state that
+    /// forbids it (e.g. cancel after the commit boundary).
+    /// Host policy: reject input (drop the out-of-order frame; never retry it
+    /// against the same state).
     InvalidStep {
         /// Peer identifier
         peer: [u8; 17],
     },
-
-    /// Invalid handshake step or state
-    InvalidHandshakeState,
 
     /// Pending handshake timed out
     /// Semantic error for a pending entry reclaimed because the host seconds
@@ -96,6 +146,8 @@ pub enum SigilError {
     /// returns the peer MAC list from `tick` rather than this enum directly).
     /// Manual [`crate::core::manager::SessionManager::cancel_pending`] after a
     /// radio timer does **not** return this variant (`Ok` / `NoPending`).
+    /// Host policy: back off / reclaim capacity (entry reclaimed by timeout;
+    /// restart the handshake if still needed).
     TimeoutElapsed {
         /// Peer identifier
         peer: [u8; 17],
@@ -108,6 +160,7 @@ pub enum SigilError {
     /// [`crate::core::install::INSTALL_REQUEST_COOLDOWN`], plus
     /// [`crate::core::pipeline::TIME_SYNC_REQUEST_COOLDOWN_SECS`], all
     /// **15 seconds**).
+    /// Host policy: back off / reclaim capacity (retry after the cooldown).
     RateLimited {
         /// Peer identifier
         peer: [u8; 17],
@@ -117,6 +170,7 @@ pub enum SigilError {
     /// Returned when `key_expire_at <= now` or the lifetime
     /// `key_expire_at - now` exceeds
     /// [`crate::core::session::MAX_SESSION_LIFETIME_SECS`] (2 days).
+    /// Host policy: fix integration (host passed an invalid expiry value).
     InvalidKeyExpire {
         /// Host clock at validation (`now`, seconds)
         now: u32,
@@ -125,12 +179,15 @@ pub enum SigilError {
     },
 
     /// Authenticated wire-v3 lifetime is zero, too long, or overflows local time.
+    /// Host policy: fix integration (host passed an invalid lifetime value).
     InvalidKeyLifetime {
         /// Rejected duration in seconds.
         lifetime_secs: u32,
     },
 
     /// Another reliable Event is already waiting for its EventAck.
+    /// Host policy: back off / reclaim capacity (finish or cancel the
+    /// in-flight Event, then retry).
     EventAckPending {
         /// Peer identifier.
         peer: [u8; 17],
@@ -139,6 +196,8 @@ pub enum SigilError {
     },
 
     /// Gateway already has another Event awaiting durable processing/ACK.
+    /// Host policy: back off / reclaim capacity (ACK or release the pending
+    /// delivery, then retry).
     EventDeliveryPending {
         /// Sensor peer identifier.
         peer: [u8; 17],
@@ -147,6 +206,7 @@ pub enum SigilError {
     },
 
     /// No matching uncommitted gateway Event delivery exists.
+    /// Host policy: reject input (unknown/mismatched id supplied by the host).
     UnexpectedEventDelivery {
         /// Sensor peer identifier.
         peer: [u8; 17],
@@ -155,6 +215,7 @@ pub enum SigilError {
     },
 
     /// Event id was reused or moved backwards.
+    /// Host policy: reject input (id monotonicity violated; use a fresh id).
     InvalidEventId {
         /// Peer identifier.
         peer: [u8; 17],
@@ -165,12 +226,64 @@ pub enum SigilError {
     },
 
     /// Authenticated EventAck does not match the pending Event.
+    /// Host policy: reject input (mismatched ACK id; drop it).
     UnexpectedEventAck {
         /// Peer identifier.
         peer: [u8; 17],
         /// Acknowledged Event id.
         event_id: u64,
     },
+
+    // ------------------------------------------------------------------
+    // Final taxonomy: these domain-specific variants replace the former
+    // coarse capacity/parsing/handshake-state variants outright — a
+    // conscious breaking removal approved by the crate owner before any
+    // production use of this crate; no deprecated alias is retained.
+    // ------------------------------------------------------------------
+    /// A caller-provided output buffer cannot hold the produced data
+    /// (e.g. the `MSG` transmit buffer or the `DATA` receive payload buffer
+    /// of the generic APIs, or the output `Vec` of the AEAD helpers).
+    /// Host policy: fix integration (enlarge the buffer generic constant).
+    OutputBufferTooSmall,
+
+    /// The fixed-capacity established-session table is full and the peer is
+    /// unknown (a known peer is replaced in place without growth).
+    /// Host policy: back off / reclaim capacity (remove stale sessions).
+    SessionTableFull,
+
+    /// The fixed-capacity pending-handshake table is full and no slot can be
+    /// freed for a new peer (a duplicate peer yields
+    /// [`SigilError::PendingAlreadyExists`] instead).
+    /// Host policy: back off / reclaim capacity (`cancel_pending`/`tick`).
+    PendingTableFull,
+
+    /// The gateway admission/cooldown table is full after purging expired
+    /// entries and the peer is new.
+    /// Host policy: back off / reclaim capacity (entries expire with their
+    /// cooldown window; apply the documented global admission policy).
+    AdmissionTableFull,
+
+    /// Malformed wire input: truncated frame, wrong protocol version or
+    /// frame type, outer/body identity mismatch, or an authenticated payload
+    /// whose shape does not match its frame type.
+    /// Host policy: reject input (drop the frame).
+    MalformedFrame,
+
+    /// The session's configured role does not permit this operation or frame
+    /// type (e.g. starting a sensor-only handshake from the gateway side, or
+    /// receiving a frame whose direction contradicts the local role).
+    /// Host policy: fix integration (static role/config mismatch: correct the
+    /// firmware call site; for ingress frames, drop them).
+    WrongRole {
+        /// Peer identifier
+        peer: [u8; 17],
+    },
+
+    /// An internally unrepresentable state was reached (e.g. a tagged
+    /// recovery state without its cached frame). Fail closed; this is always
+    /// a library bug.
+    /// Host policy: report invariant failure (capture diagnostics and report).
+    InvariantViolation,
 }
 
 impl fmt::Display for SigilError {
@@ -199,12 +312,6 @@ impl fmt::Display for SigilError {
             SigilError::VerificationFailed => {
                 write!(f, "Cryptographic verification failed")
             }
-            SigilError::CapacityExceeded => {
-                write!(f, "Session manager capacity exceeded")
-            }
-            SigilError::ParseError => {
-                write!(f, "Failed to parse packet (truncated or malformed)")
-            }
             SigilError::NoPending { peer } => {
                 write!(f, "No pending handshake for peer: {:02x?}", peer)
             }
@@ -224,6 +331,9 @@ impl fmt::Display for SigilError {
             SigilError::InvalidStaticKey => {
                 write!(f, "Invalid static public key format")
             }
+            SigilError::InvalidResumePsk => {
+                write!(f, "Invalid Resume PSK")
+            }
             SigilError::SessionNotActive { peer } => {
                 write!(f, "Session not active for peer: {:02x?}", peer)
             }
@@ -236,9 +346,6 @@ impl fmt::Display for SigilError {
             }
             SigilError::InvalidStep { peer } => {
                 write!(f, "Invalid handshake step for peer: {:02x?}", peer)
-            }
-            SigilError::InvalidHandshakeState => {
-                write!(f, "Invalid handshake step or state")
             }
             SigilError::TimeoutElapsed { peer } => {
                 write!(
@@ -289,6 +396,31 @@ impl fmt::Display for SigilError {
                 "Unexpected ACK for Event {} from peer {:02x?}",
                 event_id, peer
             ),
+            SigilError::OutputBufferTooSmall => {
+                write!(f, "Output buffer too small for the produced data")
+            }
+            SigilError::SessionTableFull => {
+                write!(f, "Session table full")
+            }
+            SigilError::PendingTableFull => {
+                write!(f, "Pending handshake table full")
+            }
+            SigilError::AdmissionTableFull => {
+                write!(f, "Admission table full")
+            }
+            SigilError::MalformedFrame => {
+                write!(f, "Malformed frame received")
+            }
+            SigilError::WrongRole { peer } => {
+                write!(
+                    f,
+                    "Operation not valid for the session role of peer: {:02x?}",
+                    peer
+                )
+            }
+            SigilError::InvariantViolation => {
+                write!(f, "Internal invariant violated")
+            }
         }
     }
 }

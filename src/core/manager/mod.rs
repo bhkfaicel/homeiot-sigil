@@ -1,14 +1,24 @@
 //! Session manager with fixed capacity
 //!
 //! This module provides the `SessionManager<N>` type which manages a fixed-capacity
-//! table of sessions keyed by peer identifier.
+//! table of sessions keyed by peer identifier. The storage itself lives in the
+//! crate-private `store` components (`SessionStore`, `PendingStore`,
+//! gateway-only `AdmissionStore`); the manager is the host-facing facade
+//! that composes them and retains the protocol entry points.
+
+mod store;
+
+#[cfg(feature = "gateway")]
+use store::AdmissionStore;
+pub(crate) use store::PendingStore;
+pub(crate) use store::ProtocolStores;
+pub(crate) use store::SessionStore;
 
 use crate::core::error::SigilError;
 use crate::core::event::{SigilAction, SigilEvent};
 use crate::core::pending::PendingHandshake;
 use crate::core::session::{PeerId, Session};
 use crate::core::traits::{RandomSource, SecureElement, StaticPublicKey};
-use heapless::FnvIndexMap;
 
 /// Default capacity for sensor devices (single active peer).
 /// `heapless::FnvIndexMap` (v0.8) requires the capacity to be a power of two
@@ -58,8 +68,8 @@ pub const GATEWAY_CAPACITY: usize = 128;
 /// calling `handle_install_request` / `handle_resume_request` / renew handlers
 /// — for example a token bucket or max concurrent pending across all peers.
 /// Allowlisting alone is not enough if many allowlisted MACs can be spoofed or
-/// if install discovery accepts many factory-attested peers. See CLAUDE.md /
-/// `contracts/session-api.md` ("Host global rate-limit").
+/// if install discovery accepts many factory-attested peers. This guidance is
+/// restated in the repository README ("Host global rate-limit" section).
 /// # Example
 /// ```
 /// use sigil::core::manager::SessionManager;
@@ -68,9 +78,9 @@ pub const GATEWAY_CAPACITY: usize = 128;
 /// let sensor_mac = [0x01u8; 17];
 /// let gateway_mac = [0xAAu8; 17];
 /// // Sensor: local_mac = this device; sessions keyed by gateway MAC.
-/// let _sensor: SessionManager<2> = SessionManager::new(factory_pubkey, sensor_mac);
+/// let _sensor: SessionManager<2> = SessionManager::new(factory_pubkey, sensor_mac).unwrap();
 /// // Gateway: local_mac = this device; sessions keyed by each sensor MAC.
-/// let _gateway: SessionManager<128> = SessionManager::new(factory_pubkey, gateway_mac);
+/// let _gateway: SessionManager<128> = SessionManager::new(factory_pubkey, gateway_mac).unwrap();
 /// ```
 /// All storage is RAM-only; the host owns NVRAM persistence of static keys.
 /// # Identity model (multi-peer)
@@ -81,18 +91,19 @@ pub const GATEWAY_CAPACITY: usize = 128;
 /// - **Ingress**: `process_incoming_packet` reads the outer header as the
 ///   remote sender identity — suitable for install allowlisting on a gateway.
 pub struct SessionManager<const N: usize> {
-    /// Sessions keyed by **remote** peer identifier
-    sessions: FnvIndexMap<PeerId, Session, N>,
+    /// Established sessions keyed by **remote** peer identifier.
+    sessions: SessionStore<N>,
 
-    /// In-progress handshakes keyed by **remote** peer identifier
-    pending: FnvIndexMap<PeerId, PendingHandshake, N>,
+    /// In-progress handshakes and post-commit recovery entries keyed by
+    /// **remote** peer identifier.
+    pending: PendingStore<N>,
 
-    /// Last accepted install SE work timestamp (**seconds**) per peer.
+    /// Gateway-side install admission / cooldown bookkeeping per peer.
     /// Used with [`crate::core::install::INSTALL_REQUEST_COOLDOWN`] so a flood of
     /// `InstallRequest` frames cannot re-drive ATECC ECDH for the same MAC
     /// within the cooldown window.
     #[cfg(feature = "gateway")]
-    install_last_at: FnvIndexMap<PeerId, u32, N>,
+    install_admission: AdmissionStore<N>,
 
     /// Factory root public key (compressed P-256 SEC1).
     /// Used to verify peer factory certificates during install. Public and
@@ -111,15 +122,16 @@ impl<const N: usize> SessionManager<N> {
     ///   public keys during install without contacting the ATECC each time.
     /// * `local_mac` - This device's 17-byte identity. Written into the outer
     ///   header of every frame this manager transmits (sender identity).
-    pub fn new(factory_pubkey: StaticPublicKey, local_mac: PeerId) -> Self {
-        Self {
-            sessions: FnvIndexMap::new(),
-            pending: FnvIndexMap::new(),
+    pub fn new(factory_pubkey: StaticPublicKey, local_mac: PeerId) -> Result<Self, SigilError> {
+        crate::core::session::validate_static_public_key_encoding(&factory_pubkey)?;
+        Ok(Self {
+            sessions: SessionStore::new(),
+            pending: PendingStore::new(),
             #[cfg(feature = "gateway")]
-            install_last_at: FnvIndexMap::new(),
+            install_admission: AdmissionStore::new(),
             factory_pubkey,
             local_mac,
-        }
+        })
     }
 
     /// Returns the cached factory root public key.
@@ -146,36 +158,26 @@ impl<const N: usize> SessionManager<N> {
 
     /// Returns true if the session manager is at capacity
     pub fn is_full(&self) -> bool {
-        self.sessions.len() >= N
+        self.sessions.is_full()
     }
 
     /// Inserts a session for the specified peer.
     /// If a session for the same `peer_mac` already exists, it is **replaced**
     /// even when the manager is at capacity (no net growth). A new peer is
-    /// rejected with [`SigilError::CapacityExceeded`] only when the table is
+    /// rejected with [`SigilError::SessionTableFull`] only when the table is
     /// full and the peer is unknown.
     /// # Arguments
     /// * `session` - The session to insert
     ///
     /// # Returns
-    /// `Ok(())` on success, `Err(SigilError::CapacityExceeded)` if the manager
-    /// is full and `session.peer_mac` is not already present.
+    /// `Ok(())` on success, `Err(SigilError::SessionTableFull)` if the manager
+    /// is full and `session.peer_mac()` is not already present.
     /// Active-key expiry is enforced when handshake code calls
-    /// [`Session::new_active`](crate::core::session::Session::new_active) /
-    /// [`Session::update_key`](crate::core::session::Session::update_key)
+    /// `Session::new_active` / `Session::update_key`
     /// (crate-internal). Hosts insert enrolled shells via
     /// [`Session::new_enrolled`](crate::core::Session::new_enrolled).
     pub fn insert(&mut self, session: Session) -> Result<(), SigilError> {
-        let peer_mac = session.peer_mac;
-        // Allow in-place replace at capacity; reject only true growth.
-        if self.is_full() && !self.sessions.contains_key(&peer_mac) {
-            return Err(SigilError::CapacityExceeded);
-        }
-
-        self.sessions
-            .insert(peer_mac, session)
-            .map_err(|_| SigilError::CapacityExceeded)?;
-        Ok(())
+        self.sessions.insert(session)
     }
 
     /// Gets a reference to the session for the specified peer
@@ -216,10 +218,10 @@ impl<const N: usize> SessionManager<N> {
     /// any persistent (NVRAM) copy of the peer's static public key.
     pub fn remove(&mut self, peer: &PeerId) -> Option<Session> {
         // Cancel any in-progress handshake (zeroizes ephemeral secrets)
-        let _ = self.remove_pending(peer);
+        let _ = self.pending.remove(peer);
         // Drop install cooldown entry so forgotten peers free capacity.
         #[cfg(feature = "gateway")]
-        let _ = self.install_last_at.remove(peer);
+        self.install_admission.remove(peer);
         self.sessions.remove(peer)
     }
 
@@ -241,75 +243,52 @@ impl<const N: usize> SessionManager<N> {
     /// # Returns
     /// `Ok(())` on success, `Err(SigilError::PendingAlreadyExists)` if a pending
     /// handshake already exists for this peer
+    /// Test-only seam: production pending insertion flows through the lent
+    /// [`ProtocolStores`] view, so this facade helper exists only for the
+    /// dual-role unit tests.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
     pub(crate) fn insert_pending(
         &mut self,
         peer: PeerId,
         handshake: PendingHandshake,
     ) -> Result<(), SigilError> {
-        if self.pending.contains_key(&peer) {
-            return Err(SigilError::PendingAlreadyExists { peer });
-        }
-
-        self.pending
-            .insert(peer, handshake)
-            .map(|_| ())
-            .map_err(|_| SigilError::CapacityExceeded)
+        self.pending.insert(peer, handshake)
     }
 
     /// Returns `true` if install SE work for `peer` is allowed at `now` (seconds).
     /// Expired cooldown entries are purged opportunistically so the
     /// table does not permanently fill with historical PeerIds.
-    #[cfg(feature = "gateway")]
+    /// Test-only seam: production install admission flows through the lent
+    /// [`ProtocolStores`] view, so this facade helper exists only for the
+    /// dual-role unit tests.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
     pub(crate) fn install_cooldown_elapsed(&mut self, peer: &PeerId, now: u32) -> bool {
-        self.purge_expired_install_cooldowns(now);
-        match self.install_last_at.get(peer) {
-            None => true,
-            Some(last) => {
-                now.saturating_sub(*last) >= crate::core::install::INSTALL_REQUEST_COOLDOWN
-            }
-        }
-    }
-
-    /// Removes `install_last_at` entries whose cooldown window has elapsed.
-    #[cfg(feature = "gateway")]
-    pub(crate) fn purge_expired_install_cooldowns(&mut self, now: u32) {
-        let cooldown = crate::core::install::INSTALL_REQUEST_COOLDOWN;
-        self.install_last_at
-            .retain(|_, last| now.saturating_sub(*last) < cooldown);
+        self.install_admission.install_cooldown_elapsed(peer, now)
     }
 
     /// Records that install admission for `peer` was accepted at `now` (seconds).
-    /// Called after factory attestation binds the claimed `peer`, but before
-    /// device-signature and ECDH work. This prevents an unauthenticated sender
-    /// from poisoning a legitimate peer's cooldown. If the table is full and
-    /// `peer` is new, returns [`SigilError::CapacityExceeded`].
-    #[cfg(feature = "gateway")]
+    /// Returns [`SigilError::AdmissionTableFull`] when the admission table is
+    /// full and `peer` is new (admission-table saturation).
+    /// Test-only seam: production install admission flows through the lent
+    /// [`ProtocolStores`] view, so this facade helper exists only for the
+    /// dual-role unit tests.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
     pub(crate) fn mark_install_request(
         &mut self,
         peer: PeerId,
         now: u32,
     ) -> Result<(), SigilError> {
-        self.purge_expired_install_cooldowns(now);
-        if self.install_last_at.len() >= N && !self.install_last_at.contains_key(&peer) {
-            return Err(SigilError::CapacityExceeded);
-        }
-        self.install_last_at
-            .insert(peer, now)
-            .map_err(|_| SigilError::CapacityExceeded)?;
-        Ok(())
-    }
-
-    /// Returns true if a new pending entry for `peer` can be inserted.
-    pub(crate) fn pending_slot_available(&self, peer: &PeerId) -> bool {
-        self.pending.contains_key(peer) || self.pending.len() < N
+        self.install_admission.mark_install_request(peer, now)
     }
 
     /// Returns true if the install cooldown table cannot accept `peer`.
     /// Purges expired entries first so capacity reflects live cooldowns only.
-    #[cfg(feature = "gateway")]
+    /// Test-only seam: production install admission flows through the lent
+    /// [`ProtocolStores`] view, so this facade helper exists only for the
+    /// dual-role unit tests.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
     pub(crate) fn install_last_at_full_for(&mut self, peer: &PeerId, now: u32) -> bool {
-        self.purge_expired_install_cooldowns(now);
-        self.install_last_at.len() >= N && !self.install_last_at.contains_key(peer)
+        self.install_admission.install_last_at_full_for(peer, now)
     }
 
     /// Gets a reference to the pending handshake for the specified peer
@@ -322,17 +301,6 @@ impl<const N: usize> SessionManager<N> {
         self.pending.get(peer)
     }
 
-    /// Gets a mutable reference to the pending handshake for the specified peer
-    /// # Arguments
-    /// * `peer` - The peer identifier
-    ///
-    /// # Returns
-    /// `Some(&mut PendingHandshake)` if found, `None` otherwise
-    #[allow(dead_code)]
-    pub(crate) fn get_pending_mut(&mut self, peer: &PeerId) -> Option<&mut PendingHandshake> {
-        self.pending.get_mut(peer)
-    }
-
     /// Removes the pending handshake for the specified peer
     /// # Arguments
     /// * `peer` - The peer identifier
@@ -341,6 +309,51 @@ impl<const N: usize> SessionManager<N> {
     /// `Some(PendingHandshake)` if found and removed, `None` otherwise
     pub(crate) fn remove_pending(&mut self, peer: &PeerId) -> Option<PendingHandshake> {
         self.pending.remove(peer)
+    }
+
+    /// Returns the number of handshakes and commit-recovery entries currently
+    /// occupying the independent pending table.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Returns the peers currently occupying the pending table. This lets a
+    /// host export metrics and enforce a global admission budget without
+    /// exposing handshake secrets or internal state-machine details.
+    pub fn pending_peers(&self) -> impl Iterator<Item = &PeerId> {
+        self.pending.keys()
+    }
+
+    /// Returns the peers retained after the handshake commit boundary for
+    /// loss-recovery retransmission.
+    pub fn commit_recovery_peers(&self) -> heapless::Vec<PeerId, N> {
+        self.pending
+            .iter()
+            .filter_map(|(peer, pending)| pending.state().is_commit_critical().then_some(*peer))
+            .collect()
+    }
+
+    /// Explicitly abandons a post-commit recovery entry while preserving the
+    /// current session/enrollment.
+    ///
+    /// This is the terminal operation for a host-owned bounded retransmission
+    /// policy. Before calling it, the host should retry
+    /// [`Self::retransmit_pending_cached`] for its configured budget and record
+    /// an operational alert. On a gateway the committed new session remains;
+    /// on a sensor the previously active/enrolled state remains and a fresh
+    /// handshake can be started. Staged secrets are zeroized on removal.
+    ///
+    /// Ordinary pre-commit cancellation must continue to use
+    /// [`Self::cancel_pending`].
+    pub fn abandon_commit_recovery(&mut self, peer: &PeerId) -> Result<(), SigilError> {
+        let pending = self
+            .get_pending(peer)
+            .ok_or(SigilError::NoPending { peer: *peer })?;
+        if !pending.state().is_commit_critical() {
+            return Err(SigilError::InvalidStep { peer: *peer });
+        }
+        let _ = self.remove_pending(peer);
+        Ok(())
     }
 
     /// Cancels a pending handshake for the specified peer without removing
@@ -365,7 +378,7 @@ impl<const N: usize> SessionManager<N> {
     pub fn cancel_pending(&mut self, peer: &PeerId) -> Result<(), SigilError> {
         if self
             .get_pending(peer)
-            .is_some_and(crate::core::pending::PendingHandshake::is_commit_critical)
+            .is_some_and(|pending| pending.state().is_commit_critical())
         {
             return Err(SigilError::InvalidStep { peer: *peer });
         }
@@ -404,14 +417,30 @@ impl<const N: usize> SessionManager<N> {
         for (peer, pending) in self.pending.iter() {
             // Dropping staged keys / cached CommitConfirmed here can
             // permanently split the peers across key epochs after packet loss.
-            if now >= pending.deadline_at && !pending.is_commit_critical() {
+            if now >= pending.deadline_at && !pending.state().is_commit_critical() {
                 let _ = expired.push(*peer);
             }
         }
         for peer in &expired {
-            let _ = self.remove_pending(peer);
+            let _ = self.pending.remove(peer);
         }
         expired
+    }
+
+    /// Lends the crate-internal storage capabilities (session table, pending
+    /// table, gateway-gated install admission table, plus the read-only
+    /// factory root and device egress identity) to the protocol
+    /// implementations, so they never mutate the facade itself. See
+    /// [`store::ProtocolStores`].
+    pub(crate) fn protocol_stores(&mut self) -> ProtocolStores<'_, N> {
+        ProtocolStores {
+            sessions: &mut self.sessions,
+            pending: &mut self.pending,
+            #[cfg(feature = "gateway")]
+            admission: &mut self.install_admission,
+            factory_pubkey: &self.factory_pubkey,
+            local_mac: &self.local_mac,
+        }
     }
 
     /// Rebinds the sole sensor-side install pending entry to `new_peer`.
@@ -425,79 +454,34 @@ impl<const N: usize> SessionManager<N> {
     /// `new_peer` (no-op).
     /// # Errors
     /// - [`SigilError::NoPending`] — no sensor `InstallWaitingForChallenge` entry
-    /// - [`SigilError::InvalidHandshakeState`] — more than one matching pending
-    #[cfg(feature = "sensor")]
+    /// - [`SigilError::InvariantViolation`] — more than one matching pending
+    ///
+    /// Test-only seam: production rebinding flows through the lent
+    /// [`ProtocolStores`] view, so this facade helper exists only for the
+    /// dual-role unit tests.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
     pub(crate) fn rebind_sole_sensor_install_pending(
         &mut self,
         new_peer: PeerId,
     ) -> Result<Option<PeerId>, SigilError> {
-        use crate::core::pending::{HandshakeRole, HandshakeStep};
-
-        if self.pending.contains_key(&new_peer) {
-            return Ok(None);
-        }
-
-        let mut old: Option<PeerId> = None;
-        for (peer, ph) in self.pending.iter() {
-            if ph.role == HandshakeRole::Sensor
-                && ph.step == HandshakeStep::InstallWaitingForChallenge
-            {
-                if old.is_some() {
-                    return Err(SigilError::InvalidHandshakeState);
-                }
-                old = Some(*peer);
-            }
-        }
-        let old = old.ok_or(SigilError::NoPending { peer: new_peer })?;
-        let mut ph = self
-            .remove_pending(&old)
-            .ok_or(SigilError::NoPending { peer: new_peer })?;
-        ph.peer_mac = new_peer;
-        self.insert_pending(new_peer, ph)?;
-        Ok(Some(old))
+        self.pending.rebind_sole_sensor_install_pending(new_peer)
     }
 
     /// Restores a discovery pending key after a failed challenge verification.
     /// Moves the sensor `InstallWaitingForChallenge` entry from `from_peer`
     /// (gateway MAC that failed crypto) back to `to_peer` (provisional discovery
     /// dest) so a later valid challenge can still complete the install.
-    #[cfg(feature = "sensor")]
+    /// Test-only seam: production rollback flows through the lent
+    /// [`ProtocolStores`] view, so this facade helper exists only for the
+    /// dual-role unit tests.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
     pub(crate) fn rollback_install_pending_rebind(
         &mut self,
         from_peer: PeerId,
         to_peer: PeerId,
     ) -> Result<(), SigilError> {
-        use crate::core::pending::{HandshakeRole, HandshakeStep};
-
-        if self.pending.contains_key(&to_peer) {
-            return Ok(());
-        }
-        let mut ph = self
-            .remove_pending(&from_peer)
-            .ok_or(SigilError::NoPending { peer: from_peer })?;
-        if ph.role != HandshakeRole::Sensor || ph.step != HandshakeStep::InstallWaitingForChallenge
-        {
-            // Put back — do not leave the table inconsistent.
-            let _ = self.insert_pending(from_peer, ph);
-            return Err(SigilError::InvalidHandshakeState);
-        }
-        ph.peer_mac = to_peer;
-        self.insert_pending(to_peer, ph)
-    }
-
-    /// Clears a sensor-side Install state that cannot survive a local reboot.
-    /// Called only when the trusted host explicitly starts a fresh Install.
-    #[cfg(feature = "sensor")]
-    pub(crate) fn clear_sensor_install_commit_recovery(&mut self) {
-        use crate::core::pending::{HandshakeRole, HandshakeStep};
-        let peer = self.pending.iter().find_map(|(peer, pending)| {
-            (pending.role == HandshakeRole::Sensor
-                && pending.step == HandshakeStep::InstallWaitingForCommitConfirmed)
-                .then_some(*peer)
-        });
-        if let Some(peer) = peer {
-            let _ = self.remove_pending(&peer);
-        }
+        self.pending
+            .rollback_install_pending_rebind(from_peer, to_peer)
     }
 
     //  High-level protocol API
@@ -538,7 +522,8 @@ impl<const N: usize> SessionManager<N> {
     /// # // (pseudo-code, not compiled)
     /// # fn example(mgr: &mut sigil::core::manager::SessionManager<16>,
     /// #           frame: &[u8], se: &mut impl sigil::core::traits::SecureElement,
-    /// #           rng: &mut impl sigil::core::traits::RandomSource, now: u32) {
+    /// #           rng: &mut impl sigil::core::traits::RandomSource,
+    /// #           now: u32) {
     /// match mgr.process_incoming_packet::<200, 256>(frame, 1000).unwrap() {
     ///     (SigilEvent::Data { peer, payload }, _) => {
     ///         // handle decrypted application data
@@ -548,38 +533,55 @@ impl<const N: usize> SessionManager<N> {
     ///     }
     ///     (SigilEvent::TimeSyncRequest { peer }, _) => {
     ///         // Gateway host: apply product policy, then build and TX TimeSync.
-    ///         let response = mgr.encrypt_time_sync::<256>(&peer, now, 1, 1, now).ok();
+    ///         #[cfg(feature = "gateway")]
+    ///         let _response = mgr.encrypt_time_sync::<256>(&peer, now, 1, 1, now).ok();
     ///     }
     ///     (SigilEvent::Event { peer, event_id, payload, duplicate }, _) => {
     ///         // Process/persist only when !duplicate, then call ack_event and TX it.
-    ///         let ack = mgr.ack_event::<256>(&peer, event_id, now).ok();
+    ///         #[cfg(feature = "gateway")]
+    ///         let _ack = mgr.ack_event::<256>(&peer, event_id, now).ok();
     ///     }
     ///     (SigilEvent::EventAck { event_id, .. }, _) => {
     ///         // Matching pending Event was authenticated and cleared.
     ///     }
     ///     (SigilEvent::InstallRequest { peer, frame }, _) => {
     ///         // Host: check pairing allowlist (DB) for `peer` (sender MAC), then:
-    ///         mgr.handle_install_request::<256>(&frame, se, rng, now, now + 86_400).ok();
+    ///         #[cfg(feature = "gateway")]
+    ///         mgr.handle_install_request::<256>(&frame, se, rng, now, 86_400).ok();
     ///     }
     ///     (SigilEvent::InstallChallenge { frame,.. }
-    ///     | SigilEvent::InstallConfirm { frame,.. }
     ///     | SigilEvent::InstallCommitConfirmed { frame,.. }, _) => {
+    ///         #[cfg(feature = "sensor")]
+    ///         mgr.continue_install::<256>(&frame, se, now).ok();
+    ///     }
+    ///     (SigilEvent::InstallConfirm { frame,.. }, _) => {
+    ///         #[cfg(feature = "gateway")]
     ///         mgr.continue_install::<256>(&frame, se, now).ok();
     ///     }
     ///     (SigilEvent::RenewRequest { frame,.. }, _) => {
-    ///         mgr.handle_renew_request::<256>(&frame, rng, 1000, 20_000).ok();
+    ///         #[cfg(feature = "gateway")]
+    ///         mgr.handle_renew_request::<256>(&frame, se, rng, 1000, 20_000).ok();
     ///     }
     ///     (SigilEvent::RenewChallenge { frame,.. }
-    ///     | SigilEvent::RenewAck { frame,.. }
     ///     | SigilEvent::RenewCommitConfirmed { frame,.. }, _) => {
-    ///         mgr.continue_renew::<256>(&frame, rng, now).ok();
+    ///         #[cfg(feature = "sensor")]
+    ///         mgr.continue_renew::<256>(&frame, se, now).ok();
+    ///     }
+    ///     (SigilEvent::RenewConfirm { frame,.. }, _) => {
+    ///         #[cfg(feature = "gateway")]
+    ///         mgr.handle_renew_confirm::<256>(&frame, se, now).ok();
     ///     }
     ///     (SigilEvent::ResumeRequest { frame,.. }, _) => {
-    ///         mgr.handle_resume_request::<256>(&frame, se, rng, 1000, 1000 + 86_400).ok();
+    ///         #[cfg(feature = "gateway")]
+    ///         mgr.handle_resume_request::<256>(&frame, se, rng, 1000, 86_400).ok();
     ///     }
     ///     (SigilEvent::ResumeChallenge { frame,.. }
-    ///     | SigilEvent::ResumeConfirm { frame,.. }
     ///     | SigilEvent::ResumeCommitConfirmed { frame,.. }, _) => {
+    ///         #[cfg(feature = "sensor")]
+    ///         mgr.continue_resume::<256>(&frame, se, now).ok();
+    ///     }
+    ///     (SigilEvent::ResumeConfirm { frame,.. }, _) => {
+    ///         #[cfg(feature = "gateway")]
     ///         mgr.continue_resume::<256>(&frame, se, now).ok();
     ///     }
     /// }
@@ -639,11 +641,7 @@ impl<const N: usize> SessionManager<N> {
     /// Abandons the matching Event after the host retry budget is exhausted.
     /// The id remains consumed and cannot be reused for a later Event.
     #[cfg(feature = "sensor")]
-    pub fn cancel_pending_event(
-        &mut self,
-        peer: &PeerId,
-        event_id: u64,
-    ) -> Result<(), SigilError> {
+    pub fn cancel_pending_event(&mut self, peer: &PeerId, event_id: u64) -> Result<(), SigilError> {
         crate::core::pipeline::cancel_pending_event_internal(self, peer, event_id)
     }
 
@@ -784,39 +782,60 @@ impl<const N: usize> SessionManager<N> {
     pub fn start_renew<const MSG: usize>(
         &mut self,
         peer: PeerId,
-        rng: &mut impl RandomSource,
         now: u32,
     ) -> Result<SigilAction<MSG>, SigilError> {
-        crate::core::renew::start_renew_sensor_internal(self, peer, rng, now)
+        crate::core::renew::start_renew_sensor_internal(self, peer, now)
     }
 
     /// Processes a renew request packet (gateway side).
     /// # Arguments
     /// * `packet` - Received encrypted renew request frame
-    /// * `rng` - Random source (for the gateway ephemeral scalar)
+    /// * `se` - Host-selected crypto implementation
+    /// * `rng` - Host CSPRNG used by the gateway implementation
     /// * `now` - Current host time in **seconds** (validates the **old** session key)
     /// * `key_lifetime_secs` - Lifetime of the **new** key in seconds
     #[cfg(feature = "gateway")]
     pub fn handle_renew_request<const MSG: usize>(
         &mut self,
         packet: &[u8],
+        se: &mut impl SecureElement,
         rng: &mut impl RandomSource,
         now: u32,
         key_lifetime_secs: u32,
     ) -> Result<SigilAction<MSG>, SigilError> {
-        crate::core::renew::handle_renew_request_internal(self, packet, rng, now, key_lifetime_secs)
+        crate::core::renew::handle_renew_request_internal(
+            self,
+            packet,
+            se,
+            rng,
+            now,
+            key_lifetime_secs,
+        )
     }
 
-    /// Continues an in-progress renew handshake.
-    /// Host must call this for `RenewChallenge`, `RenewAck`, **and**
-    /// `RenewCommitConfirmed`.
+    /// Continues sensor-side Renew for `RenewChallenge` and
+    /// `RenewCommitConfirmed`. Challenge processing performs the atomic ATECC
+    /// TempKey P-256 exchange through `se`.
+    #[cfg(feature = "sensor")]
     pub fn continue_renew<const MSG: usize>(
         &mut self,
         packet: &[u8],
-        rng: &mut impl RandomSource,
+        se: &mut impl SecureElement,
         now: u32,
     ) -> Result<SigilAction<MSG>, SigilError> {
-        crate::core::renew::continue_renew_internal(self, packet, rng, now)
+        crate::core::renew::continue_renew_sensor_internal(self, packet, se, now)
+    }
+
+    /// Processes a sensor `RenewConfirm` on the gateway using the same
+    /// `SecureElement` implementation that generated the context at Request.
+    #[cfg(feature = "gateway")]
+    pub fn handle_renew_confirm<const MSG: usize>(
+        &mut self,
+        packet: &[u8],
+        se: &mut impl SecureElement,
+        now: u32,
+    ) -> Result<SigilAction<MSG>, SigilError> {
+        crate::core::renew::handle_renew_confirm_internal(self, packet, se, now)
     }
 
     /// Starts a resume handshake (sensor side).
@@ -888,41 +907,17 @@ impl<const N: usize> SessionManager<N> {
     }
 
     /// Retransmits the cached Final / CommitConfirmed wire frame for `peer`
-    /// when pending is in a post-Final step
-    /// (`*WaitingForCommitConfirmed` or `*CommitSent`).
-    /// Intended for host retry timers and unit tests. Returns
-    /// [`SigilError::InvalidStep`] / [`SigilError::InvalidHandshakeState`] when
-    /// no cache is available.
+    /// when pending is in a post-Final recovery state (sensor `*FinalSent` or
+    /// gateway `*CommitSent`). Intended for host retry timers and unit tests.
+    /// Returns [`SigilError::InvalidStep`] for any pre-Final state and
+    /// [`SigilError::InvariantViolation`] when a recovery state somehow
+    /// carries no cached frame (internal invariant failure — unrepresentable
+    /// in the tagged model).
     pub fn retransmit_pending_cached<const MSG: usize>(
         &self,
         peer: &PeerId,
     ) -> Result<SigilAction<MSG>, SigilError> {
-        let pending = self
-            .get_pending(peer)
-            .ok_or(SigilError::NoPending { peer: *peer })?;
-        let timeout_ms = pending.suggested_timeout_ms;
-        match pending.step {
-            crate::core::pending::HandshakeStep::InstallWaitingForCommitConfirmed
-            | crate::core::pending::HandshakeStep::InstallCommitSent
-            | crate::core::pending::HandshakeStep::RenewWaitingForCommitConfirmed
-            | crate::core::pending::HandshakeStep::RenewCommitSent
-            | crate::core::pending::HandshakeStep::ResumeWaitingForCommitConfirmed
-            | crate::core::pending::HandshakeStep::ResumeCommitSent => {}
-            _ => return Err(SigilError::InvalidStep { peer: *peer }),
-        }
-        let cached = pending
-            .cached_wire
-            .as_ref()
-            .ok_or(SigilError::InvalidHandshakeState)?;
-        let mut payload: heapless::Vec<u8, MSG> = heapless::Vec::new();
-        payload
-            .extend_from_slice(cached)
-            .map_err(|_| SigilError::CapacityExceeded)?;
-        Ok(SigilAction::Transmit {
-            dest: *peer,
-            payload,
-            wait_timeout_ms: Some(timeout_ms),
-        })
+        self.pending.retransmit_cached_action(peer)
     }
 }
 

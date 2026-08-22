@@ -2,6 +2,9 @@
 
 //! Unit tests for non-blocking packet pipeline
 
+// Isolated semantic-handler tests (Event delivery, TimeSync cooldown).
+mod handlers;
+
 use crate::core::error::SigilError;
 use crate::core::frame::{
     FRAME_TYPE_OFFSET, FrameType, OUTER_HEADER_SIZE, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET,
@@ -104,7 +107,7 @@ fn transmitted<const MSG: usize>(action: crate::core::event::SigilAction<MSG>) -
 fn test_process_empty_packet() {
     let mut manager: SessionManager<16> = crate::core::test_support::test_manager();
     let result = manager.process_incoming_packet::<200, 256>(&[], 1000);
-    assert_eq!(result, Err(SigilError::ParseError));
+    assert_eq!(result, Err(SigilError::MalformedFrame));
 }
 
 #[test]
@@ -112,7 +115,35 @@ fn test_process_short_packet() {
     let mut manager: SessionManager<16> = crate::core::test_support::test_manager();
     let packet = [1u8; 10]; // Less than 17 bytes
     let result = manager.process_incoming_packet::<200, 256>(&packet, 1000);
-    assert_eq!(result, Err(SigilError::ParseError));
+    assert_eq!(result, Err(SigilError::MalformedFrame));
+}
+
+#[test]
+fn test_deterministic_wire_fuzz_smoke_never_panics() {
+    // Stable, dependency-free fuzz smoke for every length around the supported
+    // LoRa frame budget. The corpus mixes arbitrary headers with inputs that
+    // reach the encrypted Data parser, nonce-prefix and tag verification paths.
+    let mut manager = manager_with_active_session(100_000);
+    let mut state = 0xA5A5_1234u32;
+
+    for len in 0..=300usize {
+        let mut packet = [0u8; 300];
+        for byte in &mut packet[..len] {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (state >> 24) as u8;
+        }
+        let _ = manager.process_incoming_packet::<200, 256>(&packet[..len], 1_000);
+
+        if len >= OUTER_HEADER_SIZE {
+            packet[..17].copy_from_slice(&REMOTE);
+            packet[PROTOCOL_VERSION_OFFSET] = PROTOCOL_VERSION;
+            packet[FRAME_TYPE_OFFSET] = FrameType::Data as u8;
+            if len >= OUTER_HEADER_SIZE + 4 {
+                packet[OUTER_HEADER_SIZE..OUTER_HEADER_SIZE + 4].copy_from_slice(&[0x01u8; 4]);
+            }
+            let _ = manager.process_incoming_packet::<200, 256>(&packet[..len], 1_000);
+        }
+    }
 }
 
 #[test]
@@ -189,7 +220,9 @@ fn test_encrypt_then_decrypt_roundtrip() {
 #[test]
 fn test_event_ack_roundtrip_clears_pending() {
     let (mut sensor, mut gateway) = event_pair();
-    let send = sensor.send_event::<256>(&REMOTE, 1, b"door-open", 1_000).unwrap();
+    let send = sensor
+        .send_event::<256>(&REMOTE, 1, b"door-open", 1_000)
+        .unwrap();
     assert!(matches!(
         send,
         crate::core::event::SigilAction::Transmit {
@@ -313,8 +346,8 @@ fn test_event_rejects_wrong_ack_and_parallel_event() {
         })
     );
 
-    let wrong_ack = super::encrypt_application_payload::<4, 256>(
-        &mut gateway,
+    let wrong_ack = super::data::encrypt_application_payload::<4, 256>(
+        &mut gateway.protocol_stores(),
         &LOCAL,
         FrameType::EventAck,
         &99u64.to_be_bytes(),
@@ -336,7 +369,7 @@ fn test_event_cancel_consumes_id_and_small_buffer_is_fail_closed() {
     let (mut sensor, _) = event_pair();
     assert_eq!(
         sensor.send_event::<54>(&REMOTE, 1, b"x", 1_000),
-        Err(SigilError::CapacityExceeded)
+        Err(SigilError::OutputBufferTooSmall)
     );
     assert_eq!(sensor.get(&REMOTE).unwrap().pending_event_id(), None);
     assert_eq!(sensor.get(&REMOTE).unwrap().tx_counter(), 0);
@@ -402,7 +435,7 @@ fn test_event_ack_capacity_failure_preserves_delivery_state() {
 
     assert_eq!(
         gateway.ack_event::<54>(&LOCAL, 3, 1_000),
-        Err(SigilError::CapacityExceeded)
+        Err(SigilError::OutputBufferTooSmall)
     );
     assert_eq!(gateway.get(&LOCAL).unwrap().tx_counter(), 0);
 
@@ -457,15 +490,15 @@ fn test_event_and_ack_enforce_session_roles() {
     let (mut sensor, mut gateway) = event_pair();
     assert_eq!(
         gateway.send_event::<256>(&LOCAL, 1, b"forbidden", 1_000),
-        Err(SigilError::InvalidStep { peer: LOCAL })
+        Err(SigilError::WrongRole { peer: LOCAL })
     );
     assert_eq!(
         sensor.ack_event::<256>(&REMOTE, 1, 1_000),
-        Err(SigilError::InvalidStep { peer: REMOTE })
+        Err(SigilError::WrongRole { peer: REMOTE })
     );
     assert_eq!(
         sensor.release_event_delivery(&REMOTE, 1),
-        Err(SigilError::InvalidStep { peer: REMOTE })
+        Err(SigilError::WrongRole { peer: REMOTE })
     );
 }
 
@@ -504,7 +537,7 @@ fn test_event_type_tampering_fails_authentication_without_consuming_counter() {
 fn test_flipped_frame_type_data_to_renew_fails_aad() {
     // C2 regression: encrypt as Data, flip frame_type to RenewRequest.
     // Routing classifies as renew, but decrypt under Renew AAD must fail.
-    use crate::core::test_support::MockRandom;
+    use crate::core::test_support::{MockRandom, MockSecureElement};
 
     let mut sender = manager_with_active_session(100_000);
     let plaintext = [0xABu8; 33];
@@ -534,8 +567,10 @@ fn test_flipped_frame_type_data_to_renew_fails_aad() {
             .unwrap(),
         )
         .unwrap();
+    let mut se = MockSecureElement::default();
     let mut rng = MockRandom::new();
-    let result = gateway.handle_renew_request::<256>(&frame, &mut rng, 1000, 1000 + 86_400);
+    let result =
+        gateway.handle_renew_request::<256>(&frame, &mut se, &mut rng, 1000, 1000 + 86_400);
     assert_eq!(result, Err(SigilError::VerificationFailed));
     let session = gateway.get(&LOCAL).unwrap();
     assert_eq!(session.session_key().unwrap(), &[0x42u8; 32]);
@@ -663,7 +698,7 @@ fn test_time_sync_is_gateway_only_authenticated_and_replay_protected() {
 
     assert_eq!(
         sensor.encrypt_time_sync::<128>(&GW_MAC, 10, 1, 2, 1_000),
-        Err(SigilError::InvalidStep { peer: GW_MAC })
+        Err(SigilError::WrongRole { peer: GW_MAC })
     );
 
     let frame = gateway
@@ -689,8 +724,8 @@ fn test_time_sync_is_gateway_only_authenticated_and_replay_protected() {
     // A valid AEAD TimeSync in the wrong direction is rejected by the
     // gateway-role receiver. The private primitive simulates a nonconforming
     // peer implementation; the public sensor API already rejects this send.
-    let wrong_direction = super::encrypt_application_payload::<4, 128>(
-        &mut sensor,
+    let wrong_direction = super::data::encrypt_application_payload::<4, 128>(
+        &mut sensor.protocol_stores(),
         &GW_MAC,
         FrameType::TimeSync,
         &[0u8; 10],
@@ -699,7 +734,7 @@ fn test_time_sync_is_gateway_only_authenticated_and_replay_protected() {
     .unwrap();
     assert_eq!(
         gateway.process_incoming_packet::<32, 128>(&wrong_direction, 1_000),
-        Err(SigilError::InvalidStep { peer: SENSOR_MAC })
+        Err(SigilError::WrongRole { peer: SENSOR_MAC })
     );
 }
 
@@ -709,7 +744,7 @@ fn test_time_sync_request_roundtrip_cooldown_and_response() {
 
     assert_eq!(
         gateway.request_time_sync::<128>(&LOCAL, 1_000),
-        Err(SigilError::InvalidStep { peer: LOCAL })
+        Err(SigilError::WrongRole { peer: LOCAL })
     );
     let request = sensor.request_time_sync::<128>(&REMOTE, 1_000).unwrap();
     assert_eq!(request[FRAME_TYPE_OFFSET], FrameType::TimeSyncRequest as u8);
@@ -769,12 +804,12 @@ fn test_time_sync_request_rejects_wrong_direction_malformed_and_small_buffer() {
 
     assert_eq!(
         sensor.request_time_sync::<46>(&REMOTE, 1_000),
-        Err(SigilError::CapacityExceeded)
+        Err(SigilError::OutputBufferTooSmall)
     );
     assert_eq!(sensor.get(&REMOTE).unwrap().tx_counter(), 0);
 
-    let wrong_direction = super::encrypt_application_payload::<4, 128>(
-        &mut gateway,
+    let wrong_direction = super::data::encrypt_application_payload::<4, 128>(
+        &mut gateway.protocol_stores(),
         &LOCAL,
         FrameType::TimeSyncRequest,
         &[],
@@ -783,20 +818,22 @@ fn test_time_sync_request_rejects_wrong_direction_malformed_and_small_buffer() {
     .unwrap();
     assert_eq!(
         sensor.process_incoming_packet::<32, 128>(&wrong_direction, 1_000),
-        Err(SigilError::InvalidStep { peer: REMOTE })
+        Err(SigilError::WrongRole { peer: REMOTE })
     );
 
-    let malformed = super::encrypt_application_payload::<4, 128>(
-        &mut sensor,
+    let malformed = super::data::encrypt_application_payload::<4, 128>(
+        &mut sensor.protocol_stores(),
         &REMOTE,
         FrameType::TimeSyncRequest,
         &[0x01],
         1_000,
     )
     .unwrap();
+    // An authenticated payload whose shape contradicts its frame type is
+    // malformed wire input.
     assert_eq!(
         gateway.process_incoming_packet::<32, 128>(&malformed, 1_000),
-        Err(SigilError::ParseError)
+        Err(SigilError::MalformedFrame)
     );
 }
 
@@ -867,7 +904,8 @@ fn test_wrong_nonce_prefix_rejected() {
     frame[OUTER_HEADER_SIZE] ^= 0xFF;
 
     let result = manager.process_incoming_packet::<200, 256>(&frame, 1000);
-    assert!(matches!(result, Err(SigilError::ParseError)));
+    // A corrupted nonce prefix fails AEAD authentication: malformed input.
+    assert!(matches!(result, Err(SigilError::MalformedFrame)));
 }
 
 #[test]
@@ -880,7 +918,7 @@ fn test_truncated_encrypted_frame_rejected() {
     short_frame[FRAME_TYPE_OFFSET] = FrameType::Data as u8;
 
     let result = manager.process_incoming_packet::<200, 256>(&short_frame, 1000);
-    assert_eq!(result, Err(SigilError::ParseError));
+    assert_eq!(result, Err(SigilError::MalformedFrame));
 }
 
 #[test]
@@ -961,7 +999,8 @@ fn test_handshake_frame_copy_rejects_oversized_msg() {
     packet[FRAME_TYPE_OFFSET] = FrameType::InstallRequest as u8;
 
     let result = manager.process_incoming_packet::<200, 16>(&packet, 1000);
-    assert_eq!(result, Err(SigilError::CapacityExceeded));
+    // An undersized MSG generic constant is an integration buffer-sizing error.
+    assert_eq!(result, Err(SigilError::OutputBufferTooSmall));
 }
 
 #[test]
@@ -1024,7 +1063,7 @@ fn test_process_renew_steps_classified() {
     for (ft, expect_req, expect_chal, expect_ack) in [
         (FrameType::RenewRequest, true, false, false),
         (FrameType::RenewChallenge, false, true, false),
-        (FrameType::RenewAck, false, false, true),
+        (FrameType::RenewConfirm, false, false, true),
     ] {
         let mut packet = [0u8; 40];
         packet[..17].copy_from_slice(&peer);
@@ -1050,7 +1089,7 @@ fn test_process_renew_steps_classified() {
         assert_eq!(
             matches!(
                 event,
-                crate::core::event::SigilEvent::RenewAck { peer: p,.. } if p == peer
+                crate::core::event::SigilEvent::RenewConfirm { peer: p,.. } if p == peer
             ),
             expect_ack
         );
