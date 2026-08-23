@@ -81,7 +81,7 @@ fn measurement_pair() -> (SessionManager<4>, SessionManager<4>) {
                 [2u8; 33],
                 material.clone(),
                 SessionRole::Sensor,
-                RESUME_PSK,
+                &RESUME_PSK,
                 EXPIRE,
                 NOW,
             )
@@ -95,7 +95,7 @@ fn measurement_pair() -> (SessionManager<4>, SessionManager<4>) {
                 [2u8; 33],
                 material,
                 SessionRole::Gateway,
-                RESUME_PSK,
+                &RESUME_PSK,
                 EXPIRE,
                 NOW,
             )

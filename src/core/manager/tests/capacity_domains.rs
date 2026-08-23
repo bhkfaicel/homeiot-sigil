@@ -48,7 +48,7 @@ fn buffer_sizing_error_is_distinct_from_capacity_domains() {
             [0x02u8; 33],
             DirectionalMaterial::symmetric_for_test([0x55u8; 32], [0xAAu8; 4]),
             SESSION_ROLE,
-            [0x5Du8; 32],
+            &[0x5Du8; 32],
             100_000,
             0,
         )
@@ -87,7 +87,7 @@ fn session_saturation_yields_session_table_full_for_unknown_peer() {
             [0x02u8; 33],
             DirectionalMaterial::symmetric_for_test([key; 32], [key; 4]),
             SESSION_ROLE,
-            [0x5Du8; 32],
+            &[0x5Du8; 32],
             100_000,
             0,
         )
@@ -132,7 +132,7 @@ fn pending_saturation_yields_pending_table_full_on_sensor_paths() {
             [0x02u8; 33],
             DirectionalMaterial::symmetric_for_test([key; 32], [key; 4]),
             SessionRole::Sensor,
-            [0x5Du8; 32],
+            &[0x5Du8; 32],
             100_000,
             0,
         )
@@ -182,12 +182,16 @@ fn pending_saturation_yields_pending_table_full_on_gateway_paths() {
     let mut se_gw = MockSecureElement::gateway(2, GATEWAY_LOCAL_MAC);
     let mut rng = MockRandom::new();
 
-    // Three accepted install requests occupy three pending slots.
+    // Three accepted install requests occupy three pending slots. They also
+    // insert replay-cache triples, so the saturation phase below is staged
+    // beyond the replay horizon: the TTL purge empties the CACHE while the
+    // pre-commit PENDING entries persist (no tick is called), isolating the
+    // failure to the pending domain alone.
     for id in 0..3u8 {
         let mac = sensor_mac(id);
         let frame = super::host_flows::build_install_request_frame(&mut se_sensor, mac, 0x11)
             .expect("attested request frame builds");
-        mgr.handle_install_request::<256>(&frame, &mut se_gw, &mut rng, 1_000, 86_400)
+        mgr.handle_install_request::<256>(&frame, &mut se_gw, &mut rng, 0, 86_400)
             .expect("request accepted into pending");
     }
     assert_eq!(mgr.pending_len(), 3);
@@ -210,7 +214,7 @@ fn pending_saturation_yields_pending_table_full_on_gateway_paths() {
         RESUME_SENSOR_MAC,
         [0x44u8; 16],
     );
-    mgr.handle_resume_request::<256>(&req4, &mut se_gw, &mut rng, 2_000, 86_400)
+    mgr.handle_resume_request::<256>(&req4, &mut se_gw, &mut rng, 10, 86_400)
         .expect("fourth pending created");
     assert_eq!(mgr.pending_len(), 4);
 
@@ -232,15 +236,17 @@ fn pending_saturation_yields_pending_table_full_on_gateway_paths() {
         [0x55u8; 16],
     );
     assert_eq!(
-        mgr.handle_resume_request::<256>(&req5, &mut se_gw, &mut rng, 3_000, 86_400),
+        mgr.handle_resume_request::<256>(&req5, &mut se_gw, &mut rng, 4_000, 86_400),
         Err(SigilError::PendingTableFull)
     );
 
     // Fail-atomic and retryable: no cooldown was stamped for the rejected
     // requester (stamping happens only after a successful insert), so the
-    // retry reaches the same capacity signal rather than RateLimited.
+    // retry reaches the same capacity signal rather than RateLimited. The
+    // replay cache stays empty too (the purge already reclaimed every
+    // expired triple; failures never insert).
     assert_eq!(
-        mgr.handle_resume_request::<256>(&req5, &mut se_gw, &mut rng, 3_001, 86_400),
+        mgr.handle_resume_request::<256>(&req5, &mut se_gw, &mut rng, 4_001, 86_400),
         Err(SigilError::PendingTableFull)
     );
 }

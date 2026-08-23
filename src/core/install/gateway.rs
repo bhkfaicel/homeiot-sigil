@@ -33,7 +33,7 @@ use crate::core::install::wire::{
     EcdsaSig, InstallChallenge, build_install_challenge, parse_install_confirm,
     parse_install_request,
 };
-use crate::core::manager::ProtocolStores;
+use crate::core::manager::{HandshakeKind, ProtocolStores};
 use crate::core::pending::{InstallGatewayStaged, PendingHandshake, PendingState};
 use crate::core::session::{Session, SessionRole};
 use crate::core::traits::{FactoryCertificateMetadata, RandomSource, SecureElement};
@@ -98,6 +98,27 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
     // cooldown-table purge of this request happens here; unauthenticated
     // senders can trigger only that expired-entry reclamation.
     stores.admission.admit_install(&peer, now)?;
+
+    // Replay defense (runs BEFORE the first cryptographic operation): purge
+    // strictly-expired entries (the only permitted pre-authentication cache
+    // effect — expired stamps form a ring prefix), then exact-triple lookup
+    // over the live remainder. A hit is a re-delivery of a triple this
+    // handler already authenticated to successful completion within the
+    // replay horizon; it costs zero SE/HKDF work and mutates nothing.
+    stores.replay_cache.prefix_purge(now);
+    if stores
+        .replay_cache
+        .contains(HandshakeKind::Install, &peer, &req.sensor_nonce)
+    {
+        return Err(SigilError::HandshakeReplay { peer });
+    }
+    // Fail-closed bounded refusal: a full cache of live entries rejects the
+    // fresh initiator here instead of evicting any entry. Recovery flows
+    // through TTL expiry once filling pressure stops.
+    if stores.replay_cache.is_full() {
+        return Err(SigilError::ReplayCacheFull { peer });
+    }
+
     // Factory attestation: cert binds PeerId ‖ pubkey.
     let cert_msg = crate::core::install::factory_cert_message(
         crate::core::install::FACTORY_PRODUCT_ID_SENSOR,
@@ -210,6 +231,15 @@ pub(crate) fn handle_install_request<const N: usize, const MSG: usize>(
     }
     stores.pending.insert(peer, pending)?;
 
+    // Success-only cache insertion — the FINAL mutation of this invocation,
+    // after the fail-atomic pending commit and immediately before returning
+    // Transmit. Every error return above therefore leaves the cache
+    // byte-identical: a failed handshake writes no triple, so no legitimate
+    // retry is ever denied `HandshakeReplay` by its own earlier failure.
+    stores
+        .replay_cache
+        .insert(HandshakeKind::Install, peer, &req.sensor_nonce, now)?;
+
     Ok(SigilAction::Transmit {
         dest: peer,
         payload: out,
@@ -237,6 +267,10 @@ pub(crate) fn handle_install_confirm<const N: usize, const MSG: usize>(
 
     // Extract every commit input from the tagged state while the pending
     // borrow is immutable; the clone ends the borrow before mutations.
+    // The durable-PSK copy is wrapped in its zeroizing carrier immediately so
+    // every fallible step below (signature verify, commit-frame build, session
+    // insert, recovery transition) wipes it on any error path instead of
+    // leaving a plain stack copy behind.
     let (sensor_pubkey, gateway_nonce, sensor_nonce, key_lifetime_secs, material, resume_psk) = {
         let pending = stores
             .pending
@@ -253,7 +287,7 @@ pub(crate) fn handle_install_confirm<const N: usize, const MSG: usize>(
                 *staged.sensor_nonce.as_array(),
                 staged.key_lifetime_secs,
                 staged.keys.clone(),
-                *staged.resume_psk.as_array(),
+                crate::core::event::ResumePskSecret::new(*staged.resume_psk.as_array()),
             ),
             _ => return Err(SigilError::InvalidStep { peer }),
         }
@@ -278,12 +312,16 @@ pub(crate) fn handle_install_confirm<const N: usize, const MSG: usize>(
     )?;
 
     let key_expire_at = crate::core::session::expire_from_lifetime(now, key_lifetime_secs)?;
+    // Borrow-only hand-off: the constructor validates through the carrier and
+    // copies into the session-owned field itself, so this handler never
+    // unwraps a plain copy; `resume_psk` stays owned here for the persist
+    // action below and wipes if any remaining step fails.
     let session = Session::new_active(
         peer,
         sensor_pubkey,
         material,
         SessionRole::Gateway,
-        resume_psk,
+        resume_psk.expose_secret(),
         key_expire_at,
         now,
     )?;
@@ -306,7 +344,7 @@ pub(crate) fn handle_install_confirm<const N: usize, const MSG: usize>(
     Ok(SigilAction::PersistPeerStaticKey {
         peer,
         pubkey: sensor_pubkey,
-        resume_psk: crate::core::event::ResumePskSecret::new(resume_psk),
+        resume_psk,
         transmit: commit_frame,
         wait_timeout_ms: Some(INSTALL_TIMEOUT_MS),
     })

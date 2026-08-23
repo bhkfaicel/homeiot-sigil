@@ -4,6 +4,12 @@
 
 mod transitions;
 
+// Commit-path durable-PSK zeroization suites (success / failure / retransmit).
+mod commit_psk;
+
+// Replay-defense downstream-failure suites for the install initiator path.
+mod replay_cache;
+
 // Host-side performance measurement suite (dev-only, prints with --nocapture).
 mod perf_measurements;
 
@@ -1382,7 +1388,9 @@ fn test_install_rejects_inflight_pending_before_se() {
 
 #[test]
 fn test_install_rate_limited_after_cancel() {
-    // After cancel, cooldown still blocks a fresh InstallRequest within 15 s.
+    // After cancel, cooldown still blocks a fresh InstallRequest within 15 s;
+    // beyond it the ALREADY-ACCEPTED recording is suppressed as a handshake
+    // replay, and legitimate recovery restarts with a FRESH nonce.
     let mut sensor: SessionManager<16> =
         crate::core::test_support::test_manager_with_mac(SENSOR_MAC);
     let mut gateway: SessionManager<16> = crate::core::test_support::test_manager_with_mac(GW_MAC);
@@ -1406,13 +1414,39 @@ fn test_install_rate_limited_after_cancel() {
     let result = gateway.handle_install_request::<256>(&req, &mut se_gw, &mut rng_gw, 1000, 86_400);
     assert_eq!(result, Err(SigilError::RateLimited { peer: SENSOR_MAC }));
 
+    // At the cooldown boundary the identical recording meets the replay
+    // cache (accepted-to-completion triples are suppressed within the
+    // horizon): hosts abandon the stale attempt...
+    let result = gateway.handle_install_request::<256>(
+        &req,
+        &mut se_gw,
+        &mut rng_gw,
+        1000 + crate::core::install::INSTALL_REQUEST_COOLDOWN,
+        86_400,
+    );
+    assert_eq!(
+        result,
+        Err(SigilError::HandshakeReplay { peer: SENSOR_MAC })
+    );
+
+    // ...and recovery restarts the handshake with a FRESH nonce. Host
+    // policy first: abandon the stale sensor-side attempt (its pre-commit
+    // pending is cancellable).
+    sensor.cancel_pending(&GW_MAC).unwrap();
+    let fresh_req = match sensor
+        .start_install::<256>(GW_MAC, &mut se_sensor, &mut rng_sensor, 1_015)
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!(),
+    };
     let action = gateway
         .handle_install_request::<256>(
-            &req,
+            &fresh_req,
             &mut se_gw,
             &mut rng_gw,
             1000 + crate::core::install::INSTALL_REQUEST_COOLDOWN,
-            1000 + crate::core::install::INSTALL_REQUEST_COOLDOWN + 86_400,
+            86_400,
         )
         .unwrap();
     assert!(matches!(action, SigilAction::Transmit { .. }));

@@ -33,7 +33,7 @@ fn gateway_with_session(expire: u32) -> SessionManager<4> {
             [2u8; 33],
             DirectionalMaterial::symmetric_for_test([0x42u8; 32], [0x01u8; 4]),
             SessionRole::Gateway,
-            RESUME_PSK,
+            &RESUME_PSK,
             expire,
             0,
         )
@@ -53,7 +53,7 @@ fn sensor_with_session(expire: u32) -> SessionManager<4> {
             [2u8; 33],
             DirectionalMaterial::symmetric_for_test([0x42u8; 32], [0x01u8; 4]),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             expire,
             0,
         )

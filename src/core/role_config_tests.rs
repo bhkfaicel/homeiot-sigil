@@ -49,7 +49,7 @@ fn sensor_only_drives_install_renew_and_resume_entrypoints() {
                 [0x02; 33],
                 material,
                 SessionRole::Sensor,
-                RESUME_PSK,
+                &RESUME_PSK,
                 10_000,
                 0,
             )

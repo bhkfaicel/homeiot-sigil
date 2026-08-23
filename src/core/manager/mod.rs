@@ -11,8 +11,15 @@ mod store;
 #[cfg(feature = "gateway")]
 use store::AdmissionStore;
 pub(crate) use store::PendingStore;
+#[cfg(feature = "gateway")]
+pub(crate) use store::{HandshakeKind, ReplayCache};
+// Test-introspection surface of the replay cache (sizes, expiry math,
+// entry layout): its only consumers are the dual-role adversarial suites,
+// so it is compiled out of every other build.
 pub(crate) use store::ProtocolStores;
 pub(crate) use store::SessionStore;
+#[cfg(all(test, feature = "sensor", feature = "gateway"))]
+pub(crate) use store::{REPLAY_HORIZON_SECS, ReplayCacheEntry, replay_entry_expired};
 
 use crate::core::error::SigilError;
 use crate::core::event::{SigilAction, SigilEvent};
@@ -105,6 +112,14 @@ pub struct SessionManager<const N: usize> {
     #[cfg(feature = "gateway")]
     install_admission: AdmissionStore<N>,
 
+    /// Gateway-side bounded replay-defense cache of accepted clear-text
+    /// handshake initiator triples (`Install` / `Resume`, disjoint key
+    /// spaces). Success-only insertion, TTL-only removal
+    /// ([`REPLAY_HORIZON_SECS`](crate::core::manager::REPLAY_HORIZON_SECS)),
+    /// fail-closed saturation refusal. RAM-only: cold after reboot.
+    #[cfg(feature = "gateway")]
+    replay_cache: ReplayCache<N>,
+
     /// Factory root public key (compressed P-256 SEC1).
     /// Used to verify peer factory certificates during install. Public and
     /// stable for the whole fleet; never taken from an on-air packet.
@@ -129,6 +144,8 @@ impl<const N: usize> SessionManager<N> {
             pending: PendingStore::new(),
             #[cfg(feature = "gateway")]
             install_admission: AdmissionStore::new(),
+            #[cfg(feature = "gateway")]
+            replay_cache: ReplayCache::new(),
             factory_pubkey,
             local_mac,
         })
@@ -431,9 +448,20 @@ impl<const N: usize> SessionManager<N> {
             pending: &mut self.pending,
             #[cfg(feature = "gateway")]
             admission: &mut self.install_admission,
+            #[cfg(feature = "gateway")]
+            replay_cache: &mut self.replay_cache,
             factory_pubkey: &self.factory_pubkey,
             local_mac: &self.local_mac,
         }
+    }
+
+    /// Test-only read access to the gateway replay cache so the adversarial
+    /// suites can assert occupancy, FIFO ordering, and byte-identical live
+    /// state. Production code reaches the cache exclusively through the
+    /// lent [`ProtocolStores`] view.
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
+    pub(crate) fn replay_cache(&self) -> &ReplayCache<N> {
+        &self.replay_cache
     }
 
     /// Rebinds the sole sensor-side install pending entry to `new_peer`.

@@ -27,6 +27,11 @@ mod store_saturation;
 #[cfg(all(feature = "sensor", feature = "gateway"))]
 mod type_size_bounds;
 
+// Replay-defense adversarial suite (dual-role: drives real sensor/gateway
+// handshake flows through the public facade).
+#[cfg(all(feature = "sensor", feature = "gateway"))]
+mod replay_cache;
+
 // Host-side performance measurement suite (dev-only, prints with
 // --nocapture); uses the dual-role test seams below for pending fixtures.
 #[cfg(all(feature = "sensor", feature = "gateway"))]

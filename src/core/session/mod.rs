@@ -284,17 +284,29 @@ impl Session {
     /// **Crate-internal**: not part of the host API. Counters
     /// always start at 0, so restoring persisted keys through this constructor
     /// would reuse nonces. Hosts must use [`Self::new_enrolled`] + Resume.
+    ///
+    /// # Zeroization contract
+    ///
+    /// `resume_psk` is taken **by borrow** (at production call sites it
+    /// references the bytes inside a zeroizing [`ResumePskSecret`] carrier).
+    /// Validation runs through that borrow, so every constructor failure path
+    /// leaves the caller-owned carrier as the only holder of the secret — no
+    /// plain by-value copy is ever owned by this function. The single plain
+    /// materialization is the session-owned copy created **after** all
+    /// validations succeed, directly inside this `ZeroizeOnDrop` Session.
     pub(crate) fn new_active(
         peer_mac: PeerId,
         peer_static_pubkey: StaticPublicKeyBytes,
         material: DirectionalMaterial,
         role: SessionRole,
-        resume_psk: ResumePsk,
+        resume_psk: &ResumePsk,
         key_expire_at: u32,
         now: u32,
     ) -> Result<Self, SigilError> {
+        // Validate through the borrow only; nothing is unwrapped or copied yet,
+        // so a rejection here cannot leave PSK bytes behind on this stack.
         validate_key_expire_at(now, key_expire_at)?;
-        validate_resume_psk(&resume_psk)?;
+        validate_resume_psk(resume_psk)?;
         let (tx_key, tx_prefix, rx_key, rx_prefix) = Self::apply_directional(role, &material);
         Ok(Self {
             peer_mac,
@@ -304,7 +316,9 @@ impl Session {
             tx_prefix: Some(tx_prefix),
             rx_key: Some(rx_key),
             rx_prefix: Some(rx_prefix),
-            resume_psk: Some(resume_psk),
+            // Infallible success-only materialization: the copy lands straight
+            // in this ZeroizeOnDrop struct field; error paths never reach it.
+            resume_psk: Some(*resume_psk),
             tx_counter: 0,
             rx_counter: 0,
             key_expire_at,

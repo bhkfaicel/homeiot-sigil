@@ -22,7 +22,7 @@ fn test_require_key_material_returns_refs() {
         [4u8; 33],
         DirectionalMaterial::symmetric_for_test(key, prefix),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         10_000,
         0,
     )
@@ -45,7 +45,7 @@ fn test_new_active_and_update_key_validate_expire() {
         [2u8; 33],
         DirectionalMaterial::symmetric_for_test([3u8; 32], [4u8; 4]),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         now,
         now,
     ) {
@@ -64,7 +64,7 @@ fn test_new_active_and_update_key_validate_expire() {
         [2u8; 33],
         DirectionalMaterial::symmetric_for_test([3u8; 32], [4u8; 4]),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         too_far,
         now,
     ) {
@@ -82,7 +82,7 @@ fn test_new_active_and_update_key_validate_expire() {
         [2u8; 33],
         DirectionalMaterial::symmetric_for_test([3u8; 32], [4u8; 4]),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         now + 60,
         now,
     )
@@ -202,7 +202,7 @@ fn test_new_active_session() {
         peer_static_pubkey,
         DirectionalMaterial::symmetric_for_test(session_key, nonce_prefix),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         key_expire_at,
         0,
     )
@@ -225,7 +225,7 @@ fn test_resume_psk_survives_update_and_clear() {
         [2u8; 33],
         DirectionalMaterial::symmetric_for_test([3u8; 32], [4u8; 4]),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         1000,
         0,
     )
@@ -256,7 +256,7 @@ fn test_is_active() {
         peer_static_pubkey,
         DirectionalMaterial::symmetric_for_test(session_key, nonce_prefix),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         key_expire_at,
         0,
     )
@@ -283,7 +283,7 @@ fn test_is_expired() {
         peer_static_pubkey,
         DirectionalMaterial::symmetric_for_test(session_key, nonce_prefix),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         key_expire_at,
         0,
     )
@@ -310,7 +310,7 @@ fn test_update_key() {
         peer_static_pubkey,
         DirectionalMaterial::symmetric_for_test(old_key, old_prefix),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         old_expire,
         0,
     )
@@ -344,7 +344,7 @@ fn test_clear_expired_key() {
         [2u8; 33],
         DirectionalMaterial::symmetric_for_test([3u8; 32], [4u8; 4]),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         1000,
         0,
     )
@@ -379,7 +379,7 @@ fn test_session_zeroize_on_drop() {
         [2u8; 33],
         DirectionalMaterial::symmetric_for_test([0xABu8; 32], [0xCDu8; 4]),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         1000,
         0,
     )

@@ -7,6 +7,145 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+[1.1.0] 2026-08-23
+
+- Document the formally accepted forward-secrecy characteristic of the
+  Install and Resume handshakes in a new README security/threat-model
+  section. The section records the owner's formal acceptance statement —
+  session epochs from Install and Resume are derived from static↔static
+  ECDH, so recorded epochs become decryptable if a device's static private
+  key is extracted after traffic recording (accepted on 2026-08-22) — plus
+  the mitigating context (Renew derives its epochs from ephemeral P-256 ECDH
+  and stays forward-secret; ATECC608-class secure elements keep static keys
+  non-exportable, holding the extraction cost at the physical/side-channel
+  class; re-installing mixes fresh nonces but does not restore forward
+  secrecy for already-recorded epochs) and integrator guidance (do not rely
+  on Install/Resume for long-epoch confidentiality; keep key lifetimes well
+  under `MAX_SESSION_LIFETIME_SECS` and drive Renew regularly so most live
+  epochs are forward-secret; prefer Renew rotation). CLAUDE.md carries a
+  matching pointer note in its host-responsibilities guidance.
+  Documentation-only change: no code, wire-format, or API change.
+
+- Implement the gateway replay defense for clear-text handshake initiators
+  per the accepted design (`docs/anti-replay-design.md`). A crate-private,
+  gateway-gated `ReplayCache` FIFO ring (`heapless::Deque` sized by the
+  manager generic capacity) holds `(handshake_kind, peer_mac,
+initiator_nonce, seen_at)` triples of accepted install/resume requests.
+  An exact-triple redelivery returns the new additive error variant
+  `HandshakeReplay { peer }` with zero secure-element/HKDF work; a cache
+  full of live entries refuses fresh initiators fail-closed through the new
+  `ReplayCacheFull { peer }` variant (family of the table-full variants).
+  Purge, lookup, and the capacity pre-check run after the cheap guards and
+  before any cryptography (install: between the admission decide phase and
+  the first ECDSA verify; resume: between the pending/cooldown guards and
+  the request-MAC verification), and cache insertion happens only as the
+  final step of a successful invocation immediately before Transmit, so
+  every downstream failure leaves the cache byte-identical and never
+  denies a legitimate retry. TTL expiry beyond the 3,600-second horizon is
+  the only removal mechanism — exact tail-plus-head cross-wrap arithmetic
+  under the monotonic half-range clock contract — and no live entry is ever
+  evicted or refreshed. Sensor builds pay zero bytes (the store and its
+  wiring are compiled out of non-gateway configurations). The resume
+  request handler applies the one declared ordering adjustment: the
+  same-peer pending guard and the per-peer cooldown now precede the
+  request-MAC verification, so in-cooldown duplicates keep returning
+  `RateLimited` and bad-MAC frames inside a cooldown surface as
+  `RateLimited` rather than `VerificationFailed`. Twenty-eight named tests
+  cover thirteen downstream-failure retry classes and fifteen core
+  adversarial scenarios (pre-crypto rejection with zero-crypto assertions,
+  multi-peer bounds, churn without resurrection, fail-closed saturation
+  with expiry recovery, forged-frame live-entry immutability, exact
+  wrap-boundary expiry, guard precedence on both paths, cached
+  retransmission, stale and reboot residuals, wire/size regression pins).
+  Three pre-existing suites were updated to pin the newly documented
+  semantics instead: identical recordings re-delivered past the lapsed
+  cooldown now assert `HandshakeReplay` with recovery restarting via a
+  fresh initiator nonce, and the uniform-capacity pending-saturation
+  scenario ages its fill phase past the horizon so the pending-table
+  refusal surfaces through the pre-insert replay check as designed. The
+  all-features suite total rises from 300 to 328 passed.
+
+- Revise the gateway replay-defense design document
+  (`docs/anti-replay-design.md`) through four security-revalidation rounds.
+  The third round applied three precision corrections only: a written
+  side-effect proof for the pre-authentication purge with the spoof-resistance
+  invariant narrowed to live-entry immutability (strictly-expired-prefix
+  reclamation permitted; post-auth relocation rejected in-document), a
+  completed resume ordering contract placing session-existence and role
+  checks exactly, enumerating every pre-MAC observable state including global
+  cache saturation, and pinning the active-session boundary to the host
+  `clear_expired_key` API (none in-handler), and named malformed-provider-key
+  plus null-ECDH-output retry tests on both paths. The fourth round applied
+  three precision corrections only: the install malformed-provider-key test
+  now targets the actual failure site — a malformed gateway-local key
+  returned by `get_static_pubkey` and rejected by encoding validation
+  immediately after retrieval (post-authentication, pre-ECDH) — while a
+  wire-supplied peer point is documented as unreachable at ECDH behind the
+  `verify_ecdsa` trait contract (defense-in-depth only) and resume keeps its
+  distinct at-ECDH stored-peer-key test; an explicit rationale states why no
+  additional named failure test exists between the install admission stamp
+  and the cache insert (every injectable site is already named, fixed-shape
+  helpers are infallible, the pending insert is structurally impossible, and
+  the stamp itself cannot fail after the same-invocation admission decide);
+  install cache occupancy — exactly one slot per accepted handshake,
+  persisting until horizon expiry or reboot — and its pre-authentication
+  saturation-refusal exposure are disclosed, explicitly accepted, and pinned
+  in precedence tests; the adversarial suite is renumbered one function per
+  entry to exactly 28 named tests.
+  The design adds a gateway-local bounded replay cache for authenticated
+  handshake initiators: a `heapless::Deque` FIFO ring sized by the manager's
+  generic capacity holds `(kind, peer_mac, initiator_nonce, seen_at)` triples
+  (40 bytes per entry; about 5 KiB at the gateway default including the deque
+  control block) keyed disjointly for Install and Resume. No live entry is
+  ever evicted; TTL expiry beyond a 3,600-second horizon is the only removal
+  mechanism, so adversarial authenticated churn beyond capacity can never
+  resurrect any recorded pair inside its horizon. A cache full of unexpired
+  entries refuses fresh initiators fail-closed before any cryptographic work
+  via the new `ReplayCacheFull { peer }` error variant — an explicitly
+  accepted availability trade-off whose refusal persists while churn
+  continues (established Data sessions stay unaffected); exact-triple hits
+  return the new `HandshakeReplay { peer }` variant with zero SE/HKDF calls.
+  Cache inserts happen only at successful handshake-step completion (after
+  pending commit), so downstream failures never poison a legitimate retry;
+  install keeps its post-authentication admission stamp (an immediate retry
+  returns `RateLimited`, success lands at the cooldown boundary), and the one
+  declared resume ordering adjustment (pending/cooldown guards ahead of the
+  request-MAC verify) is documented with its error-precedence consequences
+  and pinned by tests. Cross-wrap expiry uses exact tail-plus-head
+  arithmetic under a monotonic half-range clock contract. The document
+  specifies the complete adversarial test plan: thirteen downstream-failure
+  retry tests, named structurally-unreachable failure classes, and fifteen
+  core adversarial tests (28 named tests in total) covering
+  churn-without-resurrection, exact
+  wrap-boundary expiry, forged no-mutation, error precedence, cached
+  retransmission, reboot residual, and wire-constant/size-bound regressions.
+  Design-only change: no code, dependency, wire-format, or existing
+  public-API surface touched; the two error variants ship with the
+  implementation task.
+
+- Close the durable Resume-PSK zeroization gap in both install commit paths:
+  the gateway `InstallConfirm` commit and the sensor `InstallCommitConfirmed`
+  handler now carry the temporary PSK copy extracted from the staged pending
+  state inside the zeroizing `ResumePskSecret` wrapper from extraction to its
+  final destinations (committed session + host persist action), so every
+  error path (rejected proof, key-expiry overflow, corrupted CommitConfirmed
+  frame, saturated session table, failed recovery transition) wipes it
+  instead of leaving a plain stack copy. The crate-private session
+  constructor for active keys now receives the durable PSK **by borrow**:
+  validation runs through the borrow, and the only plain materialization is
+  the session-owned copy created after all validations succeed inside the
+  zeroizing `Session`, so constructor error paths never own unwrapped PSK
+  bytes. The idempotent retransmission path already moved its copy directly
+  into the wrapper and is unchanged. No wire format, public API, or
+  handshake-semantics change; regression suites beside the install module
+  now cover success persistence on both roles, gateway-side commit insertion
+  failure with retry recovery, rejected device-signature proof with retry,
+  key-expiry overflow with retry on both roles, corrupted CommitConfirmed
+  frame with retry, duplicate-Final retransmission PSK equality, and wrapper
+  wipe-on-drop. Eight new tests raise the all-features suite total from 292
+  to 300 passed; the validation-gate test-count floor is re-baselined
+  accordingly (feature-scoped and doctest counts are unchanged).
+
 - Version the footprint measurement report in the documentation tree
   (`docs/footprint-report.md`) instead of the untracked working-notes
   directory, and rename its companion example binary to match
@@ -135,7 +274,7 @@ and this project adheres to semantic versioning.
 - Fix the wire-only test target: shared session test support no longer
   compiles without the `session` feature, so the manufacturing (factory
   certificate) tests run again under `cargo test --no-default-features
-  --features wire`.
+--features wire`.
 - Document the supported feature matrix (`wire`, `sensor`, `gateway`, and the
   explicit `sensor,gateway` composition) and add
   `scripts/test-feature-matrix.sh` as the authoritative locked feature-matrix

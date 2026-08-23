@@ -33,7 +33,7 @@ fn test_insert_and_get() {
         pubkey,
         DirectionalMaterial::symmetric_for_test(key, prefix),
         SessionRole::Sensor,
-        RESUME_PSK,
+        &RESUME_PSK,
         1000,
         0,
     )
@@ -64,7 +64,7 @@ fn test_insert_full() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -77,7 +77,7 @@ fn test_insert_full() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -93,7 +93,7 @@ fn test_insert_full() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -120,7 +120,7 @@ fn test_insert_replaces_existing_when_full() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key_a, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -133,7 +133,7 @@ fn test_insert_replaces_existing_when_full() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key_a, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -148,7 +148,7 @@ fn test_insert_replaces_existing_when_full() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key_b, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             2000,
             0,
         )
@@ -175,7 +175,7 @@ fn test_remove() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -204,7 +204,7 @@ fn test_get_mut() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -242,7 +242,7 @@ fn test_remove_also_clears_pending() {
             pubkey,
             DirectionalMaterial::symmetric_for_test(key, prefix),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -325,7 +325,7 @@ fn test_remove_returns_session_for_nvram_cleanup() {
             pubkey,
             DirectionalMaterial::symmetric_for_test([3u8; 32], [4u8; 4]),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1000,
             0,
         )
@@ -350,7 +350,7 @@ fn test_remove_is_ram_only_no_wipe_hook() {
             [0u8; 33],
             DirectionalMaterial::symmetric_for_test([0u8; 32], [0u8; 4]),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             1,
             0,
         )
@@ -481,7 +481,7 @@ fn test_abandon_commit_recovery_preserves_session_and_frees_slot() {
             [2u8; 33],
             DirectionalMaterial::symmetric_for_test([3u8; 32], [4u8; 4]),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             2_000,
             1_000,
         )

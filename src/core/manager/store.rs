@@ -43,6 +43,9 @@ use crate::core::pending::PendingHandshake;
 use crate::core::session::{PeerId, Session};
 use crate::core::traits::StaticPublicKey;
 use heapless::FnvIndexMap;
+// The replay-cache ring exists only in gateway builds.
+#[cfg(feature = "gateway")]
+use heapless::Deque;
 
 /// Fixed-capacity table of established sessions keyed by **remote** peer MAC.
 ///
@@ -447,6 +450,185 @@ impl<const N: usize> Default for AdmissionStore<N> {
     }
 }
 
+/// Replay horizon for the clear-text handshake replay defense (seconds).
+///
+/// A recorded `(handshake_kind, peer_mac, initiator_nonce)` triple that was
+/// accepted to successful completion is suppressed for this long after its
+/// acceptance. Owner-tunable constant; far below half the `u32` seconds
+/// counter range, as required by the wrap-aware expiry contract.
+#[cfg(feature = "gateway")]
+pub(crate) const REPLAY_HORIZON_SECS: u32 = 3_600;
+
+/// True when a cache entry stamped `seen_at` is at least
+/// [`REPLAY_HORIZON_SECS`] old at `now`.
+///
+/// Wrap-aware expiry comparison under the documented clock contract
+/// (monotonic non-decreasing `u32` seconds; at most one wrap between stamp
+/// and observation; horizon far below half range). Same-epoch observations
+/// use plain subtraction; cross-wrap observations use the exact
+/// tail-plus-head sum widened to `u64`. If the observation-gap clause is
+/// broken (no cache observation for nearly a full counter period), an
+/// ancient entry aliases to "same epoch, small age" and stays SUPPRESSED:
+/// fail-closed false freshness — a denial of that stale recording, never a
+/// replay acceptance.
+#[cfg(feature = "gateway")]
+pub(crate) fn replay_entry_expired(seen_at: u32, now: u32) -> bool {
+    if now >= seen_at {
+        // Same wrap epoch: plain subtraction is the true elapsed time.
+        now - seen_at >= REPLAY_HORIZON_SECS
+    } else {
+        // One wrap between stamp and observation: tail + head, u64-safe.
+        (u32::MAX - seen_at) as u64 + 1 + now as u64 >= REPLAY_HORIZON_SECS as u64
+    }
+}
+
+/// Handshake namespace tag kept inside every replay-cache entry so the
+/// Install and Resume key spaces stay disjoint: an accepted Install request
+/// never suppresses a Resume delivery with the same nonce, and vice versa.
+#[cfg(feature = "gateway")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandshakeKind {
+    /// Clear-text install initiator (`InstallRequest`).
+    Install,
+    /// Clear-text resume initiator (`ResumeRequest`).
+    Resume,
+}
+
+/// One accepted clear-text handshake initiator triple.
+///
+/// Inserted exactly once per successful handler invocation (never on any
+/// error path) and removed only by TTL expiry of [`REPLAY_HORIZON_SECS`] or
+/// by reboot. Stamps are never refreshed. Layout matches the approved RAM
+/// budget: 38 payload bytes, alignment 4, `size_of == 40`.
+#[cfg(feature = "gateway")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayCacheEntry {
+    /// Authenticated remote MAC (the request's outer-header / body identity).
+    pub(crate) peer: PeerId,
+    /// Initiator nonce carried by the request body.
+    pub(crate) nonce: [u8; 16],
+    /// Handshake namespace (keeps Install and Replay keys disjoint).
+    pub(crate) kind: HandshakeKind,
+    /// Acceptance time in absolute seconds (`u32`, wrap-aware comparison).
+    pub(crate) seen_at: u32,
+}
+
+/// Bounded gateway-side cache of accepted clear-text handshake initiators.
+///
+/// A true O(1) FIFO ring ([`heapless::Deque`], `push_back` / `pop_front`,
+/// no element shifting) capped at the manager capacity `N` — sessions ==
+/// pending == admission == cache. Defense properties pinned here:
+///
+/// - **Success-only insertion**: entries enter only as the final mutation of
+///   a successful handler invocation, immediately before the Transmit
+///   return; every error return leaves the cache byte-identical, so no
+///   legitimate retry is ever denied by its own earlier failure.
+/// - **No live-entry eviction**: TTL expiry beyond the horizon is the ONLY
+///   silent removal mechanism; a full cache of unexpired entries refuses
+///   fresh initiators fail-closed ([`SigilError::ReplayCacheFull`]) before
+///   any cryptographic work instead of evicting.
+/// - **Pre-authentication purge safety**: expired stamps form a ring prefix
+///   (stamps are success-only and never refreshed), so the purge pass pops
+///   strictly-expired front entries only; an unauthenticated frame can
+///   never insert, evict, alter, refresh, or reorder any live entry — its
+///   only possible cache effect is earlier reclamation of already-dead
+///   slots.
+/// - **RAM-only**: cold after reboot (documented first-window residual).
+///
+/// Gateway feature only; sensor builds pay zero bytes.
+#[cfg(feature = "gateway")]
+pub(crate) struct ReplayCache<const N: usize> {
+    /// FIFO ring of accepted triples, oldest entry at the front.
+    ring: Deque<ReplayCacheEntry, N>,
+}
+
+#[cfg(feature = "gateway")]
+impl<const N: usize> ReplayCache<N> {
+    /// Creates an empty replay cache.
+    pub(crate) fn new() -> Self {
+        Self { ring: Deque::new() }
+    }
+
+    /// Pops strictly-expired entries from the ring front.
+    ///
+    /// Because stamps are written exactly once (success-only insertion) and
+    /// have no refresh path, they are non-decreasing under the clock
+    /// contract and expired entries always form a ring prefix; the pass
+    /// deterministically stops at the first live entry. This is the single
+    /// pre-authentication mutation channel on the cache.
+    pub(crate) fn prefix_purge(&mut self, now: u32) {
+        while let Some(front) = self.ring.front() {
+            if !replay_entry_expired(front.seen_at, now) {
+                break;
+            }
+            let _ = self.ring.pop_front();
+        }
+    }
+
+    /// Returns true when the exact `(kind, peer, nonce)` triple is present
+    /// among the live (post-purge) entries.
+    pub(crate) fn contains(&self, kind: HandshakeKind, peer: &PeerId, nonce: &[u8; 16]) -> bool {
+        self.ring
+            .iter()
+            .any(|entry| entry.kind == kind && entry.peer == *peer && entry.nonce == *nonce)
+    }
+
+    /// Returns true when the ring holds `N` live-capable slots' worth of
+    /// entries (capacity pre-check runs after the purge, so this reflects
+    /// the post-purge saturation state).
+    pub(crate) fn is_full(&self) -> bool {
+        self.ring.is_full()
+    }
+
+    /// Inserts an accepted triple stamped `now` (success-only, final step
+    /// before Transmit).
+    ///
+    /// Callers must have run the capacity pre-check in the same
+    /// single-threaded invocation, so the push cannot grow past capacity;
+    /// the failure mapping stays fail-closed
+    /// ([`SigilError::ReplayCacheFull`]) as a backstop for future callers,
+    /// mirroring the admission store's scan-free stamp.
+    pub(crate) fn insert(
+        &mut self,
+        kind: HandshakeKind,
+        peer: PeerId,
+        nonce: &[u8; 16],
+        now: u32,
+    ) -> Result<(), SigilError> {
+        self.ring
+            .push_back(ReplayCacheEntry {
+                peer,
+                nonce: *nonce,
+                kind,
+                seen_at: now,
+            })
+            .map_err(|_| SigilError::ReplayCacheFull { peer })?;
+        Ok(())
+    }
+
+    /// Number of cached triples (test introspection only; consumers are
+    /// the dual-role adversarial suites).
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
+    pub(crate) fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Iterates cached triples front-to-back, i.e. oldest first (test
+    /// introspection only; used to assert byte-identical live state and
+    /// FIFO ordering).
+    #[cfg(all(test, feature = "sensor", feature = "gateway"))]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &ReplayCacheEntry> {
+        self.ring.iter()
+    }
+}
+
+#[cfg(all(feature = "gateway", test))]
+impl<const N: usize> Default for ReplayCache<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Narrow multi-store borrow handed to protocol handlers.
 ///
 /// The facade lends this view to the pipeline and handshake implementations
@@ -463,6 +645,11 @@ pub(crate) struct ProtocolStores<'a, const N: usize> {
     /// Gateway-side per-peer install admission / cooldown bookkeeping.
     #[cfg(feature = "gateway")]
     pub(crate) admission: &'a mut AdmissionStore<N>,
+    /// Gateway-side bounded cache of accepted clear-text handshake
+    /// initiator triples (replay defense). Consumed by the install and
+    /// resume request handlers only.
+    #[cfg(feature = "gateway")]
+    pub(crate) replay_cache: &'a mut ReplayCache<N>,
     /// Factory root public key (read-only). Install attestation verifies that
     /// a peer's static key was signed under this same fleet root.
     pub(crate) factory_pubkey: &'a StaticPublicKey,

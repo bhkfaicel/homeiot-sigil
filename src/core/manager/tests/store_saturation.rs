@@ -39,7 +39,7 @@ fn active_session(peer: PeerId, key_byte: u8, expire_at: u32) -> Session {
         [0x02u8; 33],
         DirectionalMaterial::symmetric_for_test([key_byte; 32], [key_byte; 4]),
         SessionRole::Sensor,
-        super::RESUME_PSK,
+        &super::RESUME_PSK,
         expire_at,
         1_000,
     )

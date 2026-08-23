@@ -30,7 +30,7 @@ fn sensor_active() -> SessionManager<16> {
                 [2; 33],
                 DirectionalMaterial::symmetric_for_test(KEY, PREFIX),
                 SessionRole::Sensor,
-                RESUME_PSK,
+                &RESUME_PSK,
                 86_400,
                 0,
             )
@@ -49,7 +49,7 @@ fn gateway_active() -> SessionManager<16> {
                 [2; 33],
                 DirectionalMaterial::symmetric_for_test(KEY, PREFIX),
                 SessionRole::Gateway,
-                RESUME_PSK,
+                &RESUME_PSK,
                 86_400,
                 0,
             )

@@ -68,7 +68,7 @@ fn active_session(peer: PeerId) -> Session {
         [2u8; 33],
         DirectionalMaterial::symmetric_for_test(KEY, PREFIX),
         SessionRole::Gateway,
-        RESUME_PSK,
+        &RESUME_PSK,
         INSERT_NOW + 100_000,
         INSERT_NOW,
     )

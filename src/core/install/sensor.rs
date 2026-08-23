@@ -260,7 +260,10 @@ pub(crate) fn handle_install_commit_confirmed<const N: usize, const MSG: usize>(
             ..
         } => (
             keys.clone(),
-            *resume_psk.as_array(),
+            // Zeroizing carrier for the durable-PSK copy: any failure between
+            // this extraction and the persist action wipes it instead of
+            // leaving a plain stack copy behind.
+            crate::core::event::ResumePskSecret::new(*resume_psk.as_array()),
             *gateway_static_pubkey,
             *key_lifetime_secs,
         ),
@@ -285,12 +288,16 @@ pub(crate) fn handle_install_commit_confirmed<const N: usize, const MSG: usize>(
     })?;
 
     let key_expire_at = crate::core::session::expire_from_lifetime(now, key_lifetime_secs)?;
+    // Borrow-only hand-off: the constructor validates through the carrier and
+    // copies into the session-owned field itself, so this handler never
+    // unwraps a plain copy; `resume_psk` stays owned here for the persist
+    // action below and wipes if any remaining step fails.
     let session = Session::new_active(
         *peer,
         gateway_pubkey,
         material,
         SessionRole::Sensor,
-        resume_psk,
+        resume_psk.expose_secret(),
         key_expire_at,
         now,
     )?;
@@ -303,7 +310,7 @@ pub(crate) fn handle_install_commit_confirmed<const N: usize, const MSG: usize>(
     Ok(SigilAction::PersistPeerStaticKey {
         peer: *peer,
         pubkey: gateway_pubkey,
-        resume_psk: crate::core::event::ResumePskSecret::new(resume_psk),
+        resume_psk,
         transmit: heapless::Vec::new(),
         wait_timeout_ms: None,
     })

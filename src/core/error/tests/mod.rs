@@ -128,7 +128,8 @@ fn host_policy(err: &SigilError) -> HostPolicy {
         | SigilError::UnexpectedEventDelivery { .. }
         | SigilError::InvalidEventId { .. }
         | SigilError::UnexpectedEventAck { .. }
-        | SigilError::MalformedFrame => HostPolicy::RejectInput,
+        | SigilError::MalformedFrame
+        | SigilError::HandshakeReplay { .. } => HostPolicy::RejectInput,
 
         SigilError::NoPending { .. }
         | SigilError::EcdhFailed
@@ -147,7 +148,8 @@ fn host_policy(err: &SigilError) -> HostPolicy {
         | SigilError::EventDeliveryPending { .. }
         | SigilError::SessionTableFull
         | SigilError::PendingTableFull
-        | SigilError::AdmissionTableFull => HostPolicy::BackOffOrReclaimCapacity,
+        | SigilError::AdmissionTableFull
+        | SigilError::ReplayCacheFull { .. } => HostPolicy::BackOffOrReclaimCapacity,
 
         SigilError::InvariantViolation => HostPolicy::ReportInvariantFailure,
     }
@@ -157,7 +159,7 @@ fn host_policy(err: &SigilError) -> HostPolicy {
 fn every_error_maps_to_one_documented_host_policy_category() {
     // One representative instance per variant; the exhaustive `host_policy`
     // match guarantees this table stays complete when the enum grows.
-    let cases: [(&str, SigilError, HostPolicy); 30] = [
+    let cases: [(&str, SigilError, HostPolicy); 32] = [
         (
             "UnknownSession",
             SigilError::UnknownSession { peer: PEER },
@@ -320,6 +322,16 @@ fn every_error_maps_to_one_documented_host_policy_category() {
             "MalformedFrame",
             SigilError::MalformedFrame,
             HostPolicy::RejectInput,
+        ),
+        (
+            "HandshakeReplay",
+            SigilError::HandshakeReplay { peer: PEER },
+            HostPolicy::RejectInput,
+        ),
+        (
+            "ReplayCacheFull",
+            SigilError::ReplayCacheFull { peer: PEER },
+            HostPolicy::BackOffOrReclaimCapacity,
         ),
         (
             "WrongRole",

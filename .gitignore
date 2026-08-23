@@ -26,5 +26,4 @@ specs/
 # But keep any README.md
 !README.md
 !CHANGELOG.md
-# Keep the versioned footprint report in docs/
-!docs/footprint-report.md
+!docs/*

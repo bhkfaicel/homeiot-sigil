@@ -246,6 +246,38 @@ and `SecureElement` rustdoc.
 
 ---
 
+## Security and threat model
+
+**Formally accepted limitation — Install/Resume epochs have no forward
+secrecy.** Install and Resume session epochs are derived from static↔static
+ECDH. If a device's static private key is extracted after traffic recording,
+those recorded epochs become decryptable. This limitation is formally
+accepted by the crate owner (2026-08-22).
+
+Context:
+
+- **Renew is forward-secret.** Renew derives each epoch from ephemeral P-256
+  ECDH (`TempKey` on the sensor side), so recorded renew epochs stay
+  confidential even against a later static-key compromise.
+- **Secure elements raise the attack cost.** ATECC608-class secure elements
+  keep static private keys non-exportable, which pushes extraction into the
+  physical/side-channel attack class rather than remote or firmware-level
+  compromise.
+- **Re-install freshness does not restore forward secrecy.** Each install
+  mixes fresh nonces into the HKDF (new keys per pairing), but the
+  underlying static↔static ECDH input is unchanged — epochs recorded before
+  a static-key extraction remain decryptable afterwards.
+
+Integrator guidance:
+
+- Do not rely on Install/Resume for long-epoch confidentiality.
+- Keep `key_lifetime_secs` well under `MAX_SESSION_LIFETIME_SECS` (2 days)
+  and drive Renew regularly so most live epochs are forward-secret.
+- Prefer Renew rotation over re-install/resume cycles to refresh ongoing
+  sessions.
+
+---
+
 ## Usage
 
 Choose the product role explicitly in its `Cargo.toml`. This is important on

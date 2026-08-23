@@ -24,7 +24,11 @@
 //! ([`SigilError::AdmissionTableFull`]), malformed wire input
 //! ([`SigilError::MalformedFrame`]), wrong role ([`SigilError::WrongRole`]),
 //! invalid transitions ([`SigilError::InvalidStep`]) and internal invariant
-//! failures ([`SigilError::InvariantViolation`]).
+//! failures ([`SigilError::InvariantViolation`]). The clear-text handshake
+//! replay defense adds [`SigilError::HandshakeReplay`] (a recorded
+//! authenticated initiator re-delivered inside its horizon) and
+//! [`SigilError::ReplayCacheFull`] (fail-closed bounded refusal of fresh
+//! initiators while the cache is saturated with live entries).
 //!
 //! # Secrecy
 //!
@@ -269,6 +273,33 @@ pub enum SigilError {
     /// Host policy: reject input (drop the frame).
     MalformedFrame,
 
+    /// A clear-text handshake initiator frame whose exact
+    /// `(handshake_kind, peer_mac, initiator_nonce)` triple was already
+    /// accepted as cryptographically authenticated **to successful
+    /// completion** by the same handler within the replay horizon
+    /// (see `REPLAY_HORIZON_SECS`). Distinct from the AEAD data-path
+    /// [`SigilError::Replay`]. Install and Resume namespaces are disjoint
+    /// via the handshake-kind tag.
+    /// Host policy: reject input (drop the frame; never retry it as-is,
+    /// never cancel pending for it).
+    HandshakeReplay {
+        /// Peer identifier
+        peer: [u8; 17],
+    },
+
+    /// The gateway replay cache is saturated with live (in-horizon) entries
+    /// and the fresh initiator was refused fail-closed **before any
+    /// cryptographic work**. This is the documented bounded-refusal
+    /// trade-off of the replay defense: recovery flows through TTL expiry
+    /// once filling pressure stops or the host budget throttles it.
+    /// Family of the table-full variants.
+    /// Host policy: back off / reclaim capacity (enforce the global admission
+    /// budget; entries expire with their horizon window).
+    ReplayCacheFull {
+        /// Peer identifier
+        peer: [u8; 17],
+    },
+
     /// The session's configured role does not permit this operation or frame
     /// type (e.g. starting a sensor-only handshake from the gateway side, or
     /// receiving a frame whose direction contradicts the local role).
@@ -410,6 +441,16 @@ impl fmt::Display for SigilError {
             }
             SigilError::MalformedFrame => {
                 write!(f, "Malformed frame received")
+            }
+            SigilError::HandshakeReplay { peer } => {
+                write!(f, "Handshake replay detected for peer: {:02x?}", peer)
+            }
+            SigilError::ReplayCacheFull { peer } => {
+                write!(
+                    f,
+                    "Replay cache full, fresh handshake refused for peer: {:02x?}",
+                    peer
+                )
             }
             SigilError::WrongRole { peer } => {
                 write!(

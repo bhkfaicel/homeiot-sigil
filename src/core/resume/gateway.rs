@@ -15,7 +15,7 @@ use crate::core::event::SigilAction;
 use crate::core::frame::{
     FRAME_TYPE_OFFSET, FrameType, OUTER_HEADER_SIZE, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET,
 };
-use crate::core::manager::ProtocolStores;
+use crate::core::manager::{HandshakeKind, ProtocolStores};
 use crate::core::pending::{PendingHandshake, PendingState};
 use crate::core::resume::wire::{
     RESUME_NONCE_SIZE, RESUME_REQUEST_BODY_LEN, build_resume_challenge_body,
@@ -53,8 +53,11 @@ pub(crate) fn handle_resume_request<const N: usize, const MSG: usize>(
     let body = &packet[OUTER_HEADER_SIZE..];
     let req = parse_resume_request_body(body).ok_or(SigilError::MalformedFrame)?;
 
-    // Verify request MAC with durable PSK **before** SE-ECDH.
-    let expected = {
+    // Session existence and local-role validation run BEFORE the request MAC
+    // is computed: the PSK needed for that MAC lives in the session record,
+    // so this precedence is pre-MAC in the current source already (position
+    // unchanged by the replay defense).
+    {
         let session = stores
             .sessions
             .get(peer)
@@ -63,15 +66,16 @@ pub(crate) fn handle_resume_request<const N: usize, const MSG: usize>(
         if session.role() != SessionRole::Gateway {
             return Err(SigilError::WrongRole { peer: *peer });
         }
-        resume_request_mac(session.require_resume_psk()?, peer, &req.sensor_nonce)?
-    };
-    if !resume_chal_mac_eq(&expected, &req.req_mac) {
-        return Err(SigilError::VerificationFailed);
     }
 
     // A stale gateway post-commit recovery state (cached CommitConfirmed the
     // sensor never received) may be replaced by a fresh authenticated
     // request; every other pending for this peer blocks a new handshake.
+    // Intentional ordering delta of the replay defense: this guard and the
+    // per-peer cooldown below advance ahead of the request-MAC verification
+    // so in-cooldown duplicates keep returning `RateLimited` inside the
+    // cached-retransmission recovery window and peers stuck in pending keep
+    // their specific guard error.
     let replacing_stale_commit = stores
         .pending
         .get(peer)
@@ -89,6 +93,37 @@ pub(crate) fn handle_resume_request<const N: usize, const MSG: usize>(
         if !session.resume_cooldown_elapsed(now, RESUME_REQUEST_COOLDOWN) {
             return Err(SigilError::RateLimited { peer: *peer });
         }
+    }
+
+    // Replay defense, between the cheap guards above and the request-MAC
+    // verification below: purge strictly-expired entries (the only permitted
+    // pre-authentication cache effect), exact-triple lookup, then the
+    // fail-closed capacity pre-check. A hit costs zero crypto units — no PSK
+    // MAC computation, no SE-ECDH — and mutates nothing; the capacity check
+    // sits BEFORE the MAC verify so a saturated refusal performs zero
+    // cryptography as well.
+    stores.replay_cache.prefix_purge(now);
+    if stores
+        .replay_cache
+        .contains(HandshakeKind::Resume, peer, &req.sensor_nonce)
+    {
+        return Err(SigilError::HandshakeReplay { peer: *peer });
+    }
+    if stores.replay_cache.is_full() {
+        return Err(SigilError::ReplayCacheFull { peer: *peer });
+    }
+
+    // Verify request MAC with durable PSK **before** SE-ECDH (mandatory,
+    // preserved).
+    let expected = {
+        let session = stores
+            .sessions
+            .get(peer)
+            .ok_or(SigilError::UnknownSession { peer: *peer })?;
+        resume_request_mac(session.require_resume_psk()?, peer, &req.sensor_nonce)?
+    };
+    if !resume_chal_mac_eq(&expected, &req.req_mac) {
+        return Err(SigilError::VerificationFailed);
     }
 
     let peer_static = stores
@@ -150,6 +185,16 @@ pub(crate) fn handle_resume_request<const N: usize, const MSG: usize>(
     if let Some(s) = stores.sessions.get_mut(peer) {
         s.mark_resume_request(now);
     }
+
+    // Success-only cache insertion — the FINAL mutation of this invocation,
+    // after the fail-atomic pending insert and the cooldown stamp, and
+    // immediately before returning Transmit. Every error return above
+    // leaves the cache byte-identical: a failed handshake writes no triple,
+    // so no legitimate retry is ever denied `HandshakeReplay` by its own
+    // earlier failure.
+    stores
+        .replay_cache
+        .insert(HandshakeKind::Resume, *peer, &req.sensor_nonce, now)?;
 
     Ok(SigilAction::Transmit {
         dest: *peer,

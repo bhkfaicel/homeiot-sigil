@@ -46,7 +46,7 @@ fn insert_symmetric_session(mgr: &mut SessionManager<4>, peer: PeerId, role: Ses
             [0x02u8; 33],
             DirectionalMaterial::symmetric_for_test([0x55u8; 32], [0xAAu8; 4]),
             role,
-            PEER_PSK,
+            &PEER_PSK,
             100_000,
             0,
         )

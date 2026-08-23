@@ -77,6 +77,25 @@ pub struct MockSecureElement {
     reject_ecdh: bool,
     /// When true, ECDH providers return a null secret despite reporting success.
     zero_ecdh: bool,
+    /// When true, `ecdh` rejects the supplied peer point with
+    /// `InvalidStaticKey` — models a provider refusing a corrupt/off-curve
+    /// STORED static key (the resume path feeds session-record keys straight
+    /// into ECDH with no ECDSA gate).
+    reject_stored_point: bool,
+    /// When true, the provider getters (`get_static_pubkey`,
+    /// `get_factory_cert`, `get_factory_cert_metadata`) fail — models an
+    /// unhealthy provider boundary for downstream-failure tests.
+    fail_provider_getters: bool,
+    /// When true, `sign_ecdsa` returns `RandomFailed` (signing path failure).
+    reject_signing: bool,
+    /// When set, `get_static_pubkey` returns this value instead of the real
+    /// key — models a provider returning `Ok` with a malformed local key.
+    static_pubkey_override: Option<StaticPublicKey>,
+    /// Observed call counts for the zero-added-crypto assertions of the
+    /// replay-defense adversarial suite.
+    ecdh_calls: usize,
+    verify_calls: usize,
+    sign_calls: usize,
 }
 
 impl MockSecureElement {
@@ -114,6 +133,13 @@ impl MockSecureElement {
             reject_verify: false,
             reject_ecdh: false,
             zero_ecdh: false,
+            reject_stored_point: false,
+            fail_provider_getters: false,
+            reject_signing: false,
+            static_pubkey_override: None,
+            ecdh_calls: 0,
+            verify_calls: 0,
+            sign_calls: 0,
         }
     }
 
@@ -155,6 +181,58 @@ impl MockSecureElement {
     pub fn return_zero_ecdh(&mut self) {
         self.zero_ecdh = true;
     }
+
+    /// Switch the mock so `ecdh` rejects the peer point with
+    /// `InvalidStaticKey` (defective-provider stored-point rejection).
+    #[allow(dead_code)]
+    pub fn reject_stored_point(&mut self) {
+        self.reject_stored_point = true;
+    }
+
+    /// Switch the mock so the provider getters fail (unhealthy boundary).
+    #[allow(dead_code)]
+    pub fn fail_provider_getters(&mut self) {
+        self.fail_provider_getters = true;
+    }
+
+    /// Switch the mock so subsequent `sign_ecdsa` calls fail.
+    #[allow(dead_code)]
+    pub fn reject_signing(&mut self) {
+        self.reject_signing = true;
+    }
+
+    /// Forces `get_static_pubkey` to return the given raw key bytes,
+    /// bypassing validity (`Ok` with a malformed local key under a
+    /// defective provider). Clear by passing a valid key or `None`-reset
+    /// via [`Self::clear_static_pubkey_override`].
+    #[allow(dead_code)]
+    pub fn force_static_pubkey(&mut self, key: [u8; 33]) {
+        self.static_pubkey_override = Some(key);
+    }
+
+    /// Removes any previously forced static-pubkey override.
+    #[allow(dead_code)]
+    pub fn clear_static_pubkey_override(&mut self) {
+        self.static_pubkey_override = None;
+    }
+
+    /// Number of `SecureElement::ecdh` calls observed so far.
+    #[allow(dead_code)]
+    pub fn ecdh_call_count(&self) -> usize {
+        self.ecdh_calls
+    }
+
+    /// Number of `verify_ecdsa` calls observed so far.
+    #[allow(dead_code)]
+    pub fn verify_ecdsa_call_count(&self) -> usize {
+        self.verify_calls
+    }
+
+    /// Number of `sign_ecdsa` calls observed so far.
+    #[allow(dead_code)]
+    pub fn sign_ecdsa_call_count(&self) -> usize {
+        self.sign_calls
+    }
 }
 
 impl Default for MockSecureElement {
@@ -165,11 +243,17 @@ impl Default for MockSecureElement {
 
 impl SecureElement for MockSecureElement {
     fn ecdh(&mut self, _peer_static_pubkey: &[u8; 33]) -> Result<EcdhSharedSecret, SigilError> {
+        self.ecdh_calls = self.ecdh_calls.wrapping_add(1);
         if self.reject_ecdh {
             return Err(SigilError::EcdhFailed);
         }
         if self.zero_ecdh {
             return Ok([0u8; 32]);
+        }
+        if self.reject_stored_point {
+            // The provider refuses the supplied (stored) point at the ECDH
+            // boundary — reachable on paths that skip ECDSA for stored keys.
+            return Err(SigilError::InvalidStaticKey);
         }
         // For testing, return a deterministic shared secret.
         Ok([0x42u8; 32])
@@ -229,6 +313,10 @@ impl SecureElement for MockSecureElement {
     }
 
     fn sign_ecdsa(&mut self, message: &[u8]) -> Result<EcdsaSignature, SigilError> {
+        self.sign_calls = self.sign_calls.wrapping_add(1);
+        if self.reject_signing {
+            return Err(SigilError::RandomFailed);
+        }
         Ok(mock_message_tag(message))
     }
 
@@ -238,6 +326,7 @@ impl SecureElement for MockSecureElement {
         message: &[u8],
         signature: &[u8; 64],
     ) -> Result<(), SigilError> {
+        self.verify_calls = self.verify_calls.wrapping_add(1);
         if self.reject_verify {
             return Err(SigilError::VerificationFailed);
         }
@@ -248,10 +337,19 @@ impl SecureElement for MockSecureElement {
     }
 
     fn get_static_pubkey(&mut self) -> Result<StaticPublicKey, SigilError> {
+        if self.fail_provider_getters {
+            return Err(SigilError::RandomFailed);
+        }
+        if let Some(forced) = self.static_pubkey_override {
+            return Ok(forced);
+        }
         Ok(self.static_pubkey)
     }
 
     fn get_factory_cert(&mut self) -> Result<EcdsaSignature, SigilError> {
+        if self.fail_provider_getters {
+            return Err(SigilError::RandomFailed);
+        }
         // Factory cert covers product, immutable metadata, PeerId and pubkey.
         let msg = crate::core::install::factory_cert_message(
             self.product_id,
@@ -264,6 +362,9 @@ impl SecureElement for MockSecureElement {
     }
 
     fn get_factory_cert_metadata(&mut self) -> Result<FactoryCertificateMetadata, SigilError> {
+        if self.fail_provider_getters {
+            return Err(SigilError::RandomFailed);
+        }
         Ok(self.factory_metadata)
     }
 }
@@ -309,7 +410,7 @@ pub fn active_session(
         pubkey,
         DirectionalMaterial::symmetric_for_test(key, prefix),
         SessionRole::Sensor,
-        resume_psk,
+        &resume_psk,
         key_expire_at,
         now,
     )
@@ -335,7 +436,7 @@ pub fn active_session_role(
         pubkey,
         DirectionalMaterial::symmetric_for_test(key, prefix),
         role,
-        resume_psk,
+        &resume_psk,
         key_expire_at,
         now,
     )
@@ -362,7 +463,7 @@ pub fn pair_active_sessions(
         pubkey,
         material.clone(),
         SessionRole::Sensor,
-        resume_psk,
+        &resume_psk,
         key_expire_at,
         now,
     )
@@ -372,7 +473,7 @@ pub fn pair_active_sessions(
         pubkey,
         material,
         SessionRole::Gateway,
-        resume_psk,
+        &resume_psk,
         key_expire_at,
         now,
     )

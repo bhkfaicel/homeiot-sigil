@@ -4,6 +4,9 @@
 
 mod transitions;
 
+// Replay-defense downstream-failure suites for the resume initiator path.
+mod replay_cache;
+
 use crate::core::error::SigilError;
 use crate::core::event::SigilAction;
 use crate::core::frame::{FRAME_TYPE_OFFSET, FrameType, PROTOCOL_VERSION, PROTOCOL_VERSION_OFFSET};
@@ -579,7 +582,7 @@ fn test_resume_rate_limited_after_cancel() {
         .unwrap()
     {
         SigilAction::Transmit { payload, .. } => payload,
-        _ => panic!(),
+        _ => panic!("sensor should transmit"),
     };
     gateway
         .handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME)
@@ -590,9 +593,40 @@ fn test_resume_rate_limited_after_cancel() {
         gateway.handle_resume_request::<256>(&req, &mut se_g, &mut rng_g, 1000, RESUME_LIFETIME);
     assert_eq!(result, Err(SigilError::RateLimited { peer: SENSOR_MAC }));
 
+    // At the cooldown boundary the identical recording meets the replay
+    // cache (accepted-to-completion triples are suppressed within the
+    // horizon): hosts abandon the stale attempt and restart with a FRESH
+    // nonce.
+    let result = gateway.handle_resume_request::<256>(
+        &req,
+        &mut se_g,
+        &mut rng_g,
+        1000 + crate::core::resume::RESUME_REQUEST_COOLDOWN,
+        RESUME_LIFETIME,
+    );
+    assert_eq!(
+        result,
+        Err(SigilError::HandshakeReplay { peer: SENSOR_MAC })
+    );
+
+    // Host policy: abandon the stale sensor-side attempt (its pre-commit
+    // pending is cancellable) before restarting with a FRESH nonce.
+    sensor.cancel_pending(&GW_MAC).unwrap();
+    let fresh_req = match sensor
+        .start_resume::<256>(
+            GW_MAC,
+            &mut se_s,
+            &mut rng_s,
+            1_000 + crate::core::resume::RESUME_REQUEST_COOLDOWN,
+        )
+        .unwrap()
+    {
+        SigilAction::Transmit { payload, .. } => payload,
+        _ => panic!("sensor should transmit"),
+    };
     let action = gateway
         .handle_resume_request::<256>(
-            &req,
+            &fresh_req,
             &mut se_g,
             &mut rng_g,
             1000 + crate::core::resume::RESUME_REQUEST_COOLDOWN,

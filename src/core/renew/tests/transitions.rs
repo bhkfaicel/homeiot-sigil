@@ -90,7 +90,7 @@ fn sensor_manager() -> SessionManager<16> {
                 [2u8; 33],
                 DirectionalMaterial::symmetric_for_test(OLD_KEY, OLD_PREFIX),
                 SessionRole::Sensor,
-                RESUME_PSK,
+                &RESUME_PSK,
                 NOW + 86_400,
                 NOW,
             )
@@ -110,7 +110,7 @@ fn gateway_manager() -> SessionManager<16> {
                 [2u8; 33],
                 DirectionalMaterial::symmetric_for_test(OLD_KEY, OLD_PREFIX),
                 SessionRole::Gateway,
-                RESUME_PSK,
+                &RESUME_PSK,
                 NOW + 86_400,
                 NOW,
             )
@@ -839,7 +839,7 @@ fn renew_entry_guards_reject_without_mutation() {
             [2u8; 33],
             material(),
             SessionRole::Gateway,
-            RESUME_PSK,
+            &RESUME_PSK,
             NOW + 86_400,
             NOW,
         )
@@ -862,7 +862,7 @@ fn renew_entry_guards_reject_without_mutation() {
             [2u8; 33],
             material(),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             100,
             0,
         )
@@ -901,7 +901,7 @@ fn renew_entry_guards_reject_without_mutation() {
             [2u8; 33],
             DirectionalMaterial::symmetric_for_test(OLD_KEY, OLD_PREFIX),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             NOW + 86_400,
             NOW,
         )

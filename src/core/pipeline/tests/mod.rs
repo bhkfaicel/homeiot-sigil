@@ -33,7 +33,7 @@ fn manager_with_active_session(expire: u32) -> SessionManager<16> {
             [2u8; 33],
             DirectionalMaterial::symmetric_for_test([0x42u8; 32], [0x01u8; 4]),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             expire,
             0,
         )
@@ -54,7 +54,7 @@ fn manager_loopback(expire: u32) -> SessionManager<16> {
             [2u8; 33],
             DirectionalMaterial::symmetric_for_test([0x42u8; 32], [0x01u8; 4]),
             SessionRole::Sensor,
-            RESUME_PSK,
+            &RESUME_PSK,
             expire,
             0,
         )
@@ -75,7 +75,7 @@ fn event_pair() -> (SessionManager<4>, SessionManager<4>) {
                 [2u8; 33],
                 material.clone(),
                 SessionRole::Sensor,
-                RESUME_PSK,
+                &RESUME_PSK,
                 100_000,
                 0,
             )
@@ -89,7 +89,7 @@ fn event_pair() -> (SessionManager<4>, SessionManager<4>) {
                 [2u8; 33],
                 material,
                 SessionRole::Gateway,
-                RESUME_PSK,
+                &RESUME_PSK,
                 100_000,
                 0,
             )
@@ -199,7 +199,7 @@ fn test_encrypt_then_decrypt_roundtrip() {
                 [2u8; 33],
                 DirectionalMaterial::symmetric_for_test([0x42u8; 32], [0x01u8; 4]),
                 SessionRole::Gateway,
-                RESUME_PSK,
+                &RESUME_PSK,
                 100_000,
                 0,
             )
@@ -563,7 +563,7 @@ fn test_flipped_frame_type_data_to_renew_fails_aad() {
                 [2u8; 33],
                 DirectionalMaterial::symmetric_for_test([0x42u8; 32], [0x01u8; 4]),
                 SessionRole::Gateway,
-                RESUME_PSK,
+                &RESUME_PSK,
                 100_000,
                 0,
             )
