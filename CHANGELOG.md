@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to semantic versioning.
 
-[1.1.0] 2026-08-23
+## [Unreleased]
+
+## [1.1.0] - 2026-08-23
 
 - Document the formally accepted forward-secrecy characteristic of the
   Install and Resume handshakes in a new README security/threat-model
