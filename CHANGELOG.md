@@ -9,6 +9,12 @@ and this project adheres to semantic versioning.
 
 ## [1.1.0] - 2026-08-23
 
+- CI embedded cross-checks: install `thumbv6m-none-eabi` and
+  `armv7-unknown-linux-gnueabihf` via `rustup target add` in
+  `scripts/test.sh` before the locked `cargo check` gates. The CI container
+  image does not pre-install those targets, which caused `can't find crate for
+core` after the feature-matrix suite passed.
+
 - Document the formally accepted forward-secrecy characteristic of the
   Install and Resume handshakes in a new README security/threat-model
   section. The section records the owner's formal acceptance statement —

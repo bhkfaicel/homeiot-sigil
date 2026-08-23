@@ -12,6 +12,8 @@ bash scripts/test-release-branch-name.sh
 # sensor, gateway, sensor,gateway, and all-features configurations. The matrix
 # logic is owned exclusively by that script; never duplicate it here.
 bash scripts/test-feature-matrix.sh
-# Embedded-target cross-checks (locked for reproducibility).
+# Embedded-target cross-checks (locked for reproducibility). The CI container
+# image may ship without these std targets; rustup target add is idempotent.
+rustup target add thumbv6m-none-eabi armv7-unknown-linux-gnueabihf
 cargo check --locked --target thumbv6m-none-eabi --no-default-features --features sensor
 cargo check --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features gateway
