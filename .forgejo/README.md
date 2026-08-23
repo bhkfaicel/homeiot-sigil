@@ -1,9 +1,19 @@
 # Forgejo Actions (CI)
 
-Workflows in this directory are **thin callers**. Tag / publish / checks logic lives in
-[`faicel/central_ci`](https://code.bhk-itsolutions.com/faicel/central_ci) (`create_tag_on_dev`,
-`create_tag_on_main`, `publish_on_tag`, `rust_crate_checks`, `validate_flow`).
-Only triggers and crate-specific inputs (`repository`, `enable_deny`, `test_command`, …) stay here.
+Security-sensitive checks, tag creation and publication logic live in this
+repository. `_rust-crate-checks.yml` is the shared local gate, and
+`actions/checkout` is pinned to an immutable commit SHA. This prevents a
+mutable transitive workflow from receiving `RUNNER_TOKEN`.
+
+Reusable workflows: Forgejo allows only `inputs` and `outputs` under
+`on.workflow_call` (not a callee `secrets` block like GitHub Actions).
+Callers must pass repository secrets with `jobs.<id>.secrets: inherit` (or an
+explicit map); the callee reads `${{ secrets.RUNNER_TOKEN }}` as usual.
+
+Only the branch-flow validator remains in
+[`faicel/central_ci`](https://code.bhk-itsolutions.com/faicel/central_ci); it is
+pinned to an immutable revision, receives no secret and invokes no third-party
+action.
 
 ## Publish flow (happy path)
 
@@ -18,7 +28,7 @@ The stable/unstable split is done by **registry**, not by rewriting the crate ve
 
 1. Bump `Cargo.toml` + `CHANGELOG` (required: each version publishes once per registry).
 2. Feature branch → checks via `check-on-feature-branch.yml`.
-3. Merge to `dev` → `create-tag-on-dev.yml` creates `vX.Y.Z-rc` (skips if the tag already exists).
+3. Merge to `dev` → `create-tag-on-dev.yml` creates `vX.Y.Z-rc` (fails if the tag already exists).
 4. Tag push → `publish-on-tag.yml` publishes to `forgejorc` (client staging can pin this version).
 5. Merge `dev` → `staging` → `main` (`staging` does not tag or publish).
 6. Push to `main` → `create-tag-on-main.yml` creates `vX.Y.Z` **and** ensures `release/X.Y` exists.
@@ -32,7 +42,8 @@ Keep `Cargo.toml` and the latest `CHANGELOG.md` heading in sync (see `scripts/ch
 
 Registries are defined in [`.cargo/config.toml`](../.cargo/config.toml).
 
-`cargo deny` is currently disabled in shared checks (`enable_deny: false`) until a `deny.toml` is added.
+`cargo deny` is enabled in local checks and governed by the repository
+`deny.toml` policy.
 
 ## Maintenance branches (`release/X.Y`)
 

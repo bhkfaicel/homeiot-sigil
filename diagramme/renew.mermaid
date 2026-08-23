@@ -1,28 +1,46 @@
 sequenceDiagram
     autonumber
-    participant App_S as Sensor firmware
-    participant VK as ValidatedKey
-    participant RS as renew_session()
-    participant RC as renew_core
-    participant LoRa as LoRa (SX1278)
-    participant GW as handle_renew_request()
-    participant HW as ATECC608x (ECDH only)
+    participant Sensor as Sensor SessionManager
+    participant ATECC as ATECC608 TempKey
+    participant LoRa as LoRa host-owned
+    participant Gateway as Gateway SessionManager
+    participant Crypto as SecureElement host implementation
 
-    App_S->>VK: should_renew() or !is_valid()
-    App_S->>RS: renew_session(session_key_old, sensor_nonce)
+    Note over Sensor,Gateway: Renew P-256 éphémère, sans rétrocompatibilité X25519
+    Note over Sensor: start_renew(peer, now)
+    Sensor->>Sensor: AEAD old s2g (plaintext vide)
+    Sensor->>LoRa: RenewRequest, 47 octets
 
-    RS->>LoRa: KeyRenewRequest encrypted (session_key_old)
-    LoRa->>GW: KeyRenewRequest (AEAD auth)
+    LoRa->>Gateway: RenewRequest sous ancienne clé
+    Gateway->>Gateway: AEAD + anti-rejeu
+    Gateway->>Crypto: generate_ephemeral_keypair()
+    Crypto-->>Gateway: gateway_pub[33] + contexte opaque[32]
+    Gateway->>Gateway: Conserve le contexte zéroïsable dans pending
+    Gateway->>LoRa: RenewChallenge, 84 octets<br/>gateway_pub_compressed[33] + lifetime[4], ancienne clé
 
-    GW->>HW: Generate gateway ephemeral keypair → gw_eph_pubkey[33B]
-    GW->>LoRa: KeyRenewChallenge encrypted<br/>{gw_eph_pubkey, gateway_nonce, key_expire_at}<br/>NO ECDSA, NO ECIES 194B
-    LoRa->>RC: KeyRenewChallenge
+    Note over Sensor: continue_renew(challenge, se, now)
+    LoRa->>Sensor: RenewChallenge sous ancienne clé
+    Sensor->>Sensor: AEAD + anti-rejeu + lifetime
+    Sensor->>ATECC: GenKey(mode=0x04, KeyID=0xFFFF)
+    ATECC-->>Sensor: sensor_pub X||Y
+    Sensor->>ATECC: ECDH(mode=0x0D, KeyID=0x0000, gateway X||Y)
+    ATECC-->>Sensor: shared[32], TempKey invalidée
+    Sensor->>Sensor: HKDF transcript v4 + proof[16]
+    Sensor->>LoRa: RenewConfirm, 96 octets<br/>sensor_pub_compressed[33] + proof[16], ancienne clé
 
-    RC->>HW: Generate sensor ephemeral keypair<br/>ECDH(gw_eph_pubkey) → shared_secret
-    RC->>RC: session_key_new = HKDF(shared_secret, nonces)
-    RC->>LoRa: KeyRenewAck encrypted {sensor_eph_pubkey[33B]} (session_key_old)
-    LoRa->>GW: KeyRenewAck
+    Note over Gateway: handle_renew_confirm(confirm, se, now)
+    LoRa->>Gateway: RenewConfirm sous ancienne clé
+    Gateway->>Gateway: AEAD + anti-rejeu
+    Gateway->>Crypto: complete_ephemeral_ecdh(contexte, sensor_pub)
+    Crypto-->>Gateway: shared[32] ou erreur de validation
+    Gateway->>Gateway: HKDF + proof constant-time
+    alt preuve ou clé invalide
+        Gateway-->>Gateway: rejet, ancienne session conservée
+    else confirmation valide
+        Gateway->>Gateway: Commit nouvelles clés
+        Gateway->>LoRa: RenewCommitConfirmed, 47 octets<br/>AEAD sous nouvelle clé g2s
+    end
 
-    GW->>HW: ECDH(sensor_eph_pubkey) → shared_secret (same as sensor)
-    GW->>GW: session_key_new = HKDF(same inputs)
-    RS-->>App_S: HandshakeSession { keys, gateway_mac }
+    LoRa->>Sensor: RenewCommitConfirmed
+    Sensor->>Sensor: Vérifie AEAD nouvelle clé puis commit
+    Note over Sensor,Gateway: tick(now) reste obligatoire pour récupérer les pending pré-commit

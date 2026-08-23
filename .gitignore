@@ -14,9 +14,16 @@ config*.json
 *.swp
 *.swo
 .DS_Store
+.cursor/
+.zed/
+.specify/
+plan/
+specs/
+.claude
 # Ignore all markdown files
 *.md
-
+.opencode-memory/
 # But keep any README.md
 !README.md
 !CHANGELOG.md
+!docs/*

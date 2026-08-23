@@ -1,0 +1,78 @@
+name: Rust crate checks (local, pinned)
+
+# Reusable Rust crate gate. Callers pass secrets via jobs.<id>.secrets (Forgejo
+# does not allow a `secrets` block under on.workflow_call; use `inherit` or an
+# explicit map from the caller workflow).
+on:
+  workflow_call:
+    inputs:
+      enable_tag_check:
+        type: boolean
+        default: true
+      test_command:
+        type: string
+        default: "bash scripts/test.sh"
+
+jobs:
+  checks:
+    runs-on: docker
+    container:
+      image: code.bhk-itsolutions.com/homeiot/ci-rust-embedded:rust-1.97.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          token: ${{ secrets.RUNNER_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Lint all roles and targets
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+
+      - name: Lint sensor role
+        run: cargo clippy --locked --no-default-features --features sensor -- -D warnings
+
+      - name: Lint gateway role
+        run: cargo clippy --locked --no-default-features --features gateway -- -D warnings
+
+      - name: Unused dependencies
+        run: cargo machete
+
+      - name: Dependency policy
+        run: cargo deny check
+
+      - name: Version sync
+        run: bash scripts/check-version-sync.sh
+
+      # The offline markdown link gate requires the `lychee` link checker.
+      # Install one pinned version so local validation and CI always run link
+      # checks against the exact same reproducible toolchain build, regardless
+      # of what the container image provides.
+      - name: Install pinned lychee link checker
+        run: |
+          cargo install --locked --version 0.24.2 lychee
+          lychee --version
+
+      - name: Reject an already published version
+        if: ${{ inputs.enable_tag_check }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$VERSION" ]; then
+            echo "error: could not read Cargo.toml version" >&2
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
+            echo "error: tag v${VERSION} already exists; bump Cargo.toml and CHANGELOG.md" >&2
+            exit 1
+          fi
+
+      # The standard gate delegates the test matrix to the authoritative
+      # feature-matrix script (empty-feature diagnostic plus wire, sensor,
+      # gateway, sensor,gateway, and all-features locked test suites).
+      - name: Test production feature matrix
+        run: ${{ inputs.test_command }}

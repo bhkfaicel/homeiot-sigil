@@ -2,8 +2,7 @@
 # No tag, no publish. Used for feature branches.
 #
 # Requires: RUNNER_TOKEN secret (PAT with read repo).
-# Shared checks: faicel/central_ci rust_crate_checks.yml
-# Note: enable_deny is false until this crate has a deny.toml.
+# Checks are local so workflow code and third-party actions stay immutable.
 
 name: Run checks on feature branches
 
@@ -17,8 +16,7 @@ on:
 
 jobs:
   checks:
-    uses: faicel/central_ci/.forgejo/workflows/rust_crate_checks.yml@main
+    uses: ./.forgejo/workflows/_rust-crate-checks.yml
     with:
-      enable_deny: false
-    secrets:
-      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+      test_command: bash scripts/test.sh
+    secrets: inherit

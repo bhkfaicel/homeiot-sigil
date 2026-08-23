@@ -1,18 +1,62 @@
-# On push of tag v*: Forgejo release + cargo publish (forgejorc / forgejo).
-# Implementation: faicel/central_ci publish_on_tag.yml
-# Repository is auto-detected from github.repository (caller).
-
 name: Publish release on tag
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 jobs:
-  publish:
-    uses: faicel/central_ci/.forgejo/workflows/publish_on_tag.yml@main
+  checks:
+    uses: ./.forgejo/workflows/_rust-crate-checks.yml
     with:
-      enable_deny: false
-    secrets:
-      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+      enable_tag_check: false
+    secrets: inherit
+
+  publish:
+    needs: checks
+    runs-on: docker
+    container:
+      image: code.bhk-itsolutions.com/homeiot/ci-rust-embedded:rust-1.97.0
+    env:
+      CARGO_REGISTRIES_FORGEJO_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
+      CARGO_REGISTRIES_FORGEJORC_TOKEN: "Bearer ${{ secrets.RUNNER_TOKEN }}"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          token: ${{ secrets.RUNNER_TOKEN }}
+          persist-credentials: false
+
+      - name: Resolve release channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          if [[ "$TAG_NAME" == *-rc* ]]; then
+            echo "REGISTRY=forgejorc" >> "$GITHUB_ENV"
+            echo "PRERELEASE=true" >> "$GITHUB_ENV"
+          else
+            echo "REGISTRY=forgejo" >> "$GITHUB_ENV"
+            echo "PRERELEASE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish crate
+        run: cargo publish --registry "$REGISTRY"
+
+      - name: Create Forgejo release after successful publication
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body -X POST \
+            "https://code.bhk-itsolutions.com/api/v1/repos/${REPOSITORY}/releases" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: token ${REPO_ACCESS_TOKEN}" \
+            -d "{
+              \"tag_name\": \"${GITHUB_REF_NAME}\",
+              \"name\": \"Release ${GITHUB_REF_NAME}\",
+              \"body\": \"Automated Sigil release ${GITHUB_REF_NAME}.\",
+              \"draft\": false,
+              \"prerelease\": ${PRERELEASE}
+            }"

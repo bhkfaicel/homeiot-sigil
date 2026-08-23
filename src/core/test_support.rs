@@ -1,0 +1,523 @@
+//! Shared mock implementations for unit tests
+//!
+//! This module provides mock implementations of the `SecureElement` and
+//! `RandomSource` traits, reused across the unit tests of the core modules.
+//! It is only compiled under `cfg(test)`.
+
+#![cfg(test)]
+#![allow(dead_code)]
+
+use crate::core::error::SigilError;
+use crate::core::traits::{
+    EcdhSharedSecret, EcdsaSignature, FactoryCertificateMetadata, RandomSource, SecureElement,
+    StaticPublicKey,
+};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+fn test_p256_public(scalar: &[u8; 32]) -> Result<[u8; 33], SigilError> {
+    let secret = p256::SecretKey::from_slice(scalar).map_err(|_| SigilError::EcdhFailed)?;
+    let encoded = secret.public_key().to_encoded_point(true);
+    let mut public = [0u8; 33];
+    public.copy_from_slice(encoded.as_bytes());
+    Ok(public)
+}
+
+fn test_p256_ecdh(scalar: &[u8; 32], peer: &[u8; 33]) -> Result<[u8; 32], SigilError> {
+    if !matches!(peer[0], 0x02 | 0x03) {
+        return Err(SigilError::InvalidStaticKey);
+    }
+    let secret = p256::SecretKey::from_slice(scalar).map_err(|_| SigilError::EcdhFailed)?;
+    let peer = p256::PublicKey::from_sec1_bytes(peer).map_err(|_| SigilError::InvalidStaticKey)?;
+    let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+    let mut output = [0u8; 32];
+    output.copy_from_slice(shared.raw_secret_bytes());
+    Ok(output)
+}
+
+/// Deterministic message→signature binding used by [`MockSecureElement`].
+/// This is **not** real ECDSA. It folds the message into a 64-byte tag so that
+/// `verify_ecdsa` rejects signatures produced for a different message. That
+/// catches protocol bugs such as signing `gateway_nonce` while verifying
+/// `b"install-confirm"`.
+fn mock_message_tag(message: &[u8]) -> EcdsaSignature {
+    let mut tag = [0x99u8; 64];
+    for (i, byte) in message.iter().enumerate() {
+        tag[i % 64] ^= byte.wrapping_add((i % 251) as u8);
+    }
+    // Mix in the length so prefixes of different lengths do not collide trivially.
+    let len = message.len() as u8;
+    tag[0] ^= len;
+    tag[63] ^= len.wrapping_mul(3);
+    tag
+}
+
+/// Mock implementation of `SecureElement` for testing
+/// Returns deterministic values so tests are reproducible without a real
+/// hardware secure element.
+/// ECDSA is simulated with a message-bound tag ([`mock_message_tag`]) so
+/// verify fails when the verified message does not match the signed one.
+/// Factory certificates are tags over
+/// [`crate::core::install::factory_cert_message`] using [`Self::device_mac`]
+/// and [`Self::product_id`] — configure these to match the
+/// [`SessionManager`](crate::core::manager::SessionManager) local MAC / role.
+/// The mock can be switched into "reject" mode via [`Self::reject_signatures`]
+/// to exercise verification-failure paths.
+pub struct MockSecureElement {
+    static_pubkey: StaticPublicKey,
+    /// Wire PeerId this mock claims (must match manager `local_mac` in install tests).
+    pub device_mac: [u8; 17],
+    /// Factory product id ([`crate::core::install::FACTORY_PRODUCT_ID_SENSOR`] /
+    /// [`FACTORY_PRODUCT_ID_GATEWAY`](crate::core::install::FACTORY_PRODUCT_ID_GATEWAY)).
+    pub product_id: u16,
+    /// Immutable metadata signed into the mock factory certificate.
+    pub factory_metadata: FactoryCertificateMetadata,
+    /// When true, `verify_ecdsa` always returns `VerificationFailed`.
+    reject_verify: bool,
+    /// When true, `ecdh` returns `EcdhFailed`.
+    reject_ecdh: bool,
+    /// When true, ECDH providers return a null secret despite reporting success.
+    zero_ecdh: bool,
+    /// When true, `ecdh` rejects the supplied peer point with
+    /// `InvalidStaticKey` — models a provider refusing a corrupt/off-curve
+    /// STORED static key (the resume path feeds session-record keys straight
+    /// into ECDH with no ECDSA gate).
+    reject_stored_point: bool,
+    /// When true, the provider getters (`get_static_pubkey`,
+    /// `get_factory_cert`, `get_factory_cert_metadata`) fail — models an
+    /// unhealthy provider boundary for downstream-failure tests.
+    fail_provider_getters: bool,
+    /// When true, `sign_ecdsa` returns `RandomFailed` (signing path failure).
+    reject_signing: bool,
+    /// When set, `get_static_pubkey` returns this value instead of the real
+    /// key — models a provider returning `Ok` with a malformed local key.
+    static_pubkey_override: Option<StaticPublicKey>,
+    /// Observed call counts for the zero-added-crypto assertions of the
+    /// replay-defense adversarial suite.
+    ecdh_calls: usize,
+    verify_calls: usize,
+    sign_calls: usize,
+}
+
+impl MockSecureElement {
+    fn compressed_test_key(id: u8) -> StaticPublicKey {
+        let mut key = [id; 33];
+        key[0] = if id & 1 == 0 { 0x02 } else { 0x03 };
+        key
+    }
+
+    /// Creates a mock secure element with the given static public key.
+    /// Defaults to sensor product id and MAC `[0x10; 17]` (matches
+    /// [`test_manager`] default local MAC).
+    pub fn new(static_pubkey: StaticPublicKey) -> Self {
+        Self::with_identity(
+            static_pubkey,
+            [0x10u8; 17],
+            crate::core::install::FACTORY_PRODUCT_ID_SENSOR,
+        )
+    }
+
+    /// Creates a mock with explicit identity for factory cert tags.
+    pub fn with_identity(
+        static_pubkey: StaticPublicKey,
+        device_mac: [u8; 17],
+        product_id: u16,
+    ) -> Self {
+        Self {
+            static_pubkey,
+            device_mac,
+            product_id,
+            factory_metadata: FactoryCertificateMetadata {
+                hardware_profile_id: 1,
+                factory_key_id: 1,
+            },
+            reject_verify: false,
+            reject_ecdh: false,
+            zero_ecdh: false,
+            reject_stored_point: false,
+            fail_provider_getters: false,
+            reject_signing: false,
+            static_pubkey_override: None,
+            ecdh_calls: 0,
+            verify_calls: 0,
+            sign_calls: 0,
+        }
+    }
+
+    /// Creates a mock with a distinct pubkey derived from the given byte.
+    pub fn with_id(id: u8) -> Self {
+        Self::new(Self::compressed_test_key(id))
+    }
+
+    /// Sensor-side mock bound to `device_mac`.
+    pub fn sensor(id: u8, device_mac: [u8; 17]) -> Self {
+        Self::with_identity(
+            Self::compressed_test_key(id),
+            device_mac,
+            crate::core::install::FACTORY_PRODUCT_ID_SENSOR,
+        )
+    }
+
+    /// Gateway-side mock bound to `device_mac`.
+    pub fn gateway(id: u8, device_mac: [u8; 17]) -> Self {
+        Self::with_identity(
+            Self::compressed_test_key(id),
+            device_mac,
+            crate::core::install::FACTORY_PRODUCT_ID_GATEWAY,
+        )
+    }
+
+    /// Switch the mock so subsequent `verify_ecdsa` calls fail.
+    pub fn reject_signatures(&mut self) {
+        self.reject_verify = true;
+    }
+
+    /// Switch the mock so subsequent `ecdh` calls fail.
+    #[allow(dead_code)]
+    pub fn reject_ecdh(&mut self) {
+        self.reject_ecdh = true;
+    }
+
+    /// Simulates a defective provider that reports a null ECDH secret.
+    pub fn return_zero_ecdh(&mut self) {
+        self.zero_ecdh = true;
+    }
+
+    /// Switch the mock so `ecdh` rejects the peer point with
+    /// `InvalidStaticKey` (defective-provider stored-point rejection).
+    #[allow(dead_code)]
+    pub fn reject_stored_point(&mut self) {
+        self.reject_stored_point = true;
+    }
+
+    /// Switch the mock so the provider getters fail (unhealthy boundary).
+    #[allow(dead_code)]
+    pub fn fail_provider_getters(&mut self) {
+        self.fail_provider_getters = true;
+    }
+
+    /// Switch the mock so subsequent `sign_ecdsa` calls fail.
+    #[allow(dead_code)]
+    pub fn reject_signing(&mut self) {
+        self.reject_signing = true;
+    }
+
+    /// Forces `get_static_pubkey` to return the given raw key bytes,
+    /// bypassing validity (`Ok` with a malformed local key under a
+    /// defective provider). Clear by passing a valid key or `None`-reset
+    /// via [`Self::clear_static_pubkey_override`].
+    #[allow(dead_code)]
+    pub fn force_static_pubkey(&mut self, key: [u8; 33]) {
+        self.static_pubkey_override = Some(key);
+    }
+
+    /// Removes any previously forced static-pubkey override.
+    #[allow(dead_code)]
+    pub fn clear_static_pubkey_override(&mut self) {
+        self.static_pubkey_override = None;
+    }
+
+    /// Number of `SecureElement::ecdh` calls observed so far.
+    #[allow(dead_code)]
+    pub fn ecdh_call_count(&self) -> usize {
+        self.ecdh_calls
+    }
+
+    /// Number of `verify_ecdsa` calls observed so far.
+    #[allow(dead_code)]
+    pub fn verify_ecdsa_call_count(&self) -> usize {
+        self.verify_calls
+    }
+
+    /// Number of `sign_ecdsa` calls observed so far.
+    #[allow(dead_code)]
+    pub fn sign_ecdsa_call_count(&self) -> usize {
+        self.sign_calls
+    }
+}
+
+impl Default for MockSecureElement {
+    fn default() -> Self {
+        Self::with_id(1)
+    }
+}
+
+impl SecureElement for MockSecureElement {
+    fn ecdh(&mut self, _peer_static_pubkey: &[u8; 33]) -> Result<EcdhSharedSecret, SigilError> {
+        self.ecdh_calls = self.ecdh_calls.wrapping_add(1);
+        if self.reject_ecdh {
+            return Err(SigilError::EcdhFailed);
+        }
+        if self.zero_ecdh {
+            return Ok([0u8; 32]);
+        }
+        if self.reject_stored_point {
+            // The provider refuses the supplied (stored) point at the ECDH
+            // boundary — reachable on paths that skip ECDSA for stored keys.
+            return Err(SigilError::InvalidStaticKey);
+        }
+        // For testing, return a deterministic shared secret.
+        Ok([0x42u8; 32])
+    }
+
+    #[cfg(feature = "sensor")]
+    fn ephemeral_p256_ecdh(
+        &mut self,
+        peer_ephemeral_pubkey: &[u8; 33],
+    ) -> Result<([u8; 33], EcdhSharedSecret), SigilError> {
+        if self.reject_ecdh {
+            return Err(SigilError::EcdhFailed);
+        }
+        if self.zero_ecdh {
+            return Ok((test_p256_public(&[0x11u8; 32])?, [0u8; 32]));
+        }
+        // A valid deterministic P-256 scalar. Using the real gateway-side
+        // primitive makes the mock exercise wire encoding and shared-secret
+        // agreement without pretending that arbitrary 33-byte arrays are keys.
+        let scalar = [0x11u8; 32];
+        let public = test_p256_public(&scalar)?;
+        let shared = test_p256_ecdh(&scalar, peer_ephemeral_pubkey)?;
+        Ok((public, shared))
+    }
+
+    #[cfg(feature = "gateway")]
+    fn generate_ephemeral_p256_keypair(
+        &mut self,
+        rng: &mut impl RandomSource,
+    ) -> Result<([u8; 33], [u8; 32]), SigilError> {
+        // Model a software gateway backend: the private scalar is generated
+        // from the host CSPRNG and returned as Sigil's opaque continuation
+        // context. Retry the negligible invalid-scalar cases.
+        for _ in 0..64 {
+            let mut context = [0u8; 32];
+            rng.fill_bytes(&mut context)?;
+            if let Ok(public) = test_p256_public(&context) {
+                return Ok((public, context));
+            }
+        }
+        Err(SigilError::RandomFailed)
+    }
+
+    #[cfg(feature = "gateway")]
+    fn complete_ephemeral_p256_ecdh(
+        &mut self,
+        context: &[u8; 32],
+        peer_ephemeral_pubkey: &[u8; 33],
+    ) -> Result<[u8; 32], SigilError> {
+        if self.reject_ecdh {
+            return Err(SigilError::EcdhFailed);
+        }
+        if self.zero_ecdh {
+            return Ok([0u8; 32]);
+        }
+        test_p256_ecdh(context, peer_ephemeral_pubkey)
+    }
+
+    fn sign_ecdsa(&mut self, message: &[u8]) -> Result<EcdsaSignature, SigilError> {
+        self.sign_calls = self.sign_calls.wrapping_add(1);
+        if self.reject_signing {
+            return Err(SigilError::RandomFailed);
+        }
+        Ok(mock_message_tag(message))
+    }
+
+    fn verify_ecdsa(
+        &mut self,
+        _peer_static_pubkey: &[u8; 33],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<(), SigilError> {
+        self.verify_calls = self.verify_calls.wrapping_add(1);
+        if self.reject_verify {
+            return Err(SigilError::VerificationFailed);
+        }
+        if *signature != mock_message_tag(message) {
+            return Err(SigilError::VerificationFailed);
+        }
+        Ok(())
+    }
+
+    fn get_static_pubkey(&mut self) -> Result<StaticPublicKey, SigilError> {
+        if self.fail_provider_getters {
+            return Err(SigilError::RandomFailed);
+        }
+        if let Some(forced) = self.static_pubkey_override {
+            return Ok(forced);
+        }
+        Ok(self.static_pubkey)
+    }
+
+    fn get_factory_cert(&mut self) -> Result<EcdsaSignature, SigilError> {
+        if self.fail_provider_getters {
+            return Err(SigilError::RandomFailed);
+        }
+        // Factory cert covers product, immutable metadata, PeerId and pubkey.
+        let msg = crate::core::install::factory_cert_message(
+            self.product_id,
+            self.factory_metadata,
+            &self.device_mac,
+            &self.static_pubkey,
+        )
+        .expect("factory_cert_message fits FACTORY_CERT_MSG_LEN");
+        Ok(mock_message_tag(&msg))
+    }
+
+    fn get_factory_cert_metadata(&mut self) -> Result<FactoryCertificateMetadata, SigilError> {
+        if self.fail_provider_getters {
+            return Err(SigilError::RandomFailed);
+        }
+        Ok(self.factory_metadata)
+    }
+}
+
+/// Factory root public key used by unit tests.
+/// Arbitrary compressed-looking bytes; the mock verifier only checks the
+/// message tag, not a real ECDSA curve point.
+pub const TEST_FACTORY_PUBKEY: StaticPublicKey = [0x02u8; 33];
+
+/// Builds a [`crate::core::manager::SessionManager`] with [`TEST_FACTORY_PUBKEY`].
+/// `local_mac` defaults to `[0x10; 17]` for single-manager tests. Pairwise
+/// tests should call [`SessionManager::new`](crate::core::manager::SessionManager::new)
+/// with distinct sensor/gateway MACs.
+pub fn test_manager<const N: usize>() -> crate::core::manager::SessionManager<N> {
+    crate::core::manager::SessionManager::new(TEST_FACTORY_PUBKEY, [0x10u8; 17])
+        .expect("valid test factory key")
+}
+
+/// Builds a manager with an explicit local MAC (multi-peer / pairwise tests).
+pub fn test_manager_with_mac<const N: usize>(
+    local_mac: [u8; 17],
+) -> crate::core::manager::SessionManager<N> {
+    crate::core::manager::SessionManager::new(TEST_FACTORY_PUBKEY, local_mac)
+        .expect("valid test factory key")
+}
+
+/// Active session helper with **symmetric** TX/RX halves (loopback / single-peer).
+/// Prefer [`active_session_role`] / distinct material for pairwise sensor↔gateway.
+#[allow(dead_code)]
+#[cfg(feature = "sensor")]
+pub fn active_session(
+    peer: crate::core::session::PeerId,
+    pubkey: crate::core::session::StaticPublicKeyBytes,
+    key: crate::core::session::SessionKey,
+    prefix: crate::core::session::NoncePrefix,
+    resume_psk: crate::core::session::ResumePsk,
+    key_expire_at: u32,
+    now: u32,
+) -> crate::core::session::Session {
+    use crate::core::session::{DirectionalMaterial, Session, SessionRole};
+    Session::new_active(
+        peer,
+        pubkey,
+        DirectionalMaterial::symmetric_for_test(key, prefix),
+        SessionRole::Sensor,
+        &resume_psk,
+        key_expire_at,
+        now,
+    )
+    .expect("test active session")
+}
+
+/// Active session with an explicit [`SessionRole`] and symmetric material.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn active_session_role(
+    peer: crate::core::session::PeerId,
+    pubkey: crate::core::session::StaticPublicKeyBytes,
+    key: crate::core::session::SessionKey,
+    prefix: crate::core::session::NoncePrefix,
+    resume_psk: crate::core::session::ResumePsk,
+    key_expire_at: u32,
+    now: u32,
+    role: crate::core::session::SessionRole,
+) -> crate::core::session::Session {
+    use crate::core::session::{DirectionalMaterial, Session};
+    Session::new_active(
+        peer,
+        pubkey,
+        DirectionalMaterial::symmetric_for_test(key, prefix),
+        role,
+        &resume_psk,
+        key_expire_at,
+        now,
+    )
+    .expect("test active session")
+}
+
+/// Pair of sessions sharing **distinct** directional material.
+#[allow(clippy::too_many_arguments)]
+#[cfg(all(feature = "sensor", feature = "gateway"))]
+pub fn pair_active_sessions(
+    sensor_peer: crate::core::session::PeerId,
+    gateway_peer: crate::core::session::PeerId,
+    pubkey: crate::core::session::StaticPublicKeyBytes,
+    key: crate::core::session::SessionKey,
+    prefix: crate::core::session::NoncePrefix,
+    resume_psk: crate::core::session::ResumePsk,
+    key_expire_at: u32,
+    now: u32,
+) -> (crate::core::session::Session, crate::core::session::Session) {
+    use crate::core::session::{DirectionalMaterial, Session, SessionRole};
+    let material = DirectionalMaterial::distinct_for_test(key, prefix);
+    let sensor = Session::new_active(
+        gateway_peer,
+        pubkey,
+        material.clone(),
+        SessionRole::Sensor,
+        &resume_psk,
+        key_expire_at,
+        now,
+    )
+    .expect("sensor session");
+    let gateway = Session::new_active(
+        sensor_peer,
+        pubkey,
+        material,
+        SessionRole::Gateway,
+        &resume_psk,
+        key_expire_at,
+        now,
+    )
+    .expect("gateway session");
+    (sensor, gateway)
+}
+
+/// Mock implementation of `RandomSource` for testing
+/// Produces an incrementing byte sequence so successive calls yield different
+/// values, which is required by the ephemeral ECDH tests.
+pub struct MockRandom {
+    counter: u8,
+}
+
+impl MockRandom {
+    /// Creates a mock random source that produces incrementing bytes
+    pub fn new() -> Self {
+        Self { counter: 0 }
+    }
+}
+
+impl Default for MockRandom {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RandomSource for MockRandom {
+    fn fill_bytes(&mut self, buffer: &mut [u8]) -> Result<(), SigilError> {
+        // For testing, fill with incrementing values
+        for byte in buffer.iter_mut() {
+            *byte = self.counter;
+            self.counter = self.counter.wrapping_add(1);
+        }
+        Ok(())
+    }
+}
+
+/// Random source used to verify that entropy failures are propagated without
+/// consuming counters or creating pending gateway state.
+pub struct FailingRandom;
+
+impl RandomSource for FailingRandom {
+    fn fill_bytes(&mut self, _buffer: &mut [u8]) -> Result<(), SigilError> {
+        Err(SigilError::RandomFailed)
+    }
+}

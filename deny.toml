@@ -1,0 +1,39 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+]
+
+# The crate itself uses the repository's intentional non-commercial license,
+# which is not an SPDX-standard license. The content hash makes any license
+# text change fail closed until this clarification is deliberately updated.
+[[licenses.clarify]]
+name = "sigil"
+expression = "LicenseRef-Personal-Non-Commercial"
+license-files = [{ path = "LICENSE", hash = 0xbeb0f056 }]
+
+[[licenses.exceptions]]
+name = "sigil"
+allow = ["LicenseRef-Personal-Non-Commercial"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
