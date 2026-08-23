@@ -9,8 +9,7 @@ jobs:
     uses: ./.forgejo/workflows/_rust-crate-checks.yml
     with:
       enable_tag_check: false
-    secrets:
-      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+    secrets: inherit
 
   publish:
     needs: checks

@@ -19,5 +19,4 @@ jobs:
     uses: ./.forgejo/workflows/_rust-crate-checks.yml
     with:
       test_command: bash scripts/test.sh
-    secrets:
-      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+    secrets: inherit

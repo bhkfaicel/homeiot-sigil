@@ -5,6 +5,11 @@ repository. `_rust-crate-checks.yml` is the shared local gate, and
 `actions/checkout` is pinned to an immutable commit SHA. This prevents a
 mutable transitive workflow from receiving `RUNNER_TOKEN`.
 
+Reusable workflows: Forgejo allows only `inputs` and `outputs` under
+`on.workflow_call` (not a callee `secrets` block like GitHub Actions).
+Callers must pass repository secrets with `jobs.<id>.secrets: inherit` (or an
+explicit map); the callee reads `${{ secrets.RUNNER_TOKEN }}` as usual.
+
 Only the branch-flow validator remains in
 [`faicel/central_ci`](https://code.bhk-itsolutions.com/faicel/central_ci); it is
 pinned to an immutable revision, receives no secret and invokes no third-party

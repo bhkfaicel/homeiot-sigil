@@ -1,5 +1,8 @@
 name: Rust crate checks (local, pinned)
 
+# Reusable Rust crate gate. Callers pass secrets via jobs.<id>.secrets (Forgejo
+# does not allow a `secrets` block under on.workflow_call; use `inherit` or an
+# explicit map from the caller workflow).
 on:
   workflow_call:
     inputs:
@@ -9,9 +12,6 @@ on:
       test_command:
         type: string
         default: "bash scripts/test.sh"
-    secrets:
-      RUNNER_TOKEN:
-        required: true
 
 jobs:
   checks:

@@ -7,8 +7,7 @@ on:
 jobs:
   checks:
     uses: ./.forgejo/workflows/_rust-crate-checks.yml
-    secrets:
-      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+    secrets: inherit
 
   tag:
     needs: checks
