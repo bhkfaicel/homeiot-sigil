@@ -439,22 +439,31 @@ fn manifest_digest_layout_matches_documented_construction() {
     // against the helper output: this pins the domain tag, the PRODUCT ID
     // binding, field order, and integer endianness of the signed digest.
     let product_id: u16 = 0x0102;
+    let hardware_profile_id: u8 = 0x07;
     let version: u32 = 0x0304_0506;
     let len: u32 = 0x0708_090A;
     let chunk_len: u8 = 192;
     let sha = [0x11u8; 32];
 
-    let mut expected_input = [0u8; 55];
+    let mut expected_input = [0u8; 56];
     expected_input[..12].copy_from_slice(b"sigil-ota-v2");
     expected_input[12..14].copy_from_slice(&product_id.to_le_bytes());
-    expected_input[14..18].copy_from_slice(&version.to_le_bytes());
-    expected_input[18..22].copy_from_slice(&len.to_le_bytes());
-    expected_input[22] = chunk_len;
-    expected_input[23..55].copy_from_slice(&sha);
+    expected_input[14] = hardware_profile_id;
+    expected_input[15..19].copy_from_slice(&version.to_le_bytes());
+    expected_input[19..23].copy_from_slice(&len.to_le_bytes());
+    expected_input[23] = chunk_len;
+    expected_input[24..56].copy_from_slice(&sha);
 
     let expected: [u8; 32] = sha2::Sha256::digest(expected_input).into();
     assert_eq!(
-        wire::manifest_digest(product_id, version, len, chunk_len, &sha),
+        wire::manifest_digest(
+            product_id,
+            hardware_profile_id,
+            version,
+            len,
+            chunk_len,
+            &sha
+        ),
         expected,
         "digest construction drifted from the documented contract"
     );
@@ -482,7 +491,7 @@ fn manifest_v2_literal_vector_matches_helper_and_real_crypto() {
     let mut img_sha = [0u8; 32];
     img_sha.copy_from_slice(&sha);
     assert_eq!(
-        wire::manifest_digest_input(1, 11, 300, 64, &img_sha)[..],
+        wire::manifest_digest_input(1, 0x01, 11, 300, 64, &img_sha)[..],
         input[..],
         "manifest v2 input drifted from the frozen literal"
     );

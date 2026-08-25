@@ -62,8 +62,10 @@
 //!
 //! `manifest_sig` is an ECDSA P-256 signature (64-byte `r‖s`) over
 //! [`manifest_digest`] with the factory root key. Manifest v2 BINDS the
-//! product identifier into the signed material, so an image validly signed
-//! for another product sharing the same factory root fails here.
+//! target identity — product id AND hardware profile byte, mirroring the
+//! install factory certificate — into the signed material, so an image
+//! validly signed for another product or incompatible board sharing the
+//! same factory root fails here.
 //!
 //! Verification ordering (fail-closed, cheapest-reject-first):
 //! 1. BEGIN authenticates the manifest through the host secure element

@@ -233,12 +233,12 @@ pub enum OtaCommand<'a> {
 // ---------------------------------------------------------------------------
 
 /// Domain-separation tag prefixed to every manifest digest. The `v2` tag
-/// marks the layout that BINDS the product identifier (see
-/// [`manifest_digest_input`]); v1 never shipped, so no cross-version
-/// compatibility is required.
+/// marks the layout that BINDS the target identity (product id AND hardware
+/// profile, see [`manifest_digest_input`]); v1 never shipped, so no
+/// cross-version compatibility is required.
 const MANIFEST_DOMAIN: &[u8] = b"sigil-ota-v2";
 
-/// Builds the canonical 55-byte manifest input that is signed and verified.
+/// Builds the canonical 56-byte manifest input that is signed and verified.
 ///
 /// This is the byte string handed to
 /// [`SecureElement::verify_ecdsa`](crate::core::traits::SecureElement::verify_ecdsa)
@@ -248,26 +248,30 @@ const MANIFEST_DOMAIN: &[u8] = b"sigil-ota-v2";
 /// secure element. Single source of truth for both directions.
 ///
 /// Layout:
-/// `"sigil-ota-v2"` ‖ product_id_le ‖ version_le ‖ len_le ‖ chunk_len ‖
-/// img_sha256. Binding `product_id` into the SIGNED material prevents a
-/// validly-signed image for one product from being accepted by another
-/// product sharing the same factory root key. Integer fields use
-/// LITTLE-endian by design (native order on Cortex-M0+); wire frames stay
-/// big-endian.
+/// `"sigil-ota-v2"` ‖ product_id_le ‖ hardware_profile_id ‖ version_le ‖
+/// len_le ‖ chunk_len ‖ img_sha256. Binding BOTH identifiers into the
+/// SIGNED material mirrors the install-factory-certificate identity
+/// (`hardware_profile_id` byte) and prevents a validly-signed image for one
+/// target from being accepted by an incompatible device sharing the same
+/// factory root key. Integer fields use LITTLE-endian by design (native
+/// order on Cortex-M0+); wire frames stay big-endian.
 pub fn manifest_digest_input(
     product_id: u16,
+    hardware_profile_id: u8,
     img_version: u32,
     img_len: u32,
     chunk_len: u8,
     img_sha256: &[u8; 32],
-) -> [u8; 55] {
-    // 12 (domain) + 2 + 4 + 4 + 1 + 32 = 55 bytes of domain-separated input.
-    let mut input = [0u8; 55];
+) -> [u8; 56] {
+    // 12 (domain) + 2 + 1 + 4 + 4 + 1 + 32 = 56 bytes of separated input.
+    let mut input = [0u8; 56];
     let mut off = 0;
     input[..MANIFEST_DOMAIN.len()].copy_from_slice(MANIFEST_DOMAIN);
     off += MANIFEST_DOMAIN.len();
     input[off..off + 2].copy_from_slice(&product_id.to_le_bytes());
     off += 2;
+    input[off] = hardware_profile_id;
+    off += 1;
     input[off..off + 4].copy_from_slice(&img_version.to_le_bytes());
     off += 4;
     input[off..off + 4].copy_from_slice(&img_len.to_le_bytes());
@@ -289,12 +293,20 @@ pub fn manifest_digest_input(
 /// golden vectors) this construction instead of inventing their own.
 pub fn manifest_digest(
     product_id: u16,
+    hardware_profile_id: u8,
     img_version: u32,
     img_len: u32,
     chunk_len: u8,
     img_sha256: &[u8; 32],
 ) -> [u8; 32] {
-    let input = manifest_digest_input(product_id, img_version, img_len, chunk_len, img_sha256);
+    let input = manifest_digest_input(
+        product_id,
+        hardware_profile_id,
+        img_version,
+        img_len,
+        chunk_len,
+        img_sha256,
+    );
     let digest = Sha256::digest(input);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);

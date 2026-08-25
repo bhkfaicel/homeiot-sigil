@@ -26,10 +26,12 @@ fn print_manifest_v2_material() {
     let signing = SigningKey::from(&secret);
     let pub_compressed = signing.verifying_key().to_encoded_point(true);
 
-    // Manifest v2: product 0x0001, version 11, 300 B image, chunk_len 64.
+    // Manifest v2: product 0x0001, hardware profile 0x01, version 11,
+    // 300 B image, chunk_len 64.
     let mut msg = std::vec::Vec::new();
     msg.extend_from_slice(b"sigil-ota-v2");
     msg.extend_from_slice(&1u16.to_le_bytes());
+    msg.push(0x01); // hardware_profile_id
     msg.extend_from_slice(&11u32.to_le_bytes());
     msg.extend_from_slice(&300u32.to_le_bytes());
     msg.push(64);

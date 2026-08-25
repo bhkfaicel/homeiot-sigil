@@ -19,6 +19,9 @@ use sha2::{Digest, Sha256};
 // Test doubles
 // ---------------------------------------------------------------------------
 
+/// Hardware profile bound into signed manifests (matches receiver fixtures).
+const HARDWARE_PROFILE: u8 = 0x01;
+
 /// Deterministic RAM image whose bytes follow `(index * 7 % 251)`.
 struct MemImage {
     data: Vec<u8>,
@@ -41,7 +44,14 @@ impl MemImage {
     /// Manifest signed over THIS image with the given geometry. The
     /// product id is a fixture constant matching receiver-side tests.
     fn manifest_for(&self, version: u32, chunk_len: u8) -> BeginFrame {
-        let msg = manifest_digest_input(1, version, self.data.len() as u32, chunk_len, &self.sha());
+        let msg = manifest_digest_input(
+            1,
+            HARDWARE_PROFILE,
+            version,
+            self.data.len() as u32,
+            chunk_len,
+            &self.sha(),
+        );
         // Signature content is opaque to the send half; a fixed tag keeps
         // vectors deterministic without dragging an ECDSA stack in here.
         let mut sig = [0u8; 64];

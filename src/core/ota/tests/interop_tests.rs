@@ -182,8 +182,16 @@ fn run_interop(drop_every_nth: Option<usize>) -> (Vec<u8>, TrailerRecord) {
         out
     };
     const PRODUCT_ID: u16 = 0x0001;
-    let msg =
-        crate::core::ota::wire::manifest_digest_input(PRODUCT_ID, 11, IMG_LEN as u32, cl, &sha);
+    // Hardware profile bound into signed manifests (matches install cert).
+    const HARDWARE_PROFILE: u8 = 0x01;
+    let msg = crate::core::ota::wire::manifest_digest_input(
+        PRODUCT_ID,
+        HARDWARE_PROFILE,
+        11,
+        IMG_LEN as u32,
+        cl,
+        &sha,
+    );
     let sig = se.sign_ecdsa(&msg).expect("mock signing");
     let begin = BeginFrame {
         img_version: 11,
@@ -198,6 +206,7 @@ fn run_interop(drop_every_nth: Option<usize>) -> (Vec<u8>, TrailerRecord) {
         factory_pub(),
         OtaReceiverConfig {
             product_id: PRODUCT_ID,
+            hardware_profile_id: HARDWARE_PROFILE,
             staging_cap: STAGING_CAP,
             trailer_offset: TRAILER_OFFSET,
             min_acceptable_version: 0,

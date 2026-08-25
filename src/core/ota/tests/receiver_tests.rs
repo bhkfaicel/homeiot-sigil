@@ -118,11 +118,14 @@ fn factory_pub() -> StaticPublicKey {
 /// Product id shared by every fixture in this file (bound into signed
 /// manifests).
 const PRODUCT_ID: u16 = 0x0001;
+/// Hardware profile bound into signed manifests (matches install cert).
+const HARDWARE_PROFILE: u8 = 0x01;
 
 /// Builds the standard engine config for a given staging capacity.
 fn rig_config(staging_cap: u32) -> OtaReceiverConfig {
     OtaReceiverConfig {
         product_id: PRODUCT_ID,
+        hardware_profile_id: HARDWARE_PROFILE,
         staging_cap,
         trailer_offset: staging_cap,
         min_acceptable_version: 0,
@@ -164,7 +167,14 @@ impl Rig {
     /// pass the integrity gate.
     fn signed_begin(&mut self, version: u32, img_len: u32, chunk_len: u8) -> BeginFrame {
         let sha = transfer_image_sha(img_len, chunk_len);
-        let msg = manifest_digest_input(PRODUCT_ID, version, img_len, chunk_len, &sha);
+        let msg = manifest_digest_input(
+            PRODUCT_ID,
+            HARDWARE_PROFILE,
+            version,
+            img_len,
+            chunk_len,
+            &sha,
+        );
         let sig = self.se.sign_ecdsa(&msg).expect("mock signing works");
         BeginFrame {
             img_version: version,
@@ -386,6 +396,7 @@ fn size_gates_reject_over_capacity_and_chunk_count_overflow() {
         factory_pub(),
         OtaReceiverConfig {
             product_id: PRODUCT_ID,
+            hardware_profile_id: HARDWARE_PROFILE,
             staging_cap: 4_200_000,
             trailer_offset: 4_210_688,
             min_acceptable_version: 0,
@@ -449,6 +460,7 @@ fn trailer_block_overlapping_the_image_window_is_rejected_at_begin() {
         factory_pub(),
         OtaReceiverConfig {
             product_id: PRODUCT_ID,
+            hardware_profile_id: HARDWARE_PROFILE,
             staging_cap: 1000,
             trailer_offset: 1000,
             min_acceptable_version: 0,
@@ -492,6 +504,7 @@ fn trailer_range_end_overflow_is_rejected_at_begin() {
         factory_pub(),
         OtaReceiverConfig {
             product_id: PRODUCT_ID,
+            hardware_profile_id: HARDWARE_PROFILE,
             staging_cap: 256,
             trailer_offset: 0xFFFF_F000,
             min_acceptable_version: 0,
@@ -730,6 +743,7 @@ fn rollback_older_version_rejected_before_any_flash_access() {
         factory_pub(),
         OtaReceiverConfig {
             product_id: PRODUCT_ID,
+            hardware_profile_id: HARDWARE_PROFILE,
             staging_cap: 1024,
             trailer_offset: 1024,
             min_acceptable_version: 10,
@@ -740,7 +754,14 @@ fn rollback_older_version_rejected_before_any_flash_access() {
 
     let send_begin = |se: &mut MockSecureElement, version: u32| {
         let sha = transfer_image_sha(version, 128);
-        let msg = manifest_digest_input(PRODUCT_ID, version, 128, CHUNK_LEN_MIN as u8, &sha);
+        let msg = manifest_digest_input(
+            PRODUCT_ID,
+            HARDWARE_PROFILE,
+            version,
+            128,
+            CHUNK_LEN_MIN as u8,
+            &sha,
+        );
         let sig = se.sign_ecdsa(&msg).expect("mock signing");
         BeginFrame {
             img_version: version,
@@ -782,6 +803,7 @@ fn absolute_lifetime_expires_even_with_fresh_identical_begins() {
         factory_pub(),
         OtaReceiverConfig {
             product_id: PRODUCT_ID,
+            hardware_profile_id: HARDWARE_PROFILE,
             staging_cap: 1024,
             trailer_offset: 1024,
             min_acceptable_version: 0,

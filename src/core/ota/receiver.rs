@@ -195,6 +195,10 @@ pub struct OtaReceiverConfig {
     /// Product identifier BOUND INTO THE SIGNED MANIFEST (manifest v2): a
     /// validly-signed image for any other product fails verification here.
     pub product_id: u16,
+    /// Hardware profile byte (same identity the install factory certificate
+    /// attests), also bound into the signed manifest: images built for an
+    /// incompatible board revision are rejected at verification.
+    pub hardware_profile_id: u8,
     /// Maximum image size the host staging window accepts.
     pub staging_cap: u32,
     /// Offset (relative to the staging window base) of the trailer record;
@@ -439,6 +443,7 @@ impl OtaReceiver {
                 // actually arrived.
                 let message = manifest_digest_input(
                     self.cfg.product_id,
+                    self.cfg.hardware_profile_id,
                     begin.img_version,
                     begin.img_len,
                     begin.chunk_len,
