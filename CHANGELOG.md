@@ -7,6 +7,43 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-25
+
+- Add the OTA firmware-update protocol module (`core::ota`) behind the new
+  `ota` cargo feature (off by default; never implied by another feature).
+  The module is fully additive: no `SigilEvent`, `SigilError`, or
+  `FrameType` changes, and plain `sensor` / `gateway` builds carry zero OTA
+  code. Feature tiers:
+  - `ota` alone compiles the shared wire tier only — command constants under
+    the product gateway-command envelope (`0x7F`, ids `0x10..0x18`), a
+    bounds-checked frame codec that never panics on malformed input,
+    `manifest_digest_input` / `manifest_digest` as the single source of
+    truth for signed-manifest digests, and the local `OtaError` taxonomy.
+  - `sensor,ota` adds the receive half: the host-implemented `OtaStorage`
+    sink trait, the 46-byte `TrailerRecord` bootable marker (magic `"SOTA"`,
+    little-endian fields, strict status byte), and the `OtaReceiver` engine
+    with strictly contiguous chunk acceptance, incremental SHA-256
+    integrity, erase-once block bookkeeping bounded by `MAX_STAGING_BLOCKS`,
+    finalize gated on ECDSA verification through the existing
+    `SecureElement::verify_ecdsa` trait, STATUS projection, ABORT, and an
+    idle-timeout policy.
+  - `gateway,ota` adds the send half: the host-implemented `OtaImageSource`
+    trait and the `OtaSender` stop-and-wait engine with a full-image digest
+    preflight, deadline-driven bounded resends (`1 + max_retries`
+    transmissions per frame), cumulative-ACK progress, STATUS-driven resume,
+    and REBOOT unlocking only after verified completion.
+  Wire contract and trailer layout are frozen by hand-written golden-vector
+  tests intended for verbatim duplication in firmware, gateway, and signing
+  tooling. An interop suite drives both engines against each other through
+  the real codec over a lossy in-memory link.
+- Extend the locked feature-matrix gate with the `ota`, `sensor,ota`, and
+  `gateway,ota` configurations, and the embedded cross-checks with
+  `thumbv6m-none-eabi` builds of `sensor,ota` (constrained receive half)
+  and `armv7-unknown-linux-gnueabihf` builds of `gateway,ota`.
+- Accept the `ota`-only configuration in the empty-set compile-time
+  diagnostic so signing tooling can depend on the shared wire tier without
+  any session role.
+
 ## [1.1.0] - 2026-08-23
 
 - CI embedded cross-checks: install `thumbv6m-none-eabi` and

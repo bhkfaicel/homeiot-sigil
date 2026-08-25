@@ -17,3 +17,7 @@ bash scripts/test-feature-matrix.sh
 rustup target add thumbv6m-none-eabi armv7-unknown-linux-gnueabihf
 cargo check --locked --target thumbv6m-none-eabi --no-default-features --features sensor
 cargo check --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features gateway
+# OTA tiers on their real targets: the constrained sensor build must carry NO
+# sender code (receive half only), and the gateway build the send half.
+cargo check --locked --target thumbv6m-none-eabi --no-default-features --features sensor,ota
+cargo check --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features gateway,ota

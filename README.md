@@ -45,6 +45,12 @@ The host routes `*Request` to `handle_*` and challenge/confirm/ack/**CommitConfi
 - **Role-scoped builds** — `sensor` is the safe, smallest default. Gateway
   dependencies must use `default-features = false, features = ["gateway"]`;
   pairwise development uses `--all-features`.
+- **OTA firmware-update protocol (opt-in `ota` feature)** — signed-image
+  transfer over the encrypted Data channel: shared wire tier (`ota` alone,
+  for offline signing tools), receive half on `sensor,ota`, send half on
+  `gateway,ota`. Hardware effects stay host-side behind `OtaStorage` /
+  `OtaImageSource`; authenticity is verified through the existing
+  `SecureElement::verify_ecdsa` trait.
 - **Non-blocking core** — Host-owned radio + secure element via the `SecureElement` / `RandomSource` traits. Provides `SessionManager<N>`, a single ingress (`process_incoming_packet`), egress (`encrypt_data`), and three host-driven phases: install, sensor-initiated renew, and fast resume.
 - **`N` must be a power of two and `>= 2`** (constraint from `heapless::FnvIndexMap`); use `<2>` for single-peer sensors, `<128>` for gateways.
 - **Host-owned footprint budgets** — final flash, static RAM, and stack budgets
@@ -286,22 +292,26 @@ gateway-only API/events/state from being compiled into the sensor firmware.
 
 ```toml
 [dependencies]
-# SAMD21 sensor firmware
-sigil = { version = "1.0.1", registry = "forgejo", default-features = false, features = ["sensor"] }
+# SAMD21 sensor firmware (session + OTA receive half)
+sigil = { version = "1.2.0", registry = "forgejo", default-features = false, features = ["sensor", "ota"] }
 
-# Raspberry Pi (or equivalent) gateway software
-# sigil = { version = "1.0.1", registry = "forgejo", default-features = false, features = ["gateway"] }
+# Raspberry Pi (or equivalent) gateway software (session + OTA send half)
+# sigil = { version = "1.2.0", registry = "forgejo", default-features = false, features = ["gateway", "ota"] }
+
+# Offline signing tooling (shared OTA wire tier only, no engines)
+# sigil = { version = "1.2.0", registry = "forgejo", default-features = false, features = ["ota"] }
 ```
 
 The default feature is `sensor`, the safe smallest build for sensor firmware.
 Supported configurations are `wire` (manufacturing contract), `sensor`,
-`gateway`, and the explicit two-role composition `sensor,gateway`; pairwise
-development uses `--all-features`. A build without any supported feature set
-(no role and no `wire`) is rejected at compile time with an explicit
-diagnostic:
+`gateway`, the explicit two-role composition `sensor,gateway`, and the OTA
+tiers `ota` / `sensor,ota` / `gateway,ota` (the dual-role plus both halves is
+covered by `--all-features`). A plain `sensor` or `gateway` dependency never
+pulls in OTA code; a build without any supported feature set (no role, no
+`wire`, no `ota`) is rejected at compile time with an explicit diagnostic:
 
 ```text
-sigil: no supported feature configuration selected; enable `wire` (manufacturing contract) or one of the session roles `sensor` / `gateway`
+sigil: no supported feature configuration selected; enable `wire` (manufacturing contract), one of the session roles `sensor` / `gateway`, or the OTA protocol tiers via `ota`
 ```
 
 `SigilEvent` intentionally keeps the complete wire-classification enum in both

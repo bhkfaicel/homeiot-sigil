@@ -1,6 +1,6 @@
 [package]
 name = "sigil"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
 license-file = "LICENSE"
@@ -16,6 +16,10 @@ repository = "https://code.bhk-itsolutions.com/homeiot/sigil"
 #   - sensor:         SUPPORTED. Single-role session build.
 #   - gateway:        SUPPORTED. Single-role session build.
 #   - sensor,gateway: SUPPORTED. Explicit two-role composition.
+#   - ota:            SUPPORTED. Shared OTA wire tier (codec + manifest
+#                     digest) without any engine.
+#   - sensor,ota:     SUPPORTED. Adds the OTA receive half.
+#   - gateway,ota:    SUPPORTED. Adds the OTA send half.
 # Safe smallest default for sensor firmware. Gateways must disable defaults and
 # select `gateway`; pairwise development uses `--all-features` explicitly.
 default = ["sensor"]
@@ -36,6 +40,13 @@ session = [
 ]
 sensor = ["session"]
 gateway = ["session"]
+#
+# `ota` enables the firmware-update protocol module (`core::ota`). By itself
+# it compiles ONLY the shared wire tier (codec + manifest digest); the
+# receive engine requires `sensor,ota` and the send engine `gateway,ota`.
+# It is never implied by another feature, so plain `sensor` or `gateway`
+# builds carry zero OTA code.
+ota = ["dep:sha2", "dep:heapless"]
 
 [dependencies]
 # Cryptographic primitives
