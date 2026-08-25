@@ -307,13 +307,13 @@ fn ack_loss_resends_same_chunk_after_deadline() {
 
     // Before the deadline: nothing to do.
     assert_eq!(
-        tx.poll(&mut img, 100 + DEFAULT_ACK_TIMEOUT_SECS - 1)
+        tx.poll(100 + DEFAULT_ACK_TIMEOUT_SECS - 1)
             .expect("no fault"),
         None
     );
 
     // After it: identical chunk re-emitted.
-    let (frame, _) = expect_transmit(tx.poll(&mut img, 103));
+    let (frame, _) = expect_transmit(tx.poll(103));
     let TxFrame::Chunk { seq: 0, data } = frame else {
         panic!("expected chunk 0 resend");
     };
@@ -323,6 +323,66 @@ fn ack_loss_resends_same_chunk_after_deadline() {
     let (frame, _) =
         expect_transmit(tx.on_reply(&mut img, OtaCommand::AckChunk { next_seq: 1 }, 104));
     assert!(matches!(frame, TxFrame::Chunk { seq: 1, .. }));
+}
+
+/// Image source that COUNTS reads, proving retransmissions are free.
+struct CountingImage {
+    inner: MemImage,
+    reads: core::cell::Cell<usize>,
+}
+
+impl OtaImageSource for CountingImage {
+    fn len(&self) -> u32 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u32, out: &mut [u8]) -> Result<(), OtaError> {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.read_at(offset, out)
+    }
+}
+
+#[test]
+fn chunk_retransmission_performs_zero_additional_source_reads() {
+    let mut img = CountingImage {
+        inner: MemImage::new(128),
+        reads: core::cell::Cell::new(0),
+    };
+    let cl = CHUNK_LEN_MIN;
+    let manifest = img.inner.manifest_for(4, cl as u8);
+    let mut tx = OtaSender::new(2, 1);
+    tx.start(&mut img, manifest, 100).expect("preflight passes");
+    let reads_after_start = img.reads.get();
+    assert!(reads_after_start > 0, "preflight must hash via the source");
+
+    expect_transmit(tx.on_reply(
+        &mut img,
+        OtaCommand::AckReady {
+            chunk_len: cl as u8,
+        },
+        101,
+    ));
+    // Staging chunk 0 performed exactly one new read.
+    assert_eq!(img.reads.get(), reads_after_start + 1);
+    let staged_reads = img.reads.get();
+
+    // Deadline fires: the resend must reuse the staged bytes.
+    match tx.poll(103).expect("no fault") {
+        Some(SenderAction::Transmit {
+            frame: TxFrame::Chunk { seq: 0, data },
+            ..
+        }) => assert_eq!(data, &img.inner.data[..cl]),
+        other => panic!("expected resent chunk 0, got {other:?}"),
+    }
+    assert_eq!(
+        img.reads.get(),
+        staged_reads,
+        "a timed-out chunk must not touch the source again"
+    );
+
+    // Advancing to the NEXT sequence does read exactly once more.
+    expect_transmit(tx.on_reply(&mut img, OtaCommand::AckChunk { next_seq: 1 }, 105));
+    assert_eq!(img.reads.get(), staged_reads + 1);
 }
 
 #[test]
@@ -338,7 +398,7 @@ fn retry_exhaustion_ends_timed_out_and_blocks_reboot() {
     // First send (start), then two resends, then exhaustion.
     let mut saw_begin_sends = 1;
     loop {
-        match tx.poll(&mut img, now).expect("no fault") {
+        match tx.poll(now).expect("no fault") {
             Some(SenderAction::Transmit {
                 frame: TxFrame::Begin(_),
                 ..

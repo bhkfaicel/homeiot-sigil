@@ -356,11 +356,12 @@ impl OtaSender {
 
     /// Timer callback: resends the outstanding frame once its deadline has
     /// passed, ending the transfer when the budget is exhausted.
-    pub fn poll<IMG: OtaImageSource>(
-        &mut self,
-        image: &mut IMG,
-        now: u32,
-    ) -> Result<Option<SenderAction<'_>>, OtaError> {
+    ///
+    /// Retransmissions reuse the ALREADY-STAGED in-flight bytes: a timed-out
+    /// chunk performs ZERO additional [`OtaImageSource`] reads. The source
+    /// is only read when advancing to a NEW sequence number or during the
+    /// `start()` digest preflight.
+    pub fn poll(&mut self, now: u32) -> Result<Option<SenderAction<'_>>, OtaError> {
         if now < self.deadline_secs {
             return Ok(None);
         }
@@ -394,7 +395,9 @@ impl OtaSender {
                         }
                         Outstanding::Chunk { seq, mut attempts } => {
                             attempts.bump();
-                            self.stage_chunk(image, seq)?;
+                            // No source read here: the in-flight bytes are
+                            // already staged in the internal buffer and the
+                            // content cannot have changed while we wait.
                             if let TxState::Streaming { attempts: a, .. } = &mut self.state {
                                 *a = attempts;
                             }

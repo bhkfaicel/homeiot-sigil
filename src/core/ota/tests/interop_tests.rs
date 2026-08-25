@@ -256,7 +256,7 @@ fn run_interop(drop_every_nth: Option<usize>) -> (Vec<u8>, TrailerRecord) {
                 // Silence on both pipes: jump past the deadline to exercise
                 // retransmit paths on whichever side is waiting.
                 now += 3;
-                pending = tx.poll(&mut img, now).expect("tx ok");
+                pending = tx.poll(now).expect("tx ok");
             }
         }
     }

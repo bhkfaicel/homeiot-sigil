@@ -8,6 +8,8 @@ mod golden_vectors;
 mod receiver_tests;
 #[path = "sender_tests.rs"]
 mod sender_tests;
+#[path = "type_size_bounds.rs"]
+mod type_size_bounds;
 mod wire_tests;
 // Cross-engine proof: compiled only when BOTH halves exist. The file itself
 // carries the cfg gate so this declaration stays inert otherwise.
