@@ -106,6 +106,9 @@ pub enum FinalResult {
     /// Transfer parameters exceed host capacity (e.g. image larger than the
     /// staging window).
     SizeRejected = 5,
+    /// Signed image version is OLDER than the host's rollback-protection
+    /// floor (anti-downgrade policy; see `OtaReceiver` construction).
+    VersionRejected = 6,
 }
 
 impl FinalResult {
@@ -118,6 +121,7 @@ impl FinalResult {
             3 => Some(Self::StorageError),
             4 => Some(Self::BadState),
             5 => Some(Self::SizeRejected),
+            6 => Some(Self::VersionRejected),
             _ => None,
         }
     }
@@ -228,13 +232,13 @@ pub enum OtaCommand<'a> {
 // Manifest digest
 // ---------------------------------------------------------------------------
 
-/// Domain-separation tag prefixed to every manifest digest.
-const MANIFEST_DOMAIN: &[u8] = b"sigil-ota-v1";
+/// Domain-separation tag prefixed to every manifest digest. The `v2` tag
+/// marks the layout that BINDS the product identifier (see
+/// [`manifest_digest_input`]); v1 never shipped, so no cross-version
+/// compatibility is required.
+const MANIFEST_DOMAIN: &[u8] = b"sigil-ota-v2";
 
-/// Computes the canonical manifest digest signed by the factory key.
-///
-/// ```text
-/// Builds the canonical 53-byte manifest input that is signed and verified.
+/// Builds the canonical 55-byte manifest input that is signed and verified.
 ///
 /// This is the byte string handed to
 /// [`SecureElement::verify_ecdsa`](crate::core::traits::SecureElement::verify_ecdsa)
@@ -243,20 +247,27 @@ const MANIFEST_DOMAIN: &[u8] = b"sigil-ota-v1";
 /// `SHA256(manifest_digest_input(..))`; verifiers pass the same input to the
 /// secure element. Single source of truth for both directions.
 ///
-/// Layout: `"sigil-ota-v1"` ‖ version_le ‖ len_le ‖ chunk_len ‖ img_sha256.
-/// Integer fields use LITTLE-endian by design (native order on Cortex-M0+);
-/// wire frames stay big-endian.
+/// Layout:
+/// `"sigil-ota-v2"` ‖ product_id_le ‖ version_le ‖ len_le ‖ chunk_len ‖
+/// img_sha256. Binding `product_id` into the SIGNED material prevents a
+/// validly-signed image for one product from being accepted by another
+/// product sharing the same factory root key. Integer fields use
+/// LITTLE-endian by design (native order on Cortex-M0+); wire frames stay
+/// big-endian.
 pub fn manifest_digest_input(
+    product_id: u16,
     img_version: u32,
     img_len: u32,
     chunk_len: u8,
     img_sha256: &[u8; 32],
-) -> [u8; 53] {
-    // 12 (domain) + 4 + 4 + 1 + 32 = 53 bytes of domain-separated input.
-    let mut input = [0u8; 53];
+) -> [u8; 55] {
+    // 12 (domain) + 2 + 4 + 4 + 1 + 32 = 55 bytes of domain-separated input.
+    let mut input = [0u8; 55];
     let mut off = 0;
     input[..MANIFEST_DOMAIN.len()].copy_from_slice(MANIFEST_DOMAIN);
     off += MANIFEST_DOMAIN.len();
+    input[off..off + 2].copy_from_slice(&product_id.to_le_bytes());
+    off += 2;
     input[off..off + 4].copy_from_slice(&img_version.to_le_bytes());
     off += 4;
     input[off..off + 4].copy_from_slice(&img_len.to_le_bytes());
@@ -277,12 +288,13 @@ pub fn manifest_digest_input(
 /// offline signing tools must call (or byte-for-byte replicate, via the
 /// golden vectors) this construction instead of inventing their own.
 pub fn manifest_digest(
+    product_id: u16,
     img_version: u32,
     img_len: u32,
     chunk_len: u8,
     img_sha256: &[u8; 32],
 ) -> [u8; 32] {
-    let input = manifest_digest_input(img_version, img_len, chunk_len, img_sha256);
+    let input = manifest_digest_input(product_id, img_version, img_len, chunk_len, img_sha256);
     let digest = Sha256::digest(input);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);

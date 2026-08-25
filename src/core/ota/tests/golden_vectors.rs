@@ -62,6 +62,32 @@ pub const ACK_FINAL_OK_HEX: &str = "7f1700";
 /// img_len=112640.
 pub const STATUS_HEX: &str = "7f18010009000001000001b800";
 
+// -------------------------------------------------------------------------
+// Manifest-v2 signed-material literals (security conformance contract)
+//
+// These bytes were produced ONCE by the deterministic generator in
+// `golden_vectors_material.rs` (fixed test scalar) and MUST be copied
+// verbatim by signers/bootloaders. The verification test cross-checks them
+// against an INDEPENDENT implementation (the `p256` crate), not against
+// sigil's own code paths.
+// -------------------------------------------------------------------------
+
+/// SHA-256 of the canonical 300 B interop image (bytes `(i*13+5)%241`).
+pub const MANIFEST_V2_IMAGE_SHA_HEX: &str =
+    "A68BA90935019C9820352CE14AC052AC24ACFA2374C9980052CE26AA2649A628";
+
+/// Frozen 55-byte manifest v2 input: `"sigil-ota-v2"` ‖ product_id_le(1) ‖
+/// version_le(11) ‖ len_le(300) ‖ chunk_len(64) ‖ image_sha256.
+pub const MANIFEST_V2_INPUT_HEX: &str = "736967696C2D6F74612D763201000B0000002C01000040A68BA90935019C9820352CE14AC052AC24ACFA2374C9980052CE26AA2649A628";
+
+/// Compressed P-256 public key of the fixed test identity.
+pub const MANIFEST_V2_PUBKEY_HEX: &str =
+    "033AD3861A95621392516BB593EF05583ED2E5866F5CB6260A3017237FD89B90AF";
+
+/// Real ECDSA signature (64-byte r‖s) over [`MANIFEST_V2_INPUT_HEX`] by the
+/// matching private key.
+pub const MANIFEST_V2_SIGNATURE_HEX: &str = "7AB69D55F3BCF02A823D74A19E71767FAFE914C44438C9283FC8A53AF014747A6CEE7F18A98C258C4C9AFEAF8A68EAF24010B8774F160178E6C005ABACDB80CF";
+
 /// Decodes a lowercase hex string into bytes. Panics only on test-authoring
 /// mistakes (odd length or non-hex characters), never on codec behavior.
 #[cfg(test)]

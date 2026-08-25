@@ -91,6 +91,9 @@ pub enum TickOutcome {
     Continue,
     /// The streaming session was torn down after the idle timeout.
     ExpiredIdleTimeout,
+    /// The session hit its ABSOLUTE lifetime ceiling even though traffic
+    /// kept refreshing the idle timer (anti-pinning defense).
+    ExpiredAbsoluteLifetime,
 }
 
 /// Active streaming session (private; projected through accessors).
@@ -108,6 +111,8 @@ struct StreamingSession {
     begin: BeginFrame,
     /// Last activity stamp (whole seconds) feeding the idle timeout.
     last_activity_secs: u32,
+    /// Session opening stamp feeding the ABSOLUTE lifetime ceiling.
+    opened_at_secs: u32,
     /// Erase-once bookkeeping: bit `b` set means granularity block `b` was
     /// already erased in THIS session, so later writes into it must not
     /// erase again (they would destroy neighboring staged chunks).
@@ -176,6 +181,35 @@ impl RxState {
     }
 }
 
+/// Construction-time policy and geometry for an OTA receive engine.
+///
+/// `min_acceptable_version` is the ROLLBACK-PROTECTION floor: BEGIN frames
+/// whose signed version is strictly older are refused with
+/// [`FinalResult::VersionRejected`] before any flash access. The host owns
+/// the durable counter: keep it in rollback-resistant storage and raise it
+/// to the accepted image's version after every completed update. Deliberate
+/// downgrade recovery = an explicit, audited host action that lowers its own
+/// persisted floor.
+#[derive(Debug, Clone, Copy)]
+pub struct OtaReceiverConfig {
+    /// Product identifier BOUND INTO THE SIGNED MANIFEST (manifest v2): a
+    /// validly-signed image for any other product fails verification here.
+    pub product_id: u16,
+    /// Maximum image size the host staging window accepts.
+    pub staging_cap: u32,
+    /// Offset (relative to the staging window base) of the trailer record;
+    /// its aligned erase block must not overlap the image window.
+    pub trailer_offset: u32,
+    /// Anti-rollback floor described above. `0` accepts everything.
+    pub min_acceptable_version: u32,
+    /// Whole seconds without traffic before an unfinished session expires.
+    pub idle_timeout_secs: u32,
+    /// Absolute ceiling for ONE streaming session regardless of identical-
+    /// BEGIN refresh traffic (bounds a hostile peer's ability to pin the
+    /// receiver forever).
+    pub absolute_session_timeout_secs: u32,
+}
+
 /// Receive-side OTA transfer engine.
 ///
 /// The engine owns NO hardware handles: storage and secure element are
@@ -183,12 +217,7 @@ impl RxState {
 pub struct OtaReceiver {
     /// Factory root public key (33-byte compressed SEC1) verifying manifests.
     factory_pubkey: [u8; 33],
-    /// Maximum image size the host staging window accepts.
-    staging_cap: u32,
-    /// Offset (relative to the staging window base) of the trailer record.
-    trailer_offset: u32,
-    /// Whole-second idle timeout for unfinished sessions.
-    idle_timeout_secs: u32,
+    cfg: OtaReceiverConfig,
     /// Geometry `(img_version, img_len)` of the most recent session,
     /// retained after teardown so STATUS projections stay correlatable by
     /// the peer even once the receiver is Idle.
@@ -237,17 +266,10 @@ impl OtaReceiver {
     /// Storage integration errors (zero granularity, overflowing or
     /// overlapping trailer geometry) surface as
     /// [`OtaError::InvalidParams`] from BEGIN — never as panics.
-    pub fn new(
-        factory_pubkey: [u8; 33],
-        staging_cap: u32,
-        trailer_offset: u32,
-        idle_timeout_secs: u32,
-    ) -> Self {
+    pub fn new(factory_pubkey: [u8; 33], cfg: OtaReceiverConfig) -> Self {
         Self {
             factory_pubkey,
-            staging_cap,
-            trailer_offset,
-            idle_timeout_secs,
+            cfg,
             last_session: None,
             state: RxState::Idle,
         }
@@ -298,9 +320,9 @@ impl OtaReceiver {
         now: u32,
     ) -> Result<RxOutcome, OtaError> {
         match cmd {
-            OtaCommand::Begin(begin) => self.on_begin(storage, begin, now),
+            OtaCommand::Begin(begin) => self.on_begin(storage, se, begin, now),
             OtaCommand::Chunk(chunk) => self.on_chunk(storage, chunk.seq, chunk.data, now),
-            OtaCommand::Finalize => self.on_finalize(storage, se),
+            OtaCommand::Finalize => self.on_finalize(storage),
             OtaCommand::Reboot { delay_ms } => self.on_reboot(delay_ms),
             OtaCommand::Abort => self.on_abort(),
             // Replies (including our own STATUS frames echoed back by a
@@ -315,26 +337,37 @@ impl OtaReceiver {
     /// Drives the idle-timeout policy; call periodically (e.g. once per
     /// second from host housekeeping).
     pub fn tick(&mut self, now: u32) -> TickOutcome {
-        let expired = match &self.state {
+        let outcome = match &self.state {
             RxState::Streaming(s) => {
-                now.saturating_sub(s.last_activity_secs) >= self.idle_timeout_secs
+                if now.saturating_sub(s.opened_at_secs) >= self.cfg.absolute_session_timeout_secs {
+                    // Absolute ceiling: identical-BEGIN refresh traffic can
+                    // keep the IDLE timeout at bay but never extend a
+                    // session past this hard lifetime (anti-pinning).
+                    TickOutcome::ExpiredAbsoluteLifetime
+                } else if now.saturating_sub(s.last_activity_secs) >= self.cfg.idle_timeout_secs {
+                    TickOutcome::ExpiredIdleTimeout
+                } else {
+                    TickOutcome::Continue
+                }
             }
-            _ => false,
+            _ => TickOutcome::Continue,
         };
-        if expired {
+        if matches!(
+            outcome,
+            TickOutcome::ExpiredIdleTimeout | TickOutcome::ExpiredAbsoluteLifetime
+        ) {
             self.remember_last_session();
             self.state = RxState::Idle;
-            TickOutcome::ExpiredIdleTimeout
-        } else {
-            TickOutcome::Continue
         }
+        outcome
     }
 
     // -- BEGIN ----------------------------------------------------------
 
-    fn on_begin<S: OtaStorage>(
+    fn on_begin<S: OtaStorage, SE: SecureElement>(
         &mut self,
         storage: &mut S,
+        se: &mut SE,
         begin: BeginFrame,
         now: u32,
     ) -> Result<RxOutcome, OtaError> {
@@ -366,12 +399,11 @@ impl OtaReceiver {
                 // Trailer placement must keep its aligned erase block
                 // disjoint from the image window; otherwise finalization
                 // could erase verified staged bytes. Checked arithmetic.
-                let trailer_range = aligned_trailer_range(self.trailer_offset, granularity).ok_or(
-                    OtaError::InvalidParams {
+                let trailer_range = aligned_trailer_range(self.cfg.trailer_offset, granularity)
+                    .ok_or(OtaError::InvalidParams {
                         reason: "trailer geometry overflows the address space",
-                    },
-                )?;
-                if trailer_range.0 < self.staging_cap {
+                    })?;
+                if trailer_range.0 < self.cfg.staging_cap {
                     return Err(OtaError::InvalidParams {
                         reason: "trailer erase block overlaps the staging image window",
                     });
@@ -379,7 +411,7 @@ impl OtaReceiver {
 
                 // Capacity gate, wire-sequence overflow gate (chunk indices
                 // are u16), and bitmap bound.
-                if begin.img_len > self.staging_cap || begin.img_len == 0 {
+                if begin.img_len > self.cfg.staging_cap || begin.img_len == 0 {
                     return Ok(size_rejected_reply());
                 }
                 let total_chunks = chunk_count(begin.img_len, u32::from(begin.chunk_len));
@@ -390,6 +422,35 @@ impl OtaReceiver {
                 if blocks_needed > MAX_STAGING_BLOCKS {
                     return Ok(size_rejected_reply());
                 }
+                // Rollback protection: strictly older signed versions are
+                // refused before any flash access; equality is allowed so a
+                // re-flash of the running version remains a valid repair.
+                if begin.img_version < self.cfg.min_acceptable_version {
+                    return Ok(RxOutcome::Respond(Reply::Final(
+                        FinalResult::VersionRejected,
+                    )));
+                }
+
+                // Manifest AUTHENTICATION at BEGIN (before any erase/write):
+                // an invalid signature never opens a session, so hostile
+                // manifests cannot spend flash cycles or radio energy on
+                // staging that would be torn down later anyway. The image
+                // HASH is still verified at FINALIZE against the bytes that
+                // actually arrived.
+                let message = manifest_digest_input(
+                    self.cfg.product_id,
+                    begin.img_version,
+                    begin.img_len,
+                    begin.chunk_len,
+                    &begin.img_sha256,
+                );
+                if se
+                    .verify_ecdsa(&self.factory_pubkey, &message, &begin.manifest_sig)
+                    .is_err()
+                {
+                    return Ok(RxOutcome::Respond(Reply::Final(FinalResult::SigRejected)));
+                }
+
                 let accepted = begin.chunk_len;
                 self.state = RxState::Streaming(StreamingSession {
                     img_version: begin.img_version,
@@ -399,6 +460,7 @@ impl OtaReceiver {
                     next_seq: 0,
                     hasher: Sha256::new(),
                     last_activity_secs: now,
+                    opened_at_secs: now,
                     begin,
                     erased_blocks: BlockBitmap::new(),
                 });
@@ -491,11 +553,7 @@ impl OtaReceiver {
 
     // -- FINALIZE -------------------------------------------------------
 
-    fn on_finalize<S: OtaStorage, SE: SecureElement>(
-        &mut self,
-        storage: &mut S,
-        se: &mut SE,
-    ) -> Result<RxOutcome, OtaError> {
+    fn on_finalize<S: OtaStorage>(&mut self, storage: &mut S) -> Result<RxOutcome, OtaError> {
         // Lost final ACK: re-answer Ok WITHOUT rewriting the trailer.
         if matches!(self.state, RxState::PendingReboot { .. }) {
             return Ok(RxOutcome::Respond(Reply::Final(FinalResult::Ok)));
@@ -510,8 +568,11 @@ impl OtaReceiver {
             return Ok(RxOutcome::Respond(Reply::Final(FinalResult::BadState)));
         }
 
-        // 1. Integrity: incremental digest over exactly the staged bytes.
-        //    Cloned so verification never consumes the live hasher.
+        // Authenticity was proven at BEGIN: the verified manifest is frozen
+        // inside this session and identical-BEGIN substitution is rejected,
+        // so FINALIZE only has to prove that the staged bytes match THAT
+        // manifest's digest (integrity over exactly what arrived).
+        // Cloned so verification never consumes the live hasher.
         let (digest_ok, begin_copy) = {
             let s = match &self.state {
                 RxState::Streaming(s) => s,
@@ -521,36 +582,14 @@ impl OtaReceiver {
             (digest == s.begin.img_sha256, s.begin.clone())
         };
 
-        // 2. Authenticity: manifest signature via the host secure element.
-        //    Transport errors and bad signatures collapse into SigRejected:
-        //    both mean "do not mark bootable".
-        let sig_ok = digest_ok
-            && se
-                .verify_ecdsa(
-                    &self.factory_pubkey,
-                    &manifest_digest_input(
-                        begin_copy.img_version,
-                        begin_copy.img_len,
-                        begin_copy.chunk_len,
-                        &begin_copy.img_sha256,
-                    ),
-                    &begin_copy.manifest_sig,
-                )
-                .is_ok();
-
-        if !sig_ok {
+        if !digest_ok {
             // Untrusted staged content: tear the session down.
             self.remember_last_session();
             self.state = RxState::Idle;
-            let result = if digest_ok {
-                FinalResult::SigRejected
-            } else {
-                FinalResult::HashMismatch
-            };
-            return Ok(RxOutcome::Respond(Reply::Final(result)));
+            return Ok(RxOutcome::Respond(Reply::Final(FinalResult::HashMismatch)));
         }
 
-        // 3. Mark bootable. Storage faults keep the session retryable. The
+        // Mark bootable. Storage faults keep the session retryable. The
         // trailer is a single one-shot write into the aligned erase block
         // already validated disjoint from the image window at BEGIN (same
         // helper, so both sites can never drift).
@@ -568,13 +607,13 @@ impl OtaReceiver {
                     reason: "storage erase_granularity must be non-zero",
                 });
             }
-            let (start, span) = aligned_trailer_range(self.trailer_offset, granularity).ok_or(
+            let (start, span) = aligned_trailer_range(self.cfg.trailer_offset, granularity).ok_or(
                 OtaError::InvalidParams {
                     reason: "trailer geometry overflows the address space",
                 },
             )?;
             storage.erase_range(start, span)?;
-            storage.write(self.trailer_offset, &raw)?;
+            storage.write(self.cfg.trailer_offset, &raw)?;
         }
         self.state = RxState::PendingReboot {
             img_version: begin_copy.img_version,

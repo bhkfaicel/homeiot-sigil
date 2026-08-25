@@ -201,6 +201,7 @@ fn round_trip_all_final_results() {
         FinalResult::StorageError,
         FinalResult::BadState,
         FinalResult::SizeRejected,
+        FinalResult::VersionRejected,
     ];
     let mut out = [0u8; 3];
     for result in results {
@@ -356,9 +357,9 @@ fn rejects_body_corruption_on_fixed_frames() {
         wire::parse_command(&[0x7f, wire::CMD_ACK_CHUNK, 0x00]),
         Err(OtaError::Malformed { .. })
     ));
-    // ACK_FINAL unknown result code.
+    // ACK_FINAL unknown result code (0x06 = VersionRejected is VALID).
     assert!(matches!(
-        wire::parse_command(&[0x7f, wire::CMD_ACK_FINAL, 0x06]),
+        wire::parse_command(&[0x7f, wire::CMD_ACK_FINAL, 0x07]),
         Err(OtaError::Malformed { .. })
     ));
     // STATUS unknown state byte and truncation.
@@ -434,26 +435,77 @@ fn encode_rejects_invalid_parameters() {
 
 #[test]
 fn manifest_digest_layout_matches_documented_construction() {
-    // Independently assemble the documented input layout and compare against
-    // the helper output: this pins the domain tag, field order, and integer
-    // endianness of the signed digest contract.
-    let version: u32 = 0x0102_0304;
-    let len: u32 = 0x0506_0708;
+    // Independently assemble the documented v2 input layout and compare
+    // against the helper output: this pins the domain tag, the PRODUCT ID
+    // binding, field order, and integer endianness of the signed digest.
+    let product_id: u16 = 0x0102;
+    let version: u32 = 0x0304_0506;
+    let len: u32 = 0x0708_090A;
     let chunk_len: u8 = 192;
     let sha = [0x11u8; 32];
 
-    let mut expected_input = [0u8; 53];
-    expected_input[..12].copy_from_slice(b"sigil-ota-v1");
-    expected_input[12..16].copy_from_slice(&version.to_le_bytes());
-    expected_input[16..20].copy_from_slice(&len.to_le_bytes());
-    expected_input[20] = chunk_len;
-    expected_input[21..53].copy_from_slice(&sha);
+    let mut expected_input = [0u8; 55];
+    expected_input[..12].copy_from_slice(b"sigil-ota-v2");
+    expected_input[12..14].copy_from_slice(&product_id.to_le_bytes());
+    expected_input[14..18].copy_from_slice(&version.to_le_bytes());
+    expected_input[18..22].copy_from_slice(&len.to_le_bytes());
+    expected_input[22] = chunk_len;
+    expected_input[23..55].copy_from_slice(&sha);
 
     let expected: [u8; 32] = sha2::Sha256::digest(expected_input).into();
     assert_eq!(
-        wire::manifest_digest(version, len, chunk_len, &sha),
+        wire::manifest_digest(product_id, version, len, chunk_len, &sha),
         expected,
         "digest construction drifted from the documented contract"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Manifest-v2 frozen literals (independent-implementation conformance)
+// ---------------------------------------------------------------------------
+
+/// The manifest-v2 signed material is verified against an INDEPENDENT
+/// implementation (`p256` crate), not against sigil's own paths, and the
+/// helper output must reproduce the frozen input byte-for-byte. This is the
+/// anti-drift contract for future signers and bootloaders.
+#[test]
+fn manifest_v2_literal_vector_matches_helper_and_real_crypto() {
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+
+    let input = gv::unhex(gv::MANIFEST_V2_INPUT_HEX);
+    let sha = gv::unhex(gv::MANIFEST_V2_IMAGE_SHA_HEX);
+    let pubkey = gv::unhex(gv::MANIFEST_V2_PUBKEY_HEX);
+    let sig_bytes = gv::unhex(gv::MANIFEST_V2_SIGNATURE_HEX);
+
+    // 1. Helper reproduces the frozen input exactly.
+    let mut img_sha = [0u8; 32];
+    img_sha.copy_from_slice(&sha);
+    assert_eq!(
+        wire::manifest_digest_input(1, 11, 300, 64, &img_sha)[..],
+        input[..],
+        "manifest v2 input drifted from the frozen literal"
+    );
+
+    // 2. Frozen signature verifies over the frozen input with the frozen
+    //    key using the independent p256 implementation (SHA-256 then ECDSA).
+    let vk = VerifyingKey::from_sec1_bytes(&pubkey).expect("frozen pubkey is a valid point");
+    let signature = Signature::from_slice(&sig_bytes).expect("frozen signature parses");
+    assert!(
+        vk.verify(&input, &signature).is_ok(),
+        "frozen signature must verify over the frozen manifest input"
+    );
+}
+
+/// Literal ACK_FINAL frame for the anti-rollback verdict.
+#[test]
+fn ack_final_version_rejected_golden_frame() {
+    let mut out = [0u8; 3];
+    let n = wire::encode_ack_final(FinalResult::VersionRejected, &mut out).expect("fits");
+    assert_eq!(&out[..n], &[0x7F, wire::CMD_ACK_FINAL, 0x06]);
+    assert_eq!(
+        wire::parse_command(&out[..n]),
+        Ok(OtaCommand::AckFinal(FinalResult::VersionRejected))
     );
 }
 

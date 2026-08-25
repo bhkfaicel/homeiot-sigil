@@ -4,7 +4,7 @@
 //! trailer-marker trust-chain gating.
 
 use crate::core::ota::error::OtaError;
-use crate::core::ota::receiver::{OtaReceiver, Reply, RxOutcome, TickOutcome};
+use crate::core::ota::receiver::{OtaReceiver, OtaReceiverConfig, Reply, RxOutcome, TickOutcome};
 use crate::core::ota::storage::OtaStorage;
 use crate::core::ota::trailer::{TRAILER_LEN, TrailerRecord, TrailerStatus};
 use crate::core::ota::wire::{
@@ -115,6 +115,22 @@ fn factory_pub() -> StaticPublicKey {
     key
 }
 
+/// Product id shared by every fixture in this file (bound into signed
+/// manifests).
+const PRODUCT_ID: u16 = 0x0001;
+
+/// Builds the standard engine config for a given staging capacity.
+fn rig_config(staging_cap: u32) -> OtaReceiverConfig {
+    OtaReceiverConfig {
+        product_id: PRODUCT_ID,
+        staging_cap,
+        trailer_offset: staging_cap,
+        min_acceptable_version: 0,
+        idle_timeout_secs: 30,
+        absolute_session_timeout_secs: 3600,
+    }
+}
+
 /// Trailer region size: one aligned block is plenty for 46 bytes.
 const TRAILER_SPAN: u32 = 256;
 
@@ -129,7 +145,7 @@ impl Rig {
     /// Engine staging window `[0, staging_cap)` plus one trailer block.
     fn new(staging_cap: u32) -> Self {
         Self {
-            rx: OtaReceiver::new(factory_pub(), staging_cap, staging_cap, 30),
+            rx: OtaReceiver::new(factory_pub(), rig_config(staging_cap)),
             storage: FaultyStorage::new(staging_cap + TRAILER_SPAN),
             se: MockSecureElement::new(factory_pub()),
         }
@@ -148,7 +164,7 @@ impl Rig {
     /// pass the integrity gate.
     fn signed_begin(&mut self, version: u32, img_len: u32, chunk_len: u8) -> BeginFrame {
         let sha = transfer_image_sha(img_len, chunk_len);
-        let msg = manifest_digest_input(version, img_len, chunk_len, &sha);
+        let msg = manifest_digest_input(PRODUCT_ID, version, img_len, chunk_len, &sha);
         let sig = self.se.sign_ecdsa(&msg).expect("mock signing works");
         BeginFrame {
             img_version: version,
@@ -366,7 +382,17 @@ fn size_gates_reject_over_capacity_and_chunk_count_overflow() {
     let mut tiny_storage = FaultyStorage::with_granularity(TRAILER_SPAN, 16_384);
     let mut se = MockSecureElement::new(factory_pub());
     // Geometry: cap below the aligned trailer block at 4_210_560.
-    let mut rx = OtaReceiver::new(factory_pub(), 4_200_000, 4_210_688, 30);
+    let mut rx = OtaReceiver::new(
+        factory_pub(),
+        OtaReceiverConfig {
+            product_id: PRODUCT_ID,
+            staging_cap: 4_200_000,
+            trailer_offset: 4_210_688,
+            min_acceptable_version: 0,
+            idle_timeout_secs: 30,
+            absolute_session_timeout_secs: 3600,
+        },
+    );
     let huge = BeginFrame {
         img_version: 1,
         // 65 537 chunks: beyond the u16 wire sequence space.
@@ -392,7 +418,7 @@ fn size_gates_reject_over_capacity_and_chunk_count_overflow() {
 fn zero_granularity_is_an_integration_error_never_a_panic() {
     let mut zero_g = FaultyStorage::with_granularity(2048, 0);
     let mut se = MockSecureElement::new(factory_pub());
-    let mut rx = OtaReceiver::new(factory_pub(), 1024, 1024, 30);
+    let mut rx = OtaReceiver::new(factory_pub(), rig_config(1024));
     let begin = BeginFrame {
         img_version: 1,
         img_len: 128,
@@ -419,7 +445,17 @@ fn trailer_block_overlapping_the_image_window_is_rejected_at_begin() {
     // bytes. BEGIN must fail-closed before any flash access.
     let mut storage = FaultyStorage::new(4096);
     let mut se = MockSecureElement::new(factory_pub());
-    let mut rx = OtaReceiver::new(factory_pub(), 1000, 1000, 30);
+    let mut rx = OtaReceiver::new(
+        factory_pub(),
+        OtaReceiverConfig {
+            product_id: PRODUCT_ID,
+            staging_cap: 1000,
+            trailer_offset: 1000,
+            min_acceptable_version: 0,
+            idle_timeout_secs: 30,
+            absolute_session_timeout_secs: 3600,
+        },
+    );
     let begin = BeginFrame {
         img_version: 1,
         img_len: 512,
@@ -434,7 +470,7 @@ fn trailer_block_overlapping_the_image_window_is_rejected_at_begin() {
     assert_eq!(rx.state(), PeerState::Idle);
 
     // A coherent layout (aligned trailer block after the window) opens fine.
-    let mut ok_rx = OtaReceiver::new(factory_pub(), 1024, 1024, 30);
+    let mut ok_rx = OtaReceiver::new(factory_pub(), rig_config(1024));
     assert!(
         ok_rx
             .on_command(&mut storage, &mut se, OtaCommand::Begin(begin.clone()), 2)
@@ -452,7 +488,17 @@ fn trailer_range_end_overflow_is_rejected_at_begin() {
     let mut se = MockSecureElement::new(factory_pub());
     // staging_cap small; trailer offset aligned but its erase span crosses
     // the top of the 32-bit space (0xFFFF_F000 + one 4096 B row overflows).
-    let mut rx = OtaReceiver::new(factory_pub(), 256, 0xFFFF_F000, 30);
+    let mut rx = OtaReceiver::new(
+        factory_pub(),
+        OtaReceiverConfig {
+            product_id: PRODUCT_ID,
+            staging_cap: 256,
+            trailer_offset: 0xFFFF_F000,
+            min_acceptable_version: 0,
+            idle_timeout_secs: 30,
+            absolute_session_timeout_secs: 3600,
+        },
+    );
     let begin = BeginFrame {
         img_version: 1,
         img_len: 128,
@@ -646,27 +692,121 @@ fn hash_mismatch_tears_down_to_idle() {
 }
 
 #[test]
-fn signature_rejection_tears_down_to_idle() {
+fn begin_signature_failure_never_touches_storage() {
     let mut rig = Rig::new(1024);
-    let cl = rig.open_session(7, 128, CHUNK_LEN_MIN as u8) as usize;
-    for seq in 0..2 {
-        let d = chunk_payload(seq, if seq == 1 { 128 - cl } else { cl });
-        rig.send(
-            OtaCommand::Chunk(ChunkFrame {
-                seq: seq as u16,
-                data: &d,
-            }),
-            110 + seq as u32,
-        );
-    }
+    let begin = rig.signed_begin(7, 128, CHUNK_LEN_MIN as u8);
 
-    // Flip the SE into reject mode: transport-level failure collapses into
-    // SigRejected by contract.
+    // Flip the SE into reject mode BEFORE the transfer opens: transport-
+    // level failure collapses into SigRejected by contract, and the session
+    // must not open at all — zero erase/write operations on staging flash.
     rig.se.reject_signatures();
     assert_eq!(
-        rig.send(OtaCommand::Finalize, 150),
+        rig.send(OtaCommand::Begin(begin), 100),
         RxOutcome::Respond(Reply::Final(FinalResult::SigRejected))
     );
+    assert_eq!(rig.rx.state(), PeerState::Idle);
+    assert_eq!(rig.storage.erase_calls, 0, "no erase before authentication");
+    assert_eq!(rig.storage.write_calls, 0, "no write before authentication");
+
+    // A corrupted signature (bad tag for this message) is refused equally.
+    let mut forged = rig.signed_begin(8, 128, CHUNK_LEN_MIN as u8);
+    forged.manifest_sig[0] ^= 0xFF;
+    assert_eq!(
+        rig.send(OtaCommand::Begin(forged), 110),
+        RxOutcome::Respond(Reply::Final(FinalResult::SigRejected))
+    );
+    assert_eq!(rig.storage.erase_calls, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Anti-rollback policy (security hardening)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rollback_older_version_rejected_before_any_flash_access() {
+    let mut storage = FaultyStorage::new(2048);
+    let mut se = MockSecureElement::new(factory_pub());
+    let mut rx = OtaReceiver::new(
+        factory_pub(),
+        OtaReceiverConfig {
+            product_id: PRODUCT_ID,
+            staging_cap: 1024,
+            trailer_offset: 1024,
+            min_acceptable_version: 10,
+            idle_timeout_secs: 30,
+            absolute_session_timeout_secs: 3600,
+        },
+    );
+
+    let send_begin = |se: &mut MockSecureElement, version: u32| {
+        let sha = transfer_image_sha(version, 128);
+        let msg = manifest_digest_input(PRODUCT_ID, version, 128, CHUNK_LEN_MIN as u8, &sha);
+        let sig = se.sign_ecdsa(&msg).expect("mock signing");
+        BeginFrame {
+            img_version: version,
+            img_len: 128,
+            chunk_len: CHUNK_LEN_MIN as u8,
+            img_sha256: sha,
+            manifest_sig: sig,
+        }
+    };
+
+    // Strictly older signed image: VersionRejected, nothing stored.
+    let old = send_begin(&mut se, 9);
+    assert_eq!(
+        rx.on_command(&mut storage, &mut se, OtaCommand::Begin(old), 100)
+            .expect("no fault"),
+        RxOutcome::Respond(Reply::Final(FinalResult::VersionRejected))
+    );
+    assert_eq!(rx.state(), PeerState::Idle);
+    assert_eq!((storage.erase_calls, storage.write_calls), (0, 0));
+
+    // Equal version: allowed (re-flash repair of the running release).
+    let same = send_begin(&mut se, 10);
+    assert!(matches!(
+        rx.on_command(&mut storage, &mut se, OtaCommand::Begin(same), 101)
+            .expect("no fault"),
+        RxOutcome::Respond(Reply::Ready { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Absolute session lifetime (anti-pinning defense)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn absolute_lifetime_expires_even_with_fresh_identical_begins() {
+    let mut rig = Rig::new(1024);
+    // Tight ceiling for the scenario.
+    rig.rx = OtaReceiver::new(
+        factory_pub(),
+        OtaReceiverConfig {
+            product_id: PRODUCT_ID,
+            staging_cap: 1024,
+            trailer_offset: 1024,
+            min_acceptable_version: 0,
+            idle_timeout_secs: 30,
+            absolute_session_timeout_secs: 50,
+        },
+    );
+    let begin = rig.signed_begin(7, 192, CHUNK_LEN_MIN as u8);
+
+    // Open at t=100 and keep the IDLE timer fresh with identical re-BEGINs
+    // every 20 s (a hostile peer's pinning pattern).
+    assert!(matches!(
+        rig.send(OtaCommand::Begin(begin.clone()), 100),
+        RxOutcome::Respond(Reply::Ready { .. })
+    ));
+    for t in [120usize, 140] {
+        assert!(matches!(
+            rig.send(OtaCommand::Begin(begin.clone()), t as u32),
+            RxOutcome::Respond(Reply::Ready { .. })
+        ));
+    }
+
+    // At t=151 the session is only 21 s "fresh" but 51 s OLD: the absolute
+    // ceiling wins and tears it down.
+    assert_eq!(rig.rx.tick(151), TickOutcome::ExpiredAbsoluteLifetime);
     assert_eq!(rig.rx.state(), PeerState::Idle);
 }
 

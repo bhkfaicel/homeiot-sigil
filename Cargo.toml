@@ -63,4 +63,4 @@ heapless = { version = "0.8", optional = true }
 [dev-dependencies]
 # Reference backend used only by tests. Production gateways implement the
 # gateway P-256 methods of SecureElement using their chosen crypto provider.
-p256 = { version = "0.13", default-features = false, features = ["ecdh"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa"] }

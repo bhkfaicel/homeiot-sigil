@@ -5,6 +5,7 @@
 //! cross-repository conformance contract.
 
 mod golden_vectors;
+mod golden_vectors_material;
 mod receiver_tests;
 #[path = "sender_tests.rs"]
 mod sender_tests;

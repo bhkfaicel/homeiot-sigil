@@ -58,18 +58,39 @@
 //! may be short). `img_len` must be non-zero; the host-supplied staging
 //! capacity bound is enforced by the engines, not by this codec.
 //!
-//! # Image authenticity (trust chain)
+//! # Image authenticity and freshness (trust chain)
 //!
 //! `manifest_sig` is an ECDSA P-256 signature (64-byte `r‖s`) over
-//! [`manifest_digest`] with the factory root key. The receiver verifies it
-//! through the host-provided [`SecureElement::verify_ecdsa`](crate::core::traits::SecureElement::verify_ecdsa)
-//! BEFORE any bootable marker is sanctioned. Integrity (SHA-256) is tracked
-//! incrementally per accepted chunk. Re-verification at apply time is the
-//! host bootloader's responsibility and stays outside this crate.
+//! [`manifest_digest`] with the factory root key. Manifest v2 BINDS the
+//! product identifier into the signed material, so an image validly signed
+//! for another product sharing the same factory root fails here.
 //!
-//! Transfer security rides entirely on the enclosing AEAD session: only
-//! enrolled peers can inject OTA frames, replay protection comes from the
-//! session counters, so this module adds no additional nonce or cache state.
+//! Verification ordering (fail-closed, cheapest-reject-first):
+//! 1. BEGIN authenticates the manifest through the host secure element
+//!    ([`SecureElement::verify_ecdsa`](crate::core::traits::SecureElement::verify_ecdsa))
+//!    BEFORE any staging flash access — invalid signatures never open a
+//!    session and never spend erase/write cycles;
+//! 2. BEGIN refuses strictly older versions than the host-configured
+//!    rollback floor (`VersionRejected`; the host persists that floor in
+//!    rollback-resistant storage and raises it after every completed
+//!    update);
+//! 3. chunks stream under AEAD session protection with incremental SHA-256;
+//! 4. FINALIZE proves the staged bytes match the authenticated digest and
+//!    ONLY THEN writes the bootable marker.
+//!
+//!    Apply-time re-verification by a hash-checking bootloader remains the
+//!    host's last line of defense and lives outside this crate.
+//!
+//! # Host authorization requirements
+//!
+//! One [`crate::core::ota::OtaReceiver`] instance must be bound to exactly
+//! ONE authorized peer: route decrypted OTA Data into the engine only when
+//! the outer PeerId matches the enrolled gateway this receiver serves. The
+//! engine carries no peer identity itself; multi-gateway products must
+//! instantiate one receiver per authorized gateway and enforce that routing
+//! BEFORE invocation. Admission pacing (per-peer/global airtime budgets,
+//! flash-wear limits) also stays host policy: authentication alone cannot
+//! stop a malicious legitimate gateway from repeatedly offering transfers.
 
 #[cfg(feature = "ota")]
 pub mod error;

@@ -36,6 +36,18 @@ and this project adheres to semantic versioning.
   tests intended for verbatim duplication in firmware, gateway, and signing
   tooling. An interop suite drives both engines against each other through
   the real codec over a lossy in-memory link.
+- Security hardening of the OTA module (same release, pre-publication):
+  manifest v2 binds the PRODUCT ID into the signed digest (`sigil-ota-v2`
+  domain), so images signed for one product are rejected by another sharing
+  the factory root; BEGIN authenticates the manifest signature BEFORE any
+  staging flash access; a rollback-protection floor (`min_acceptable_version`)
+  rejects strictly older signed versions with the new wire verdict
+  `VERSION_REJECTED (6)` while equal versions remain valid repairs; an
+  absolute per-session lifetime ceiling bounds identical-BEGIN refresh
+  pinning; literal golden vectors for the signed manifest input, digest,
+  P-256 key and signature are cross-checked against the independent `p256`
+  implementation; host authorization requirements (one receiver per
+  authorized gateway, host-owned admission budgets) are documented.
 - Extend the locked feature-matrix gate with the `ota`, `sensor,ota`, and
   `gateway,ota` configurations, and the embedded cross-checks with
   `thumbv6m-none-eabi` builds of `sensor,ota` (constrained receive half)

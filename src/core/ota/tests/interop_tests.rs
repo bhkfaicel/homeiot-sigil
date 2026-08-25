@@ -6,7 +6,7 @@
 
 use crate::core::ota::error::OtaError;
 use crate::core::ota::image::OtaImageSource;
-use crate::core::ota::receiver::{OtaReceiver, Reply, RxOutcome};
+use crate::core::ota::receiver::{OtaReceiver, OtaReceiverConfig, Reply, RxOutcome};
 use crate::core::ota::sender::{OtaSender, SenderAction, TransferEnd, TxFrame};
 use crate::core::ota::storage::OtaStorage;
 use crate::core::ota::trailer::{TRAILER_LEN, TrailerRecord, TrailerStatus};
@@ -181,7 +181,9 @@ fn run_interop(drop_every_nth: Option<usize>) -> (Vec<u8>, TrailerRecord) {
         out.copy_from_slice(&d);
         out
     };
-    let msg = crate::core::ota::wire::manifest_digest_input(11, IMG_LEN as u32, cl, &sha);
+    const PRODUCT_ID: u16 = 0x0001;
+    let msg =
+        crate::core::ota::wire::manifest_digest_input(PRODUCT_ID, 11, IMG_LEN as u32, cl, &sha);
     let sig = se.sign_ecdsa(&msg).expect("mock signing");
     let begin = BeginFrame {
         img_version: 11,
@@ -192,7 +194,17 @@ fn run_interop(drop_every_nth: Option<usize>) -> (Vec<u8>, TrailerRecord) {
     };
 
     let mut tx = OtaSender::new(6, 2);
-    let mut rx = OtaReceiver::new(factory_pub(), STAGING_CAP, TRAILER_OFFSET, 30);
+    let mut rx = OtaReceiver::new(
+        factory_pub(),
+        OtaReceiverConfig {
+            product_id: PRODUCT_ID,
+            staging_cap: STAGING_CAP,
+            trailer_offset: TRAILER_OFFSET,
+            min_acceptable_version: 0,
+            idle_timeout_secs: 30,
+            absolute_session_timeout_secs: 3600,
+        },
+    );
     let mut storage = RamStorage::new(STAGING_CAP + 256);
     let mut uplink = Link::new(drop_every_nth); // tx -> rx
     let mut downlink = Link::new(None); // rx -> tx
