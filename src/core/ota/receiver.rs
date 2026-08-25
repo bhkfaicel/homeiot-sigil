@@ -214,6 +214,9 @@ fn aligned_trailer_range(trailer_offset: u32, granularity: u32) -> Option<(u32, 
     let start = trailer_offset - trailer_offset % granularity;
     let off_in_block = trailer_offset % granularity;
     let span = align_up_checked(off_in_block.checked_add(TRAILER_LEN as u32)?, granularity)?;
+    // The whole erased interval must fit the address space, not just each
+    // piece independently.
+    start.checked_add(span)?;
     Some((start, span))
 }
 

@@ -437,9 +437,33 @@ fn trailer_block_overlapping_the_image_window_is_rejected_at_begin() {
     let mut ok_rx = OtaReceiver::new(factory_pub(), 1024, 1024, 30);
     assert!(
         ok_rx
-            .on_command(&mut storage, &mut se, OtaCommand::Begin(begin), 2)
+            .on_command(&mut storage, &mut se, OtaCommand::Begin(begin.clone()), 2)
             .is_ok()
     );
+}
+
+#[test]
+fn trailer_range_end_overflow_is_rejected_at_begin() {
+    // Trailer block aligned at the very top of the address space: the
+    // ERASED INTERVAL end would exceed u32::MAX even though the start is a
+    // valid multiple of the granularity. BEGIN must reject with the normal
+    // integration error, never panic and never touch storage.
+    let mut tiny = FaultyStorage::with_granularity(256, 4096);
+    let mut se = MockSecureElement::new(factory_pub());
+    // staging_cap small; trailer offset aligned but its erase span crosses
+    // the top of the 32-bit space (0xFFFF_F000 + one 4096 B row overflows).
+    let mut rx = OtaReceiver::new(factory_pub(), 256, 0xFFFF_F000, 30);
+    let begin = BeginFrame {
+        img_version: 1,
+        img_len: 128,
+        chunk_len: CHUNK_LEN_MIN as u8,
+        img_sha256: [0u8; 32],
+        manifest_sig: [0u8; 64],
+    };
+    let err = rx
+        .on_command(&mut tiny, &mut se, OtaCommand::Begin(begin), 1)
+        .unwrap_err();
+    assert!(matches!(err, OtaError::InvalidParams { .. }));
 }
 
 // ---------------------------------------------------------------------------
