@@ -3,9 +3,12 @@
 //! This module defines the wire contract and the two pure protocol engines
 //! used to move a signed firmware image from an updating device (gateway
 //! side) to the device being updated (sensor side). Frames travel as
-//! ordinary authenticated AEAD [`Data`] payloads of an established sigil
-//! session; this module therefore performs NO cryptography of its own, owns
-//! no radio and no storage, and never blocks.
+//! ordinary authenticated AEAD `Data` payloads of an established sigil
+//! session. The module implements no session cryptography of its own: it
+//! computes SHA-256 digests (integrity) and delegates asymmetric
+//! verification to the host secure element through the crate-wide
+//! `SecureElement` trait; it owns no radio and no storage, and never
+//! blocks.
 //!
 //! # Feature tiers (`cfg` gating)
 //!
@@ -89,10 +92,17 @@ pub mod sender;
 
 #[cfg(feature = "ota")]
 pub use error::OtaError;
+// Root-level re-exports of the shared wire tier: hosts and the module docs
+// reference these types directly, and intra-doc links resolve through them.
 #[cfg(all(feature = "ota", feature = "sensor"))]
 pub use receiver::{OtaReceiver, Reply, RxOutcome, TickOutcome};
 #[cfg(all(feature = "ota", feature = "gateway"))]
 pub use sender::{OtaSender, SenderAction, TransferEnd, TxFrame};
+#[cfg(feature = "ota")]
+pub use wire::{
+    BeginFrame, ChunkFrame, FinalResult, OtaCommand, PeerState, StatusFrame, manifest_digest,
+    manifest_digest_input,
+};
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]

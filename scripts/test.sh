@@ -9,9 +9,12 @@ bash scripts/test-resolve-cargo-registry.sh
 bash scripts/test-release-branch-name.sh
 # Authoritative feature-matrix gate: asserts the approved diagnostic for the
 # unsupported empty feature set and runs the locked test suites for the wire,
-# sensor, gateway, sensor,gateway, and all-features configurations. The matrix
-# logic is owned exclusively by that script; never duplicate it here.
+# sensor, gateway, sensor,gateway, ota, sensor,ota, gateway,ota, and
+# all-features configurations. The matrix logic is owned exclusively by that
+# script; never duplicate it here.
 bash scripts/test-feature-matrix.sh
+# Strict documentation gate: broken intra-doc links fail the release docs.
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 # Embedded-target cross-checks (locked for reproducibility). The CI container
 # image may ship without these std targets; rustup target add is idempotent.
 rustup target add thumbv6m-none-eabi armv7-unknown-linux-gnueabihf

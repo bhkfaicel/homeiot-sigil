@@ -95,7 +95,11 @@ impl OtaStorage for FaultyStorage {
         self.mem[offset as usize..end as usize].copy_from_slice(data);
         Ok(())
     }
+}
 
+impl FaultyStorage {
+    /// Inherent readback (NOT part of the `OtaStorage` sink trait): used by
+    /// assertions only.
     fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError> {
         let end = offset.checked_add(buf.len() as u32).expect("read overflow");
         assert!(end <= self.mem.len() as u32, "read out of window");
@@ -339,9 +343,9 @@ fn different_begin_is_rejected_until_explicit_abort() {
 
 #[test]
 fn size_gates_reject_over_capacity_and_chunk_count_overflow() {
-    // Over staging capacity.
-    let mut rig = Rig::new(1000);
-    let over = rig.signed_begin(1, 1001, CHUNK_LEN_MIN as u8);
+    // Over staging capacity (Rig geometry keeps the trailer block disjoint).
+    let mut rig = Rig::new(1024);
+    let over = rig.signed_begin(1, 1025, CHUNK_LEN_MIN as u8);
     assert_eq!(
         rig.send(OtaCommand::Begin(over), 100),
         RxOutcome::Respond(Reply::Final(FinalResult::SizeRejected))
@@ -356,10 +360,13 @@ fn size_gates_reject_over_capacity_and_chunk_count_overflow() {
     );
 
     // Chunk-count overflow: seq is u16 on the wire, so 65 537 chunks cannot
-    // be addressed. No storage access happens during BEGIN.
-    let mut tiny_storage = FaultyStorage::new(TRAILER_SPAN);
+    // be addressed. Coarse granularity keeps the erase-block bound satisfied
+    // so THIS gate is the one that fires. No storage access happens during
+    // BEGIN beyond reading the declared granularity.
+    let mut tiny_storage = FaultyStorage::with_granularity(TRAILER_SPAN, 16_384);
     let mut se = MockSecureElement::new(factory_pub());
-    let mut rx = OtaReceiver::new(factory_pub(), u32::MAX, 0, 30);
+    // Geometry: cap below the aligned trailer block at 4_210_560.
+    let mut rx = OtaReceiver::new(factory_pub(), 4_200_000, 4_210_688, 30);
     let huge = BeginFrame {
         img_version: 1,
         // 65 537 chunks: beyond the u16 wire sequence space.
@@ -374,6 +381,64 @@ fn size_gates_reject_over_capacity_and_chunk_count_overflow() {
     assert_eq!(
         out,
         RxOutcome::Respond(Reply::Final(FinalResult::SizeRejected))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Storage-geometry integration gates (audit hardening)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zero_granularity_is_an_integration_error_never_a_panic() {
+    let mut zero_g = FaultyStorage::with_granularity(2048, 0);
+    let mut se = MockSecureElement::new(factory_pub());
+    let mut rx = OtaReceiver::new(factory_pub(), 1024, 1024, 30);
+    let begin = BeginFrame {
+        img_version: 1,
+        img_len: 128,
+        chunk_len: CHUNK_LEN_MIN as u8,
+        img_sha256: [0u8; 32],
+        manifest_sig: [0u8; 64],
+    };
+    let err = rx
+        .on_command(&mut zero_g, &mut se, OtaCommand::Begin(begin), 1)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        OtaError::InvalidParams {
+            reason: "storage erase_granularity must be non-zero"
+        }
+    );
+    assert_eq!(rx.state(), PeerState::Idle, "no session may open");
+}
+
+#[test]
+fn trailer_block_overlapping_the_image_window_is_rejected_at_begin() {
+    // staging_cap NOT aligned to the 256 B granularity: a trailer placed
+    // right after it shares the preceding erase block with verified image
+    // bytes. BEGIN must fail-closed before any flash access.
+    let mut storage = FaultyStorage::new(4096);
+    let mut se = MockSecureElement::new(factory_pub());
+    let mut rx = OtaReceiver::new(factory_pub(), 1000, 1000, 30);
+    let begin = BeginFrame {
+        img_version: 1,
+        img_len: 512,
+        chunk_len: CHUNK_LEN_MIN as u8,
+        img_sha256: [0u8; 32],
+        manifest_sig: [0u8; 64],
+    };
+    let err = rx
+        .on_command(&mut storage, &mut se, OtaCommand::Begin(begin.clone()), 1)
+        .unwrap_err();
+    assert!(matches!(err, OtaError::InvalidParams { .. }));
+    assert_eq!(rx.state(), PeerState::Idle);
+
+    // A coherent layout (aligned trailer block after the window) opens fine.
+    let mut ok_rx = OtaReceiver::new(factory_pub(), 1024, 1024, 30);
+    assert!(
+        ok_rx
+            .on_command(&mut storage, &mut se, OtaCommand::Begin(begin), 2)
+            .is_ok()
     );
 }
 
@@ -452,6 +517,49 @@ fn chunk_storage_fault_is_retryable_verbatim() {
         rig.send(OtaCommand::Chunk(ChunkFrame { seq: 0, data: &d0 }), 106),
         RxOutcome::Respond(Reply::ChunkAck { next_seq: 1 })
     );
+}
+
+#[test]
+fn erase_fault_retries_verbatim_and_never_reerases_committed_blocks() {
+    // Geometry: 96 B chunks over 128 B rows -> chunk 1 spans blocks 0..=1,
+    // sharing block 0 with chunk 0's tail. A failure erasing block 1 must
+    // leave block 0 committed (re-erasing it would destroy chunk 0 bytes)
+    // while block 1 itself is retried on the verbatim resend.
+    let mut rig = Rig::new(1024);
+    rig.storage = FaultyStorage::with_granularity(1024 + TRAILER_SPAN, 128);
+    let cl = rig.open_session(7, 192, 96) as usize;
+    assert_eq!(cl, 96);
+
+    let d0 = chunk_payload(0, 96);
+    rig.send(OtaCommand::Chunk(ChunkFrame { seq: 0, data: &d0 }), 110);
+    let d1 = chunk_payload(1, 96);
+
+    // First attempt at chunk 1: block 0 skipped (committed), block 1 erase
+    // fails -> Err(Storage), no progress.
+    rig.storage.fail_erase = true;
+    let err = rig
+        .rx
+        .on_command(
+            &mut rig.storage,
+            &mut rig.se,
+            OtaCommand::Chunk(ChunkFrame { seq: 1, data: &d1 }),
+            111,
+        )
+        .unwrap_err();
+    assert_eq!(err, OtaError::Storage);
+    assert_eq!(rig.rx.next_seq(), Some(1));
+    let erases_after_failure = rig.storage.erase_calls;
+
+    // Verbatim retry: block 1 erased AGAIN (it never committed), then the
+    // write lands. Block 0 must NOT be re-erased (count grows by exactly 1).
+    rig.storage.fail_erase = false;
+    assert_eq!(
+        rig.send(OtaCommand::Chunk(ChunkFrame { seq: 1, data: &d1 }), 112),
+        RxOutcome::Respond(Reply::ChunkAck { next_seq: 2 })
+    );
+    assert_eq!(rig.storage.erase_calls, erases_after_failure + 1);
+    // Chunk 0's staged bytes survived the whole episode untouched.
+    assert_eq!(rig.storage.slice(0, 96), d0.as_slice());
 }
 
 #[test]

@@ -388,6 +388,110 @@ fn restart_ok(img: &mut MemImage, tx: &mut OtaSender) {
 }
 
 // ---------------------------------------------------------------------------
+// Reply correlation to the ACTIVE transfer (audit hardening)
+// ---------------------------------------------------------------------------
+
+/// View of an image whose DECLARED length lies about the content, used to
+/// drive the source-length gate independently of read behaviour.
+struct LenLyingImage {
+    inner: MemImage,
+    declared: u32,
+}
+
+impl OtaImageSource for LenLyingImage {
+    fn len(&self) -> u32 {
+        self.declared
+    }
+
+    fn read_at(&self, offset: u32, out: &mut [u8]) -> Result<(), OtaError> {
+        self.inner.read_at(offset, out)
+    }
+}
+
+#[test]
+fn start_rejects_source_length_mismatch_before_any_hashing() {
+    let img = MemImage::new(128);
+
+    // Source declares MORE than the manifest: reject without opening.
+    let manifest = img.manifest_for(1, CHUNK_LEN_MIN as u8);
+    let mut lying_long = LenLyingImage {
+        inner: MemImage::new(128),
+        declared: 129,
+    };
+    let mut tx = OtaSender::new(2, 1);
+    assert!(matches!(
+        tx.start(&mut lying_long, manifest.clone(), 1),
+        Err(OtaError::InvalidParams { .. })
+    ));
+
+    // Source declares LESS than the manifest: same gate.
+    let mut lying_short = LenLyingImage {
+        inner: MemImage::new(128),
+        declared: 127,
+    };
+    assert!(matches!(
+        tx.start(&mut lying_short, manifest, 1),
+        Err(OtaError::InvalidParams { .. })
+    ));
+}
+
+#[test]
+fn ack_ready_with_wrong_chunk_len_echo_is_inert() {
+    let mut img = MemImage::new(128);
+    let cl = CHUNK_LEN_MIN as u8;
+    let mut tx = started(&mut img);
+
+    // Echo disagrees with the negotiated geometry: stale, keep waiting.
+    assert_eq!(
+        tx.on_reply(&mut img, OtaCommand::AckReady { chunk_len: 32 }, 101)
+            .expect("no fault"),
+        None
+    );
+    // The matching echo still advances afterwards.
+    let (frame, _) =
+        expect_transmit(tx.on_reply(&mut img, OtaCommand::AckReady { chunk_len: cl }, 102));
+    assert!(matches!(frame, TxFrame::Chunk { seq: 0, .. }));
+}
+
+#[test]
+fn status_describing_another_transfer_is_inert() {
+    let mut img = MemImage::new(512);
+    let cl = CHUNK_LEN_MIN;
+    let mut tx = started(&mut img);
+    expect_transmit(tx.on_reply(
+        &mut img,
+        OtaCommand::AckReady {
+            chunk_len: cl as u8,
+        },
+        101,
+    ));
+
+    // Same shape as a legit resume, but version/length describe a DIFFERENT
+    // transfer: must not realign this session.
+    let foreign = StatusFrame {
+        state: PeerState::Streaming,
+        next_seq: 4,
+        img_version: 999,
+        img_len: 999_999,
+    };
+    assert_eq!(
+        tx.on_reply(&mut img, OtaCommand::Status(foreign), 105)
+            .expect("no fault"),
+        None
+    );
+
+    // The matching identity still resumes.
+    let own = StatusFrame {
+        state: PeerState::Streaming,
+        next_seq: 2,
+        img_version: 9,
+        img_len: 512,
+    };
+    let (frame, _) = expect_transmit(tx.on_reply(&mut img, OtaCommand::Status(own), 106));
+    assert!(matches!(frame, TxFrame::Chunk { seq: 2, .. }));
+}
+
+// ---------------------------------------------------------------------------
 // STATUS-driven resume
 // ---------------------------------------------------------------------------
 
@@ -457,8 +561,10 @@ fn status_idle_restarts_the_session_from_begin() {
     let status = StatusFrame {
         state: PeerState::Idle,
         next_seq: 0,
-        img_version: 0,
-        img_len: 0,
+        // The receiver projects the DROPPED session's identity so the peer
+        // can correlate; the sender requires it to match.
+        img_version: 9,
+        img_len: 128,
     };
     let (frame, _) = expect_transmit(tx.on_reply(&mut img, OtaCommand::Status(status), 105));
     assert!(matches!(frame, TxFrame::Begin(_)));

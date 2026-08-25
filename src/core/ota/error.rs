@@ -19,7 +19,19 @@
 use core::fmt;
 
 /// Errors returned by the OTA wire codec and protocol engines.
+///
+/// # Evolution policy
+///
+/// Marked `#[non_exhaustive]` from day one: future minor releases may add
+/// variants without a breaking release, and downstream matches MUST carry a
+/// wildcard arm. The wire-level enums
+/// ([`FinalResult`](crate::core::ota::wire::FinalResult) /
+/// [`PeerState`](crate::core::ota::wire::PeerState)) are deliberately CLOSED
+/// v1 sets instead: parsers reject unknown bytes so both sides fail loudly
+/// on protocol drift; extending them is a protocol revision requiring a
+/// coordinated major version bump.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OtaError {
     /// A received payload violated the wire contract (wrong envelope opcode,
     /// unknown command id, wrong body length, field out of range).
@@ -52,14 +64,16 @@ pub enum OtaError {
     },
 
     /// The host storage sink failed while persisting staged image data or
-    /// metadata. Host policy: back off / report (the transfer cannot make
-    /// forward progress until storage recovers; surfaces as
-    /// [`FinalResult::StorageError`] on the wire).
+    /// metadata. Host policy: back off / report — the engine leaves the
+    /// session retryable, and the HOST decides whether to answer the peer
+    /// with [`FinalResult::StorageError`](crate::core::ota::wire::FinalResult::StorageError),
+    /// wait, or abort; the engine itself never fabricates that wire reply.
     Storage,
 
     /// A command arrived that is not valid for the engine's current state
     /// (e.g. a chunk before BEGIN). Host policy: reject input (optionally
-    /// answer with [`FinalResult::BadState`]).
+    /// answer with
+    /// [`FinalResult::BadState`](crate::core::ota::wire::FinalResult::BadState)).
     BadState {
         /// Static description of the rejected transition (never secret data).
         reason: &'static str,

@@ -43,9 +43,10 @@ pub trait OtaStorage {
 
     /// Writes `data` at `offset`. The covering range was erased beforehand
     /// by the engine for the current transfer session.
+    ///
+    /// Readback verification is deliberately NOT part of this sink: the
+    /// receiver hashes accepted bytes as they arrive, and apply-time
+    /// re-verification belongs to the host bootloader, which reads flash
+    /// through its own driver.
     fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), OtaError>;
-
-    /// Reads back `buf.len()` bytes at `offset` (verification hooks and
-    /// tests; not used on the hot chunk path).
-    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError>;
 }

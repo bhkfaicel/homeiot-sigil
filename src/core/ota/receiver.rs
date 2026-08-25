@@ -135,13 +135,19 @@ impl BlockBitmap {
         }
     }
 
-    /// Marks block `idx` erased; returns `true` when it was NOT marked
-    /// before (i.e. the caller must erase it now).
-    fn test_and_set(&mut self, idx: usize) -> bool {
+    /// Reads block `idx` WITHOUT mutating it: the caller erases first and
+    /// commits the bit with [`Self::set`] only after the erase succeeded,
+    /// so a failed erase leaves the block eligible on the verbatim retry.
+    fn is_set(&self, idx: usize) -> bool {
         debug_assert!(idx < MAX_STAGING_BLOCKS as usize);
-        let prev = self.words[idx / 64] & (1u64 << (idx % 64)) != 0;
+        self.words[idx / 64] & (1u64 << (idx % 64)) != 0
+    }
+
+    /// Commits block `idx` as erased. Call ONLY after the erase returned
+    /// success (see [`Self::is_set`]).
+    fn set(&mut self, idx: usize) {
+        debug_assert!(idx < MAX_STAGING_BLOCKS as usize);
         self.words[idx / 64] |= 1u64 << (idx % 64);
-        !prev
     }
 }
 
@@ -183,13 +189,32 @@ pub struct OtaReceiver {
     trailer_offset: u32,
     /// Whole-second idle timeout for unfinished sessions.
     idle_timeout_secs: u32,
+    /// Geometry `(img_version, img_len)` of the most recent session,
+    /// retained after teardown so STATUS projections stay correlatable by
+    /// the peer even once the receiver is Idle.
+    last_session: Option<(u32, u32)>,
     state: RxState,
 }
 
-/// Rounds `value` up to a multiple of `granularity` (> 0).
-fn align_up(value: u32, granularity: u32) -> u32 {
+/// Rounds `value` up to a multiple of `granularity` (> 0); `None` on
+/// overflow instead of wrapping (release-build panic resistance).
+fn align_up_checked(value: u32, granularity: u32) -> Option<u32> {
     debug_assert!(granularity > 0);
-    value.div_ceil(granularity) * granularity
+    Some(value.checked_add(granularity - 1)? / granularity * granularity)
+}
+
+/// Computes the aligned erase range covering the trailer record at
+/// `trailer_offset` for the given granularity: `(start, span)` with
+/// `start % granularity == 0`. `None` on address-space overflow.
+///
+/// Single source of truth shared by BEGIN validation and FINALIZE write so
+/// the two sites can never disagree about the erased bytes.
+fn aligned_trailer_range(trailer_offset: u32, granularity: u32) -> Option<(u32, u32)> {
+    debug_assert!(granularity > 0);
+    let start = trailer_offset - trailer_offset % granularity;
+    let off_in_block = trailer_offset % granularity;
+    let span = align_up_checked(off_in_block.checked_add(TRAILER_LEN as u32)?, granularity)?;
+    Some((start, span))
 }
 
 impl OtaReceiver {
@@ -197,10 +222,18 @@ impl OtaReceiver {
     ///
     /// * `factory_pubkey`: root key verifying manifest signatures.
     /// * `staging_cap`: maximum acceptable `img_len`.
-    /// * `trailer_offset`: write position of the [`TrailerRecord`]; must not
-    ///   overlap the image area (host layout responsibility).
+    /// * `trailer_offset`: write position of the [`TrailerRecord`]. Its
+    ///   aligned erase block must NOT overlap the image window: BEGIN
+    ///   enforces `align_lo(trailer_offset) >= staging_cap` against the
+    ///   storage granularity and rejects transfers otherwise (fail-closed,
+    ///   before any flash access). Place the trailer in a dedicated block
+    ///   at or after the end of the staging window.
     /// * `idle_timeout_secs`: whole seconds without traffic before `tick`
     ///   expires a streaming session.
+    ///
+    /// Storage integration errors (zero granularity, overflowing or
+    /// overlapping trailer geometry) surface as
+    /// [`OtaError::InvalidParams`] from BEGIN — never as panics.
     pub fn new(
         factory_pubkey: [u8; 33],
         staging_cap: u32,
@@ -212,6 +245,7 @@ impl OtaReceiver {
             staging_cap,
             trailer_offset,
             idle_timeout_secs,
+            last_session: None,
             state: RxState::Idle,
         }
     }
@@ -285,6 +319,7 @@ impl OtaReceiver {
             _ => false,
         };
         if expired {
+            self.remember_last_session();
             self.state = RxState::Idle;
             TickOutcome::ExpiredIdleTimeout
         } else {
@@ -315,8 +350,32 @@ impl OtaReceiver {
                 }
             }
             RxState::Idle => {
-                // Capacity gate first, then wire-sequence overflow gate
-                // (chunk indices are u16 on the wire).
+                // Integration geometry first: a zero granularity would
+                // divide by zero later, so it is an integration error
+                // rejected BEFORE any state changes (runtime check, not a
+                // debug-only assertion).
+                let granularity = storage.erase_granularity();
+                if granularity == 0 {
+                    return Err(OtaError::InvalidParams {
+                        reason: "storage erase_granularity must be non-zero",
+                    });
+                }
+                // Trailer placement must keep its aligned erase block
+                // disjoint from the image window; otherwise finalization
+                // could erase verified staged bytes. Checked arithmetic.
+                let trailer_range = aligned_trailer_range(self.trailer_offset, granularity).ok_or(
+                    OtaError::InvalidParams {
+                        reason: "trailer geometry overflows the address space",
+                    },
+                )?;
+                if trailer_range.0 < self.staging_cap {
+                    return Err(OtaError::InvalidParams {
+                        reason: "trailer erase block overlaps the staging image window",
+                    });
+                }
+
+                // Capacity gate, wire-sequence overflow gate (chunk indices
+                // are u16), and bitmap bound.
                 if begin.img_len > self.staging_cap || begin.img_len == 0 {
                     return Ok(size_rejected_reply());
                 }
@@ -324,11 +383,7 @@ impl OtaReceiver {
                 if total_chunks > u16::MAX as u32 {
                     return Ok(size_rejected_reply());
                 }
-                // Erase-block bookkeeping bound: the bitmap tracks at most
-                // MAX_STAGING_BLOCKS granularity blocks per session.
-                let granularity = storage.erase_granularity();
-                debug_assert!(granularity > 0);
-                let blocks_needed = chunk_count(begin.img_len, granularity.max(1));
+                let blocks_needed = chunk_count(begin.img_len, granularity);
                 if blocks_needed > MAX_STAGING_BLOCKS {
                     return Ok(size_rejected_reply());
                 }
@@ -384,30 +439,38 @@ impl OtaReceiver {
         };
         if data.len() != expected {
             // Geometry violation corrupts the staged layout: tear down.
+            self.remember_last_session();
             self.state = RxState::Idle;
             return Ok(size_rejected_reply());
         }
 
         // Persist BEFORE advancing any in-RAM progress so a storage fault
         // leaves the engine byte-identical for a verbatim retry. Each
-        // granularity block is erased exactly ONCE per session (bitmap
-        // bookkeeping): re-erasing before every write would destroy
-        // neighboring staged chunks in the same block.
+        // granularity block is erased at most once per session: the bitmap
+        // bit is COMMITTED only after that block's erase succeeded, so a
+        // failed erase is retried verbatim while successfully erased blocks
+        // are never re-erased (re-erasing would destroy neighboring staged
+        // chunks sharing the block).
         {
             let session = match &mut self.state {
                 RxState::Streaming(s) => s,
                 _ => unreachable!("state matched above"),
             };
             let granularity = storage.erase_granularity();
-            debug_assert!(granularity > 0);
+            if granularity == 0 {
+                return Err(OtaError::InvalidParams {
+                    reason: "storage erase_granularity must be non-zero",
+                });
+            }
             let offset = u32::from(seq) * u32::from(session.chunk_len);
             let first_block = (offset / granularity) as usize;
             let last_byte = offset + data.len() as u32 - 1;
             let last_block = (last_byte / granularity) as usize;
             for block in first_block..=last_block {
-                if session.erased_blocks.test_and_set(block) {
+                if !session.erased_blocks.is_set(block) {
                     let base = block as u32 * granularity;
                     storage.erase_range(base, granularity)?;
+                    session.erased_blocks.set(block);
                 }
             }
             storage.write(offset, data)?;
@@ -474,6 +537,7 @@ impl OtaReceiver {
 
         if !sig_ok {
             // Untrusted staged content: tear the session down.
+            self.remember_last_session();
             self.state = RxState::Idle;
             let result = if digest_ok {
                 FinalResult::SigRejected
@@ -484,8 +548,9 @@ impl OtaReceiver {
         }
 
         // 3. Mark bootable. Storage faults keep the session retryable. The
-        // trailer is a single one-shot write: unconditional aligned erase
-        // then write (it lives outside the chunk bitmap bookkeeping).
+        // trailer is a single one-shot write into the aligned erase block
+        // already validated disjoint from the image window at BEGIN (same
+        // helper, so both sites can never drift).
         let mut raw = [0u8; TRAILER_LEN];
         TrailerRecord::staged_valid(
             begin_copy.img_version,
@@ -495,12 +560,18 @@ impl OtaReceiver {
         .serialize(&mut raw)?;
         {
             let granularity = storage.erase_granularity();
-            debug_assert!(granularity > 0);
-            let t = self.trailer_offset;
-            let start = t - t % granularity;
-            let end = align_up(t + TRAILER_LEN as u32, granularity);
-            storage.erase_range(start, end - start)?;
-            storage.write(t, &raw)?;
+            if granularity == 0 {
+                return Err(OtaError::InvalidParams {
+                    reason: "storage erase_granularity must be non-zero",
+                });
+            }
+            let (start, span) = aligned_trailer_range(self.trailer_offset, granularity).ok_or(
+                OtaError::InvalidParams {
+                    reason: "trailer geometry overflows the address space",
+                },
+            )?;
+            storage.erase_range(start, span)?;
+            storage.write(self.trailer_offset, &raw)?;
         }
         self.state = RxState::PendingReboot {
             img_version: begin_copy.img_version,
@@ -520,18 +591,32 @@ impl OtaReceiver {
     }
 
     fn on_abort(&mut self) -> Result<RxOutcome, OtaError> {
+        self.remember_last_session();
         self.state = RxState::Idle;
         Ok(RxOutcome::Silent)
     }
 
+    /// Captures the open session's identity before tearing it down.
+    fn remember_last_session(&mut self) {
+        if let Some(geom) = self.session_geometry() {
+            self.last_session = Some(geom);
+        }
+    }
+
     fn status_reply(&self) -> Reply {
         let status = match &self.state {
-            RxState::Idle => StatusFrame {
-                state: PeerState::Idle,
-                next_seq: 0,
-                img_version: 0,
-                img_len: 0,
-            },
+            RxState::Idle => {
+                // Identity of the most recent session (zeros before any):
+                // lets the sender correlate this frame to its transfer even
+                // though the receiver already dropped it.
+                let (v, l) = self.last_session.unwrap_or((0, 0));
+                StatusFrame {
+                    state: PeerState::Idle,
+                    next_seq: 0,
+                    img_version: v,
+                    img_len: l,
+                }
+            }
             RxState::Streaming(s) => StatusFrame {
                 state: PeerState::Streaming,
                 next_seq: s.next_seq,

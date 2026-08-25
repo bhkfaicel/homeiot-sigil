@@ -66,7 +66,10 @@ impl OtaStorage for RamStorage {
         self.mem[offset as usize..end].copy_from_slice(data);
         Ok(())
     }
+}
 
+impl RamStorage {
+    /// Inherent readback for assertions (not part of the sink trait).
     fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), OtaError> {
         let end = offset as usize + buf.len();
         assert!(end <= self.mem.len());

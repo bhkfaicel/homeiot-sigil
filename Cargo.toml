@@ -46,7 +46,7 @@ gateway = ["session"]
 # receive engine requires `sensor,ota` and the send engine `gateway,ota`.
 # It is never implied by another feature, so plain `sensor` or `gateway`
 # builds carry zero OTA code.
-ota = ["dep:sha2", "dep:heapless"]
+ota = ["dep:sha2"]
 
 [dependencies]
 # Cryptographic primitives

@@ -201,6 +201,14 @@ impl OtaSender {
                 reason: "img_len must be non-zero",
             });
         }
+        // The source must declare exactly the manifest length: a shorter
+        // source would fault mid-transfer, a longer one would silently ship
+        // unverified trailing bytes.
+        if image.len() != begin.img_len {
+            return Err(OtaError::InvalidParams {
+                reason: "image source length differs from the signed manifest",
+            });
+        }
         let count = u64::from(begin.img_len).div_ceil(u64::try_from(chunk).unwrap_or(0));
         if count > u64::from(u16::MAX) {
             return Err(OtaError::InvalidParams {
@@ -264,10 +272,16 @@ impl OtaSender {
             _ => Snap::Other,
         };
 
-        // Act phase.
+        // Act phase. Reply correlation: ACK_READY and STATUS frames carry
+        // transfer-identity fields; any mismatch with the ACTIVE manifest is
+        // treated as stale/inert so a delayed reply from another OTA attempt
+        // can never steer this session.
         match reply {
-            // BEGIN acknowledged: start the chunk pipeline at chunk 0.
-            OtaCommand::AckReady { .. } if matches!(snap, Snap::AwaitingReady) => {
+            // BEGIN acknowledged (echo must match the negotiated chunk_len):
+            // start the chunk pipeline at chunk 0.
+            OtaCommand::AckReady { chunk_len }
+                if matches!(snap, Snap::AwaitingReady) && chunk_len == self.begin.chunk_len =>
+            {
                 self.enter_streaming(image, 0, now).map(Some)
             }
             // Cumulative ACK strictly beyond the in-flight chunk advances.
@@ -301,33 +315,40 @@ impl OtaSender {
                 self.state = TxState::Done(end);
                 Ok(Some(SenderAction::End(end)))
             }
-            // STATUS-driven resume: peer realigned ahead or restarted.
-            OtaCommand::Status(status) => match (&snap, status.state) {
-                (
-                    Snap::Streaming {
-                        inflight,
-                        total_chunks,
-                    },
-                    PeerState::Streaming,
-                ) => {
-                    let local_next = inflight.map_or(0, |i| i + 1);
-                    if status.next_seq > local_next && status.next_seq < *total_chunks {
-                        self.enter_streaming(image, status.next_seq, now).map(Some)
-                    } else if status.next_seq >= *total_chunks && *total_chunks > 0 {
-                        // Peer already holds every chunk: finalize now.
-                        self.state = TxState::AwaitingFinal(Attempts::first());
-                        Ok(Some(self.transmit_armed(now, |_| TxFrame::Finalize)))
-                    } else {
-                        Ok(None)
+            // STATUS-driven resume: peer realigned ahead or restarted. The
+            // status must describe the ACTIVE transfer (version AND length
+            // match); anything else is inert.
+            OtaCommand::Status(status)
+                if status.img_version == self.begin.img_version
+                    && status.img_len == self.begin.img_len =>
+            {
+                match (&snap, status.state) {
+                    (
+                        Snap::Streaming {
+                            inflight,
+                            total_chunks,
+                        },
+                        PeerState::Streaming,
+                    ) => {
+                        let local_next = inflight.map_or(0, |i| i + 1);
+                        if status.next_seq > local_next && status.next_seq < *total_chunks {
+                            self.enter_streaming(image, status.next_seq, now).map(Some)
+                        } else if status.next_seq >= *total_chunks && *total_chunks > 0 {
+                            // Peer already holds every chunk: finalize now.
+                            self.state = TxState::AwaitingFinal(Attempts::first());
+                            Ok(Some(self.transmit_armed(now, |_| TxFrame::Finalize)))
+                        } else {
+                            Ok(None)
+                        }
                     }
+                    (Snap::Streaming { .. }, PeerState::Idle) => {
+                        // Peer dropped the session: restart from BEGIN.
+                        self.state = TxState::AwaitingReady(Attempts::first());
+                        Ok(Some(self.transmit_armed(now, |s| TxFrame::Begin(&s.begin))))
+                    }
+                    _ => Ok(None),
                 }
-                (Snap::Streaming { .. }, PeerState::Idle) => {
-                    // Peer dropped the session: restart from BEGIN.
-                    self.state = TxState::AwaitingReady(Attempts::first());
-                    Ok(Some(self.transmit_armed(now, |s| TxFrame::Begin(&s.begin))))
-                }
-                _ => Ok(None),
-            },
+            }
             // Everything else is stale or inert on the send half.
             _ => Ok(None),
         }
