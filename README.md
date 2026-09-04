@@ -1,7 +1,7 @@
 # sigil
 
 > [!IMPORTANT]
-> **The canonical repository for this project lives on Forgejo**: <https://code.bhk-itsolutions.com/homeiot/lis2dh12>.
+> **The canonical repository for this project lives on Forgejo**: <https://code.bhk-itsolutions.com/homeiot/sigil>.
 > This GitHub repository is only a mirror and is **not** the primary git remote.
 
 `no_std` Rust library for secure cryptographic communication over LoRa networks on embedded IoT devices. It provides device identification, authentication, and encrypted messaging primitives for LoRa-based sensor/gateway communication.
