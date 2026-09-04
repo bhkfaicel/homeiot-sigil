@@ -1,19 +1,18 @@
 # Forgejo Actions (CI)
 
-Security-sensitive checks, tag creation and publication logic live in this
-repository. `_rust-crate-checks.yml` is the shared local gate, and
-`actions/checkout` is pinned to an immutable commit SHA. This prevents a
-mutable transitive workflow from receiving `RUNNER_TOKEN`.
+Workflows in this directory are **thin callers**. Tag / publish / checks logic lives in
+[`faicel/central_ci`](https://code.bhk-itsolutions.com/faicel/central_ci) (`create_tag_on_dev`,
+`create_tag_on_main`, `publish_on_tag`, `rust_crate_checks`, `validate_flow`).
+Only triggers and crate-specific inputs (`test_command`, `enable_deny`, …) stay here.
 
-Reusable workflows: Forgejo allows only `inputs` and `outputs` under
-`on.workflow_call` (not a callee `secrets` block like GitHub Actions).
-Callers must pass repository secrets with `jobs.<id>.secrets: inherit` (or an
-explicit map); the callee reads `${{ secrets.RUNNER_TOKEN }}` as usual.
-
-Only the branch-flow validator remains in
-[`faicel/central_ci`](https://code.bhk-itsolutions.com/faicel/central_ci); it is
-pinned to an immutable revision, receives no secret and invokes no third-party
-action.
+Sigil-specific note: every caller passes `test_command: bash scripts/test.sh`
+because the plain `cargo test` default is invalid for this crate — the empty
+feature set is rejected at compile time by design, and the authoritative gate is
+the locked feature matrix plus rustdoc and embedded-target cross-checks. That
+script also carries the feature clippy matrix (all features, sensor, gateway),
+which the shared gate does not cover (it lints with default features only).
+`cargo deny` runs inside the shared gate (`enable_deny`, default true); the
+local wrapper is `scripts/deny-check.sh`.
 
 ## Publish flow (happy path)
 
@@ -23,17 +22,19 @@ action.
 | `staging` | — (merge gate only) | — | — |
 | `main` | `vX.Y.Z` | `forgejo` (stable / `homeiot`) | release |
 
-`Cargo.toml` / `CHANGELOG.md` always hold the **stable** base version (e.g. `0.4.0`).
+`Cargo.toml` / `CHANGELOG.md` always hold the **stable** base version (e.g. `1.2.0`).
 The stable/unstable split is done by **registry**, not by rewriting the crate version.
 
 1. Bump `Cargo.toml` + `CHANGELOG` (required: each version publishes once per registry).
 2. Feature branch → checks via `check-on-feature-branch.yml`.
-3. Merge to `dev` → `create-tag-on-dev.yml` creates `vX.Y.Z-rc` (fails if the tag already exists).
+3. Merge to `dev` → `create-tag-on-dev.yml` creates `vX.Y.Z-rc` (skips if the tag already exists).
 4. Tag push → `publish-on-tag.yml` publishes to `forgejorc` (client staging can pin this version).
 5. Merge `dev` → `staging` → `main` (`staging` does not tag or publish).
 6. Push to `main` → `create-tag-on-main.yml` creates `vX.Y.Z` **and** ensures `release/X.Y` exists.
-7. Tag push → `publish-on-tag.yml` publishes to `forgejo` (client prod).  
-   Note: that workflow sets `enable_tag_check: false` because the tag already exists (it is the trigger); the tag check stays enabled on feature/`dev`/`main` pushes to prevent duplicate releases.
+7. Tag push → `publish-on-tag.yml` publishes to `forgejo` (client prod).
+   Note: the callee defaults `enable_tag_check` to `false` because the tag
+   already exists (it is the trigger); the tag check stays enabled on feature /
+   `dev` / `main` pushes to prevent duplicate releases.
 
 `validate-branch-flow.yml` enforces PR direction via shared `faicel/central_ci` → `validate_flow.yml`:
 `* → dev`, `dev → staging`, `staging → main`.
@@ -42,28 +43,24 @@ Keep `Cargo.toml` and the latest `CHANGELOG.md` heading in sync (see `scripts/ch
 
 Registries are defined in [`.cargo/config.toml`](../.cargo/config.toml).
 
-`cargo deny` is enabled in local checks and governed by the repository
-`deny.toml` policy.
-
 ## Maintenance branches (`release/X.Y`)
 
 ### Why
 
-`dev` keeps moving (features → next minor). A client or prod may stay on `0.4.0`.
-If a bug is found in `0.4.0` while `dev` already has `0.5.0` work, fixing only on `dev`
-would force the client to take unwanted features. A **`release/0.4`** line lets you
-ship `0.4.1` without `0.5.0`.
+`dev` keeps moving (features → next minor). A client or prod may stay on `1.2.0`.
+If a bug is found in `1.2.0` while `dev` already has `1.3.0` work, fixing only on `dev`
+would force the client to take unwanted features. A **`release/1.2`** line lets you
+ship `1.2.1` without `1.3.0`.
 
 ```text
-main / tag v0.4.0 ──► release/0.4 ──► 0.4.1, 0.4.2   (hotfixes only)
-                  └──► dev ─────────► 0.5.0-rc …     (features)
+main / tag v1.2.0 ──► release/1.2 ──► 1.2.1, 1.2.2   (hotfixes only)
+                  └──► dev ─────────► 1.3.0-rc …     (features)
 ```
 
 ### Automation on `main`
 
 When `create-tag-on-main.yml` publishes the first stable `vX.Y.Z` of a minor line, it
-creates `release/X.Y` at that commit (via `scripts/release-branch-name.sh`:
-`0.4.0` → `release/0.4`).
+creates `release/X.Y` at that commit (via the shared central_ci implementation).
 
 - If `release/X.Y` **already exists**, CI leaves it unchanged (no force-update).
 - Hotfix commits belong **on** `release/X.Y`, then cherry-pick/backport to `dev`/`main`
@@ -71,10 +68,10 @@ creates `release/X.Y` at that commit (via `scripts/release-branch-name.sh`:
 
 ### Hotfix checklist (manual for now)
 
-1. `git checkout -b hotfix/… release/0.4` (or branch from `release/0.4`).
-2. Fix the bug; bump patch in `Cargo.toml` + `CHANGELOG` (`0.4.0` → `0.4.1`).
-3. Merge into `release/0.4`.
-4. Tag/publish as needed (`v0.4.1-rc` → forgejorc and/or `v0.4.1` → forgejo).
+1. `git checkout -b hotfix/… release/1.2` (or branch from `release/1.2`).
+2. Fix the bug; bump patch in `Cargo.toml` + `CHANGELOG` (`1.2.0` → `1.2.1`).
+3. Merge into `release/1.2`.
+4. Tag/publish as needed (`v1.2.1-rc` → forgejorc and/or `v1.2.1` → forgejo).
    Hotfix publish from `release/*` is **not** automated yet.
 5. Cherry-pick the fix onto `dev` (and `main` if required).
 
@@ -85,7 +82,7 @@ creates `release/X.Y` at that commit (via `scripts/release-branch-name.sh`:
 | Push / merge to `staging` | No (`staging` is only a gate) |
 | Push to `dev` / tag `-rc` | No (unstable channel) |
 | First stable tag on `main` for that `X.Y` | **Yes** |
-| Later stable tags on same `X.Y` (e.g. `0.4.1` from main) | No (branch already exists; left alone) |
+| Later stable tags on same `X.Y` (e.g. `1.2.9` from main) | No (branch already exists; left alone) |
 
 ## Protecting this directory
 
@@ -102,3 +99,18 @@ write access to the branch (Forgejo Settings → Branches → Protection rules).
 Without that control, a contributor could alter a workflow to exfiltrate the
 token. Prefer this path protection over splitting many PATs when one-token
 rotation is simpler.
+
+## Accepted risk: reusable workflows track the mutable `@main` ref
+
+Date: 2026-09-03
+
+The five reusable workflows in this directory (`check-on-feature-branch.yml`,
+`create-tag-on-dev.yml`, `create-tag-on-main.yml`, `publish-on-tag.yml`,
+`validate-branch-flow.yml`) call `faicel/central_ci/.forgejo/workflows/*.yml@main`,
+a **mutable** ref. The push-triggered jobs pass `RUNNER_TOKEN` to whatever
+`@main` contains at run time, so central-repository code executes with that
+secret on every run.
+
+The repository owner has explicitly accepted this supply-chain risk for now.
+Revisit this decision to pin the `uses:` references to an immutable commit SHA
+of `faicel/central_ci` when practical.

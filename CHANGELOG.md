@@ -7,6 +7,17 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+- Update README.md
+- Migrate the Forgejo CI workflows to thin callers delegating to the shared
+  `faicel/central_ci` reusable workflows (checks, tag creation on `dev`/`main`,
+  publish on tag, branch-flow validation) and delete the local
+  `.forgejo/workflows/_rust-crate-checks.yml` gate. All callers pass
+  `test_command: bash scripts/test.sh`; the feature clippy matrix (all
+  features, sensor, gateway) moves into that script so CI lint coverage is
+  unchanged. Add `scripts/deny-check.sh` as the local dependency-policy
+  wrapper. `.forgejo/README.md` documents the thin-caller model and the
+  owner-accepted risk of tracking the mutable `central_ci@main` ref.
+
 ## [1.2.0] - 2026-08-25
 
 - Add the OTA firmware-update protocol module (`core::ota`) behind the new
@@ -32,10 +43,10 @@ and this project adheres to semantic versioning.
     preflight, deadline-driven bounded resends (`1 + max_retries`
     transmissions per frame), cumulative-ACK progress, STATUS-driven resume,
     and REBOOT unlocking only after verified completion.
-  Wire contract and trailer layout are frozen by hand-written golden-vector
-  tests intended for verbatim duplication in firmware, gateway, and signing
-  tooling. An interop suite drives both engines against each other through
-  the real codec over a lossy in-memory link.
+    Wire contract and trailer layout are frozen by hand-written golden-vector
+    tests intended for verbatim duplication in firmware, gateway, and signing
+    tooling. An interop suite drives both engines against each other through
+    the real codec over a lossy in-memory link.
 - Security hardening of the OTA module (same release, pre-publication):
   manifest v2 binds the PRODUCT ID into the signed digest (`sigil-ota-v2`
   domain), so images signed for one product are rejected by another sharing

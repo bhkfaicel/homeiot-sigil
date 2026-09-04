@@ -13,6 +13,13 @@ bash scripts/test-release-branch-name.sh
 # all-features configurations. The matrix logic is owned exclusively by that
 # script; never duplicate it here.
 bash scripts/test-feature-matrix.sh
+# Feature clippy matrix: the shared CI gate (faicel/central_ci) lints with the
+# default features (sensor) only and without --locked/--all-targets, so the
+# strict lint coverage for the supported feature configurations is enforced
+# here, on the crate side, through the test_command input.
+cargo clippy --locked --all-features --all-targets -- -D warnings
+cargo clippy --locked --no-default-features --features sensor -- -D warnings
+cargo clippy --locked --no-default-features --features gateway -- -D warnings
 # Strict documentation gate: broken intra-doc links fail the release docs.
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 # Embedded-target cross-checks (locked for reproducibility). The CI container

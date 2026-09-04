@@ -1,22 +1,26 @@
-# On push to any branch EXCEPT dev, staging, and main: run shared Rust checks.
-# No tag, no publish. Used for feature branches.
+# On push to any branch EXCEPT dev, staging, and main: run shared Rust checks
+# (format, clippy, cargo machete, cargo deny, version sync, tests). No tag, no
+# publish. Used for feature branches.
 #
 # Requires: RUNNER_TOKEN secret (PAT with read repo).
-# Checks are local so workflow code and third-party actions stay immutable.
+# Shared checks: faicel/central_ci rust_crate_checks.yml
+# test_command: the crate's authoritative gate (locked feature matrix, rustdoc,
+# embedded-target cross-checks). The plain `cargo test` default is invalid here:
+# the empty feature set is rejected at compile time by design.
 
 name: Run checks on feature branches
 
 on:
   push:
-    branches:
-      - "*"
-      - "!dev"
-      - "!staging"
-      - "!main"
+    branches-ignore:
+      - dev
+      - staging
+      - main
 
 jobs:
   checks:
-    uses: ./.forgejo/workflows/_rust-crate-checks.yml
+    uses: faicel/central_ci/.forgejo/workflows/rust_crate_checks.yml@main
     with:
       test_command: bash scripts/test.sh
-    secrets: inherit
+    secrets:
+      RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
