@@ -22,5 +22,6 @@ jobs:
     uses: faicel/central_ci/.forgejo/workflows/rust_crate_checks.yml@main
     with:
       test_command: bash scripts/test.sh
+      enable_deny: true
     secrets:
       RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}

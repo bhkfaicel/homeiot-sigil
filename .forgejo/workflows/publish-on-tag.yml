@@ -20,5 +20,6 @@ jobs:
     uses: faicel/central_ci/.forgejo/workflows/publish_on_tag.yml@main
     with:
       test_command: bash scripts/test.sh
+      enable_deny: true
     secrets:
       RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}

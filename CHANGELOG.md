@@ -7,6 +7,8 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-05
+
 - Update README.md
 - Migrate the Forgejo CI workflows to thin callers delegating to the shared
   `faicel/central_ci` reusable workflows (checks, tag creation on `dev`/`main`,

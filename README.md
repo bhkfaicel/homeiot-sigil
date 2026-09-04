@@ -1,5 +1,9 @@
 # sigil
 
+> [!IMPORTANT]
+> **The canonical repository for this project lives on Forgejo**: <https://code.bhk-itsolutions.com/homeiot/lis2dh12>.
+> This GitHub repository is only a mirror and is **not** the primary git remote.
+
 `no_std` Rust library for secure cryptographic communication over LoRa networks on embedded IoT devices. It provides device identification, authentication, and encrypted messaging primitives for LoRa-based sensor/gateway communication.
 
 ---
@@ -242,8 +246,7 @@ retry `retransmit_pending_cached`, observe `pending_len` /
 retry budget is exhausted. That explicit terminal operation preserves the
 current session/enrollment while zeroizing and freeing the recovery slot.
 
-### Sensor install vs door / vibration 
-
+### Sensor install vs door / vibration
 
 Install chains multiple secure-element ops in one call. Product priority:
 **door-open / vibration IRQs > install**. Keep those IRQs enabled during SE I/O;
