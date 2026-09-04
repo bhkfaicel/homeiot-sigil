@@ -62,6 +62,12 @@ pub(crate) mod secret;
 #[cfg(feature = "wire")]
 pub mod factory_cert;
 
+// OTA firmware-update protocol (additive, self-contained). The shared wire
+// tier compiles under `ota` alone; the receive engine additionally requires
+// `sensor` and the send engine `gateway` (gated inside the module).
+#[cfg(feature = "ota")]
+pub mod ota;
+
 // The session protocol implementation (and its deps) is behind `session`.
 #[cfg(feature = "session")]
 pub mod error;

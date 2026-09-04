@@ -20,16 +20,17 @@
 #![no_std]
 
 // Feature-configuration contract (asserted by scripts/test-feature-matrix.sh):
-// - Supported: `wire` (manufacturing contract), `sensor`, `gateway`, and the
-//   explicit two-role composition `sensor,gateway`; `--all-features` is the
+// - Supported: `wire` (manufacturing contract), `sensor`, `gateway`, the
+//   explicit two-role composition `sensor,gateway`, and `ota` (OTA protocol
+//   tiers, optionally crossed with the roles); `--all-features` is the
 //   future-facing superset gate.
 // - Unsupported: the empty feature set. It is rejected here at compile time
 //   with a deliberate diagnostic so integrators always select a documented
 //   configuration.
-#[cfg(not(any(feature = "wire", feature = "session")))]
+#[cfg(not(any(feature = "wire", feature = "session", feature = "ota")))]
 compile_error!(
-    "sigil: no supported feature configuration selected; enable `wire` (manufacturing contract) \
-     or one of the session roles `sensor` / `gateway`"
+    "sigil: no supported feature configuration selected; enable `wire` (manufacturing contract), \
+     one of the session roles `sensor` / `gateway`, or the OTA protocol tiers via `ota`"
 );
 
 // Core non-blocking session module (always available)

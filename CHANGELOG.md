@@ -7,6 +7,68 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-05
+
+- Update README.md
+- Migrate the Forgejo CI workflows to thin callers delegating to the shared
+  `faicel/central_ci` reusable workflows (checks, tag creation on `dev`/`main`,
+  publish on tag, branch-flow validation) and delete the local
+  `.forgejo/workflows/_rust-crate-checks.yml` gate. All callers pass
+  `test_command: bash scripts/test.sh`; the feature clippy matrix (all
+  features, sensor, gateway) moves into that script so CI lint coverage is
+  unchanged. Add `scripts/deny-check.sh` as the local dependency-policy
+  wrapper. `.forgejo/README.md` documents the thin-caller model and the
+  owner-accepted risk of tracking the mutable `central_ci@main` ref.
+
+## [1.2.0] - 2026-08-25
+
+- Add the OTA firmware-update protocol module (`core::ota`) behind the new
+  `ota` cargo feature (off by default; never implied by another feature).
+  The module is fully additive: no `SigilEvent`, `SigilError`, or
+  `FrameType` changes, and plain `sensor` / `gateway` builds carry zero OTA
+  code. Feature tiers:
+  - `ota` alone compiles the shared wire tier only — command constants under
+    the product gateway-command envelope (`0x7F`, ids `0x10..0x18`), a
+    bounds-checked frame codec that never panics on malformed input,
+    `manifest_digest_input` / `manifest_digest` as the single source of
+    truth for signed-manifest digests, and the local `OtaError` taxonomy.
+  - `sensor,ota` adds the receive half: the host-implemented `OtaStorage`
+    sink trait, the 46-byte `TrailerRecord` bootable marker (magic `"SOTA"`,
+    little-endian fields, strict status byte), and the `OtaReceiver` engine
+    with strictly contiguous chunk acceptance, incremental SHA-256
+    integrity, erase-once block bookkeeping bounded by `MAX_STAGING_BLOCKS`,
+    finalize gated on ECDSA verification through the existing
+    `SecureElement::verify_ecdsa` trait, STATUS projection, ABORT, and an
+    idle-timeout policy.
+  - `gateway,ota` adds the send half: the host-implemented `OtaImageSource`
+    trait and the `OtaSender` stop-and-wait engine with a full-image digest
+    preflight, deadline-driven bounded resends (`1 + max_retries`
+    transmissions per frame), cumulative-ACK progress, STATUS-driven resume,
+    and REBOOT unlocking only after verified completion.
+    Wire contract and trailer layout are frozen by hand-written golden-vector
+    tests intended for verbatim duplication in firmware, gateway, and signing
+    tooling. An interop suite drives both engines against each other through
+    the real codec over a lossy in-memory link.
+- Security hardening of the OTA module (same release, pre-publication):
+  manifest v2 binds the PRODUCT ID into the signed digest (`sigil-ota-v2`
+  domain), so images signed for one product are rejected by another sharing
+  the factory root; BEGIN authenticates the manifest signature BEFORE any
+  staging flash access; a rollback-protection floor (`min_acceptable_version`)
+  rejects strictly older signed versions with the new wire verdict
+  `VERSION_REJECTED (6)` while equal versions remain valid repairs; an
+  absolute per-session lifetime ceiling bounds identical-BEGIN refresh
+  pinning; literal golden vectors for the signed manifest input, digest,
+  P-256 key and signature are cross-checked against the independent `p256`
+  implementation; host authorization requirements (one receiver per
+  authorized gateway, host-owned admission budgets) are documented.
+- Extend the locked feature-matrix gate with the `ota`, `sensor,ota`, and
+  `gateway,ota` configurations, and the embedded cross-checks with
+  `thumbv6m-none-eabi` builds of `sensor,ota` (constrained receive half)
+  and `armv7-unknown-linux-gnueabihf` builds of `gateway,ota`.
+- Accept the `ota`-only configuration in the empty-set compile-time
+  diagnostic so signing tooling can depend on the shared wire tier without
+  any session role.
+
 ## [1.1.0] - 2026-08-23
 
 - CI embedded cross-checks: install `thumbv6m-none-eabi` and

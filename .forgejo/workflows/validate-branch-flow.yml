@@ -12,4 +12,4 @@ on:
 
 jobs:
   validate:
-    uses: faicel/central_ci/.forgejo/workflows/validate_flow.yml@0876ab0866576604378391ed3ec6d0cc5820559a
+    uses: faicel/central_ci/.forgejo/workflows/validate_flow.yml@main

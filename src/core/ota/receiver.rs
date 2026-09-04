@@ -1,0 +1,710 @@
+//! Receive-side OTA transfer engine (sensor half).
+//!
+//! Pure protocol policy over injected effects ([`OtaStorage`] sink plus the
+//! crate-wide [`SecureElement`] trait): no hardware, radio, clock, or
+//! crypto-vendor types. The host feeds DECODED commands ([`OtaCommand`],
+//! produced by [`parse_command`](crate::core::ota::wire::parse_command) on
+//! decrypted Data payloads) and transmits whatever reply the returned
+//! [`RxOutcome`] carries.
+//!
+//! # Session semantics (v1 contract)
+//!
+//! - Strictly contiguous chunks: any sequence number other than `next_seq`
+//!   is answered with the CURRENT cumulative acknowledgement, which both
+//!   rejects the frame and re-teaches the sender's position (lost-ACK
+//!   recovery needs no extra message type).
+//! - An identical re-transmitted BEGIN mid-stream is idempotent (progress
+//!   kept); a DIFFERENT one is rejected (`BadState`) until an explicit
+//!   ABORT clears the session.
+//! - FINALIZE before every chunk arrived answers `BadState` and KEEPS the
+//!   session (recoverable). A hash or signature failure tears the session
+//!   down (staged data cannot be trusted; restart required). A storage
+//!   failure surfaces as [`OtaError::Storage`] and leaves the session
+//!   retryable verbatim.
+//! - Re-FINALIZE after success (lost final ACK) re-answers `Ok`
+//!   idempotently without touching storage again.
+//! - An idle timeout (`tick`) expires an unfinished session; a verified
+//!   pending-reboot session never times out here (reboot is host policy).
+//!
+//! # Storage sequencing
+//!
+//! Chunks are persisted BEFORE any in-RAM progress advances, so storage
+//! faults leave the engine byte-identical and the triggering command can be
+//! retried verbatim. Each granularity block is erased exactly once per
+//! session (erase-once bitmap, bounded by [`MAX_STAGING_BLOCKS`]); the
+//! trailer marker is written as a single unconditional aligned erase+write
+//! outside that bookkeeping.
+//!
+//! # Trust chain position
+//!
+//! The bootable marker ([`TrailerRecord`] with `StagedValid`) is written
+//! ONLY after the incremental SHA-256 matched OTA_BEGIN and the manifest
+//! signature verified through the host secure element.
+
+use crate::core::ota::error::OtaError;
+use crate::core::ota::storage::OtaStorage;
+use crate::core::ota::trailer::{TRAILER_LEN, TrailerRecord};
+use crate::core::ota::wire::{
+    BeginFrame, FinalResult, OtaCommand, PeerState, StatusFrame, manifest_digest_input,
+};
+use crate::core::traits::SecureElement;
+use sha2::{Digest, Sha256};
+
+/// Default idle timeout applied when a streaming session receives nothing.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 30;
+
+/// Reply frames the engine asks the host to transmit (encode with the
+/// matching `wire::encode_*` function).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    /// OTA_ACK_READY: transfer parameters accepted.
+    Ready {
+        /// Echo of the negotiated chunk length.
+        chunk_len: u8,
+    },
+    /// OTA_ACK_CHUNK: cumulative contiguous acknowledgement.
+    ChunkAck {
+        /// Next expected chunk sequence number.
+        next_seq: u16,
+    },
+    /// OTA_ACK_FINAL: finalize verdict.
+    Final(FinalResult),
+    /// OTA_STATUS: current state projection.
+    Status(StatusFrame),
+}
+
+/// What the host should do after one processed command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxOutcome {
+    /// Transmit this reply frame.
+    Respond(Reply),
+    /// Nothing to transmit (ABORT is fire-and-forget by contract).
+    Silent,
+    /// Schedule the deferred system reset (REBOOT command accepted).
+    RebootAfterMs(u16),
+}
+
+/// Outcome of one [`OtaReceiver::tick`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// No change.
+    Continue,
+    /// The streaming session was torn down after the idle timeout.
+    ExpiredIdleTimeout,
+    /// The session hit its ABSOLUTE lifetime ceiling even though traffic
+    /// kept refreshing the idle timer (anti-pinning defense).
+    ExpiredAbsoluteLifetime,
+}
+
+/// Active streaming session (private; projected through accessors).
+struct StreamingSession {
+    img_version: u32,
+    img_len: u32,
+    chunk_len: u8,
+    /// Total number of chunks for the negotiated geometry (> 0, <= u16::MAX).
+    total_chunks: u16,
+    /// Next contiguous chunk index expected.
+    next_seq: u16,
+    /// Incremental digest over accepted chunk bytes.
+    hasher: Sha256,
+    /// BEGIN copy driving identical-reBEGIN detection and verification.
+    begin: BeginFrame,
+    /// Last activity stamp (whole seconds) feeding the idle timeout.
+    last_activity_secs: u32,
+    /// Session opening stamp feeding the ABSOLUTE lifetime ceiling.
+    opened_at_secs: u32,
+    /// Erase-once bookkeeping: bit `b` set means granularity block `b` was
+    /// already erased in THIS session, so later writes into it must not
+    /// erase again (they would destroy neighboring staged chunks).
+    erased_blocks: BlockBitmap,
+}
+
+/// Fixed-capacity bitmap over staging erase blocks.
+///
+/// Capacity bound: 512 blocks. With the product SAMD21 row size (256 B) this
+/// covers a 128 KiB window; hosts whose granularity would need more blocks
+/// get `SizeRejected` at BEGIN rather than silent truncation.
+const BLOCK_BITMAP_WORDS: usize = 8;
+/// Maximum number of distinct erase blocks a transfer may track.
+pub const MAX_STAGING_BLOCKS: u32 = (BLOCK_BITMAP_WORDS * 64) as u32;
+
+#[derive(Clone, Copy)]
+struct BlockBitmap {
+    words: [u64; BLOCK_BITMAP_WORDS],
+}
+
+impl BlockBitmap {
+    fn new() -> Self {
+        Self {
+            words: [0u64; BLOCK_BITMAP_WORDS],
+        }
+    }
+
+    /// Reads block `idx` WITHOUT mutating it: the caller erases first and
+    /// commits the bit with [`Self::set`] only after the erase succeeded,
+    /// so a failed erase leaves the block eligible on the verbatim retry.
+    fn is_set(&self, idx: usize) -> bool {
+        debug_assert!(idx < MAX_STAGING_BLOCKS as usize);
+        self.words[idx / 64] & (1u64 << (idx % 64)) != 0
+    }
+
+    /// Commits block `idx` as erased. Call ONLY after the erase returned
+    /// success (see [`Self::is_set`]).
+    fn set(&mut self, idx: usize) {
+        debug_assert!(idx < MAX_STAGING_BLOCKS as usize);
+        self.words[idx / 64] |= 1u64 << (idx % 64);
+    }
+}
+
+// Deliberately uneven variants: fixed-capacity by design (no_std, no
+// heap). The engine embeds exactly one `RxState`, so total size equals the
+// streaming arm; bounds tests pin it.
+#[allow(clippy::large_enum_variant)]
+enum RxState {
+    Idle,
+    Streaming(StreamingSession),
+    /// Verified image awaiting the reboot decision (host policy).
+    PendingReboot {
+        img_version: u32,
+        img_len: u32,
+        total_chunks: u16,
+    },
+}
+
+impl RxState {
+    fn coarse(&self) -> PeerState {
+        match self {
+            RxState::Idle => PeerState::Idle,
+            RxState::Streaming(_) => PeerState::Streaming,
+            RxState::PendingReboot { .. } => PeerState::PendingReboot,
+        }
+    }
+}
+
+/// Construction-time policy and geometry for an OTA receive engine.
+///
+/// `min_acceptable_version` is the ROLLBACK-PROTECTION floor: BEGIN frames
+/// whose signed version is strictly older are refused with
+/// [`FinalResult::VersionRejected`] before any flash access. The host owns
+/// the durable counter: keep it in rollback-resistant storage and raise it
+/// to the accepted image's version after every completed update. Deliberate
+/// downgrade recovery = an explicit, audited host action that lowers its own
+/// persisted floor.
+#[derive(Debug, Clone, Copy)]
+pub struct OtaReceiverConfig {
+    /// Product identifier BOUND INTO THE SIGNED MANIFEST (manifest v2): a
+    /// validly-signed image for any other product fails verification here.
+    pub product_id: u16,
+    /// Hardware profile byte (same identity the install factory certificate
+    /// attests), also bound into the signed manifest: images built for an
+    /// incompatible board revision are rejected at verification.
+    pub hardware_profile_id: u8,
+    /// Maximum image size the host staging window accepts.
+    pub staging_cap: u32,
+    /// Offset (relative to the staging window base) of the trailer record;
+    /// its aligned erase block must not overlap the image window.
+    pub trailer_offset: u32,
+    /// Anti-rollback floor described above. `0` accepts everything.
+    pub min_acceptable_version: u32,
+    /// Whole seconds without traffic before an unfinished session expires.
+    pub idle_timeout_secs: u32,
+    /// Absolute ceiling for ONE streaming session regardless of identical-
+    /// BEGIN refresh traffic (bounds a hostile peer's ability to pin the
+    /// receiver forever).
+    pub absolute_session_timeout_secs: u32,
+}
+
+/// Receive-side OTA transfer engine.
+///
+/// The engine owns NO hardware handles: storage and secure element are
+/// passed per command so hosts (RTIC tasks, tests) control borrowing.
+pub struct OtaReceiver {
+    /// Factory root public key (33-byte compressed SEC1) verifying manifests.
+    factory_pubkey: [u8; 33],
+    cfg: OtaReceiverConfig,
+    /// Geometry `(img_version, img_len)` of the most recent session,
+    /// retained after teardown so STATUS projections stay correlatable by
+    /// the peer even once the receiver is Idle.
+    last_session: Option<(u32, u32)>,
+    state: RxState,
+}
+
+/// Rounds `value` up to a multiple of `granularity` (> 0); `None` on
+/// overflow instead of wrapping (release-build panic resistance).
+fn align_up_checked(value: u32, granularity: u32) -> Option<u32> {
+    debug_assert!(granularity > 0);
+    Some(value.checked_add(granularity - 1)? / granularity * granularity)
+}
+
+/// Computes the aligned erase range covering the trailer record at
+/// `trailer_offset` for the given granularity: `(start, span)` with
+/// `start % granularity == 0`. `None` on address-space overflow.
+///
+/// Single source of truth shared by BEGIN validation and FINALIZE write so
+/// the two sites can never disagree about the erased bytes.
+fn aligned_trailer_range(trailer_offset: u32, granularity: u32) -> Option<(u32, u32)> {
+    debug_assert!(granularity > 0);
+    let start = trailer_offset - trailer_offset % granularity;
+    let off_in_block = trailer_offset % granularity;
+    let span = align_up_checked(off_in_block.checked_add(TRAILER_LEN as u32)?, granularity)?;
+    // The whole erased interval must fit the address space, not just each
+    // piece independently.
+    start.checked_add(span)?;
+    Some((start, span))
+}
+
+impl OtaReceiver {
+    /// Creates an engine bound to the host's staging geometry.
+    ///
+    /// * `factory_pubkey`: root key verifying manifest signatures.
+    /// * `staging_cap`: maximum acceptable `img_len`.
+    /// * `trailer_offset`: write position of the [`TrailerRecord`]. Its
+    ///   aligned erase block must NOT overlap the image window: BEGIN
+    ///   enforces `align_lo(trailer_offset) >= staging_cap` against the
+    ///   storage granularity and rejects transfers otherwise (fail-closed,
+    ///   before any flash access). Place the trailer in a dedicated block
+    ///   at or after the end of the staging window.
+    /// * `idle_timeout_secs`: whole seconds without traffic before `tick`
+    ///   expires a streaming session.
+    ///
+    /// Storage integration errors (zero granularity, overflowing or
+    /// overlapping trailer geometry) surface as
+    /// [`OtaError::InvalidParams`] from BEGIN — never as panics.
+    pub fn new(factory_pubkey: [u8; 33], cfg: OtaReceiverConfig) -> Self {
+        Self {
+            factory_pubkey,
+            cfg,
+            last_session: None,
+            state: RxState::Idle,
+        }
+    }
+
+    /// Current coarse state projection.
+    pub fn state(&self) -> PeerState {
+        self.state.coarse()
+    }
+
+    /// Next expected chunk sequence while streaming (`None` otherwise).
+    pub fn next_seq(&self) -> Option<u16> {
+        match &self.state {
+            RxState::Streaming(s) => Some(s.next_seq),
+            _ => None,
+        }
+    }
+
+    /// Builds the STATUS reply for the current state. The host transmits it
+    /// on its own diagnostic schedule (the v1 wire contract defines STATUS
+    /// as a reply only; there is no request frame).
+    pub fn status(&self) -> Reply {
+        self.status_reply()
+    }
+
+    /// Geometry of the open or completed session: `(version, img_len)`.
+    pub fn session_geometry(&self) -> Option<(u32, u32)> {
+        match &self.state {
+            RxState::Streaming(s) => Some((s.img_version, s.img_len)),
+            RxState::PendingReboot {
+                img_version,
+                img_len,
+                ..
+            } => Some((*img_version, *img_len)),
+            RxState::Idle => None,
+        }
+    }
+
+    /// Processes one decoded command at monotonic time `now` (seconds).
+    ///
+    /// Storage failures return [`OtaError::Storage`] and leave the engine
+    /// state untouched, so the triggering command can be retried verbatim.
+    pub fn on_command<S: OtaStorage, SE: SecureElement>(
+        &mut self,
+        storage: &mut S,
+        se: &mut SE,
+        cmd: OtaCommand<'_>,
+        now: u32,
+    ) -> Result<RxOutcome, OtaError> {
+        match cmd {
+            OtaCommand::Begin(begin) => self.on_begin(storage, se, begin, now),
+            OtaCommand::Chunk(chunk) => self.on_chunk(storage, chunk.seq, chunk.data, now),
+            OtaCommand::Finalize => self.on_finalize(storage),
+            OtaCommand::Reboot { delay_ms } => self.on_reboot(delay_ms),
+            OtaCommand::Abort => self.on_abort(),
+            // Replies (including our own STATUS frames echoed back by a
+            // confused peer) are inert input on the receive half.
+            OtaCommand::AckReady { .. }
+            | OtaCommand::AckChunk { .. }
+            | OtaCommand::AckFinal(_)
+            | OtaCommand::Status(_) => Ok(RxOutcome::Silent),
+        }
+    }
+
+    /// Drives the idle-timeout policy; call periodically (e.g. once per
+    /// second from host housekeeping).
+    pub fn tick(&mut self, now: u32) -> TickOutcome {
+        let outcome = match &self.state {
+            RxState::Streaming(s) => {
+                if now.saturating_sub(s.opened_at_secs) >= self.cfg.absolute_session_timeout_secs {
+                    // Absolute ceiling: identical-BEGIN refresh traffic can
+                    // keep the IDLE timeout at bay but never extend a
+                    // session past this hard lifetime (anti-pinning).
+                    TickOutcome::ExpiredAbsoluteLifetime
+                } else if now.saturating_sub(s.last_activity_secs) >= self.cfg.idle_timeout_secs {
+                    TickOutcome::ExpiredIdleTimeout
+                } else {
+                    TickOutcome::Continue
+                }
+            }
+            _ => TickOutcome::Continue,
+        };
+        if matches!(
+            outcome,
+            TickOutcome::ExpiredIdleTimeout | TickOutcome::ExpiredAbsoluteLifetime
+        ) {
+            self.remember_last_session();
+            self.state = RxState::Idle;
+        }
+        outcome
+    }
+
+    // -- BEGIN ----------------------------------------------------------
+
+    fn on_begin<S: OtaStorage, SE: SecureElement>(
+        &mut self,
+        storage: &mut S,
+        se: &mut SE,
+        begin: BeginFrame,
+        now: u32,
+    ) -> Result<RxOutcome, OtaError> {
+        match &self.state {
+            RxState::PendingReboot { .. } => Ok(bad_state_reply()),
+            RxState::Streaming(s) => {
+                if s.begin == begin {
+                    // Identical re-BEGIN (lost ACK_READY): progress kept.
+                    let chunk_len = s.chunk_len;
+                    if let RxState::Streaming(active) = &mut self.state {
+                        active.last_activity_secs = now;
+                    }
+                    Ok(RxOutcome::Respond(Reply::Ready { chunk_len }))
+                } else {
+                    Ok(bad_state_reply())
+                }
+            }
+            RxState::Idle => {
+                // Integration geometry first: a zero granularity would
+                // divide by zero later, so it is an integration error
+                // rejected BEFORE any state changes (runtime check, not a
+                // debug-only assertion).
+                let granularity = storage.erase_granularity();
+                if granularity == 0 {
+                    return Err(OtaError::InvalidParams {
+                        reason: "storage erase_granularity must be non-zero",
+                    });
+                }
+                // Trailer placement must keep its aligned erase block
+                // disjoint from the image window; otherwise finalization
+                // could erase verified staged bytes. Checked arithmetic.
+                let trailer_range = aligned_trailer_range(self.cfg.trailer_offset, granularity)
+                    .ok_or(OtaError::InvalidParams {
+                        reason: "trailer geometry overflows the address space",
+                    })?;
+                if trailer_range.0 < self.cfg.staging_cap {
+                    return Err(OtaError::InvalidParams {
+                        reason: "trailer erase block overlaps the staging image window",
+                    });
+                }
+
+                // Capacity gate, wire-sequence overflow gate (chunk indices
+                // are u16), and bitmap bound.
+                if begin.img_len > self.cfg.staging_cap || begin.img_len == 0 {
+                    return Ok(size_rejected_reply());
+                }
+                let total_chunks = chunk_count(begin.img_len, u32::from(begin.chunk_len));
+                if total_chunks > u16::MAX as u32 {
+                    return Ok(size_rejected_reply());
+                }
+                let blocks_needed = chunk_count(begin.img_len, granularity);
+                if blocks_needed > MAX_STAGING_BLOCKS {
+                    return Ok(size_rejected_reply());
+                }
+                // Rollback protection: strictly older signed versions are
+                // refused before any flash access; equality is allowed so a
+                // re-flash of the running version remains a valid repair.
+                if begin.img_version < self.cfg.min_acceptable_version {
+                    return Ok(RxOutcome::Respond(Reply::Final(
+                        FinalResult::VersionRejected,
+                    )));
+                }
+
+                // Manifest AUTHENTICATION at BEGIN (before any erase/write):
+                // an invalid signature never opens a session, so hostile
+                // manifests cannot spend flash cycles or radio energy on
+                // staging that would be torn down later anyway. The image
+                // HASH is still verified at FINALIZE against the bytes that
+                // actually arrived.
+                let message = manifest_digest_input(
+                    self.cfg.product_id,
+                    self.cfg.hardware_profile_id,
+                    begin.img_version,
+                    begin.img_len,
+                    begin.chunk_len,
+                    &begin.img_sha256,
+                );
+                if se
+                    .verify_ecdsa(&self.factory_pubkey, &message, &begin.manifest_sig)
+                    .is_err()
+                {
+                    return Ok(RxOutcome::Respond(Reply::Final(FinalResult::SigRejected)));
+                }
+
+                let accepted = begin.chunk_len;
+                self.state = RxState::Streaming(StreamingSession {
+                    img_version: begin.img_version,
+                    img_len: begin.img_len,
+                    chunk_len: begin.chunk_len,
+                    total_chunks: total_chunks as u16,
+                    next_seq: 0,
+                    hasher: Sha256::new(),
+                    last_activity_secs: now,
+                    opened_at_secs: now,
+                    begin,
+                    erased_blocks: BlockBitmap::new(),
+                });
+                Ok(RxOutcome::Respond(Reply::Ready {
+                    chunk_len: accepted,
+                }))
+            }
+        }
+    }
+
+    // -- CHUNK ----------------------------------------------------------
+
+    fn on_chunk<S: OtaStorage>(
+        &mut self,
+        storage: &mut S,
+        seq: u16,
+        data: &[u8],
+        now: u32,
+    ) -> Result<RxOutcome, OtaError> {
+        let (next_seq, total_chunks) = match &self.state {
+            RxState::Streaming(s) => (s.next_seq, s.total_chunks),
+            _ => return Ok(bad_state_reply()),
+        };
+
+        // Wrong position: reject AND re-teach with the cumulative ACK.
+        if seq != next_seq || seq >= total_chunks {
+            return Ok(RxOutcome::Respond(Reply::ChunkAck { next_seq }));
+        }
+
+        // Per-position length gate: only the LAST chunk may be short, and
+        // nothing may exceed the declared geometry.
+        let expected = {
+            let (img_len, chunk_len) = match &self.state {
+                RxState::Streaming(s) => (s.img_len, u32::from(s.chunk_len)),
+                _ => unreachable!("state matched above"),
+            };
+            let offset = u64::from(seq) * u64::from(chunk_len);
+            let remaining = u64::from(img_len) - offset;
+            // Bounded by chunk_len (<= 196), so the narrowing is safe.
+            remaining.min(u64::from(chunk_len)) as usize
+        };
+        if data.len() != expected {
+            // Geometry violation corrupts the staged layout: tear down.
+            self.remember_last_session();
+            self.state = RxState::Idle;
+            return Ok(size_rejected_reply());
+        }
+
+        // Persist BEFORE advancing any in-RAM progress so a storage fault
+        // leaves the engine byte-identical for a verbatim retry. Each
+        // granularity block is erased at most once per session: the bitmap
+        // bit is COMMITTED only after that block's erase succeeded, so a
+        // failed erase is retried verbatim while successfully erased blocks
+        // are never re-erased (re-erasing would destroy neighboring staged
+        // chunks sharing the block).
+        {
+            let session = match &mut self.state {
+                RxState::Streaming(s) => s,
+                _ => unreachable!("state matched above"),
+            };
+            let granularity = storage.erase_granularity();
+            if granularity == 0 {
+                return Err(OtaError::InvalidParams {
+                    reason: "storage erase_granularity must be non-zero",
+                });
+            }
+            let offset = u32::from(seq) * u32::from(session.chunk_len);
+            let first_block = (offset / granularity) as usize;
+            let last_byte = offset + data.len() as u32 - 1;
+            let last_block = (last_byte / granularity) as usize;
+            for block in first_block..=last_block {
+                if !session.erased_blocks.is_set(block) {
+                    let base = block as u32 * granularity;
+                    storage.erase_range(base, granularity)?;
+                    session.erased_blocks.set(block);
+                }
+            }
+            storage.write(offset, data)?;
+        }
+
+        if let RxState::Streaming(s) = &mut self.state {
+            s.hasher.update(data);
+            s.next_seq += 1;
+            s.last_activity_secs = now;
+        }
+        Ok(RxOutcome::Respond(Reply::ChunkAck {
+            next_seq: next_seq + 1,
+        }))
+    }
+
+    // -- FINALIZE -------------------------------------------------------
+
+    fn on_finalize<S: OtaStorage>(&mut self, storage: &mut S) -> Result<RxOutcome, OtaError> {
+        // Lost final ACK: re-answer Ok WITHOUT rewriting the trailer.
+        if matches!(self.state, RxState::PendingReboot { .. }) {
+            return Ok(RxOutcome::Respond(Reply::Final(FinalResult::Ok)));
+        }
+
+        let complete = match &self.state {
+            RxState::Streaming(s) => s.next_seq == s.total_chunks,
+            _ => return Ok(bad_state_reply()),
+        };
+        if !complete {
+            // Premature finalize: recoverable, session stays open.
+            return Ok(RxOutcome::Respond(Reply::Final(FinalResult::BadState)));
+        }
+
+        // Authenticity was proven at BEGIN: the verified manifest is frozen
+        // inside this session and identical-BEGIN substitution is rejected,
+        // so FINALIZE only has to prove that the staged bytes match THAT
+        // manifest's digest (integrity over exactly what arrived).
+        // Cloned so verification never consumes the live hasher.
+        let (digest_ok, begin_copy) = {
+            let s = match &self.state {
+                RxState::Streaming(s) => s,
+                _ => unreachable!("matched above"),
+            };
+            let digest: [u8; 32] = s.hasher.clone().finalize().into();
+            (digest == s.begin.img_sha256, s.begin.clone())
+        };
+
+        if !digest_ok {
+            // Untrusted staged content: tear the session down.
+            self.remember_last_session();
+            self.state = RxState::Idle;
+            return Ok(RxOutcome::Respond(Reply::Final(FinalResult::HashMismatch)));
+        }
+
+        // Mark bootable. Storage faults keep the session retryable. The
+        // trailer is a single one-shot write into the aligned erase block
+        // already validated disjoint from the image window at BEGIN (same
+        // helper, so both sites can never drift).
+        let mut raw = [0u8; TRAILER_LEN];
+        TrailerRecord::staged_valid(
+            begin_copy.img_version,
+            begin_copy.img_len,
+            begin_copy.img_sha256,
+        )
+        .serialize(&mut raw)?;
+        {
+            let granularity = storage.erase_granularity();
+            if granularity == 0 {
+                return Err(OtaError::InvalidParams {
+                    reason: "storage erase_granularity must be non-zero",
+                });
+            }
+            let (start, span) = aligned_trailer_range(self.cfg.trailer_offset, granularity).ok_or(
+                OtaError::InvalidParams {
+                    reason: "trailer geometry overflows the address space",
+                },
+            )?;
+            storage.erase_range(start, span)?;
+            storage.write(self.cfg.trailer_offset, &raw)?;
+        }
+        self.state = RxState::PendingReboot {
+            img_version: begin_copy.img_version,
+            img_len: begin_copy.img_len,
+            total_chunks: begin_total_chunks(&begin_copy),
+        };
+        Ok(RxOutcome::Respond(Reply::Final(FinalResult::Ok)))
+    }
+
+    // -- REBOOT / ABORT / STATUS ----------------------------------------
+
+    fn on_reboot(&mut self, delay_ms: u16) -> Result<RxOutcome, OtaError> {
+        match &self.state {
+            RxState::PendingReboot { .. } => Ok(RxOutcome::RebootAfterMs(delay_ms)),
+            _ => Ok(bad_state_reply()),
+        }
+    }
+
+    fn on_abort(&mut self) -> Result<RxOutcome, OtaError> {
+        self.remember_last_session();
+        self.state = RxState::Idle;
+        Ok(RxOutcome::Silent)
+    }
+
+    /// Captures the open session's identity before tearing it down.
+    fn remember_last_session(&mut self) {
+        if let Some(geom) = self.session_geometry() {
+            self.last_session = Some(geom);
+        }
+    }
+
+    fn status_reply(&self) -> Reply {
+        let status = match &self.state {
+            RxState::Idle => {
+                // Identity of the most recent session (zeros before any):
+                // lets the sender correlate this frame to its transfer even
+                // though the receiver already dropped it.
+                let (v, l) = self.last_session.unwrap_or((0, 0));
+                StatusFrame {
+                    state: PeerState::Idle,
+                    next_seq: 0,
+                    img_version: v,
+                    img_len: l,
+                }
+            }
+            RxState::Streaming(s) => StatusFrame {
+                state: PeerState::Streaming,
+                next_seq: s.next_seq,
+                img_version: s.img_version,
+                img_len: s.img_len,
+            },
+            RxState::PendingReboot {
+                img_version,
+                img_len,
+                total_chunks,
+            } => StatusFrame {
+                state: PeerState::PendingReboot,
+                next_seq: *total_chunks,
+                img_version: *img_version,
+                img_len: *img_len,
+            },
+        };
+        Reply::Status(status)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+/// Uniform "command invalid for current state" verdict.
+fn bad_state_reply() -> RxOutcome {
+    RxOutcome::Respond(Reply::Final(FinalResult::BadState))
+}
+
+/// Uniform capacity/geometry rejection verdict.
+fn size_rejected_reply() -> RxOutcome {
+    RxOutcome::Respond(Reply::Final(FinalResult::SizeRejected))
+}
+
+/// Number of chunks for `(len, chunk)` geometry (both > 0).
+fn chunk_count(len: u32, chunk: u32) -> u32 {
+    len.div_ceil(chunk)
+}
+
+/// Total chunks of a parsed BEGIN (validated non-zero upstream).
+fn begin_total_chunks(begin: &BeginFrame) -> u16 {
+    chunk_count(begin.img_len, u32::from(begin.chunk_len)) as u16
+}

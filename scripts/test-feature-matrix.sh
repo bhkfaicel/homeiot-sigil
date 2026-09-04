@@ -11,8 +11,12 @@
 #   - sensor:              SUPPORTED. Single-role session build.
 #   - gateway:             SUPPORTED. Single-role session build.
 #   - sensor,gateway:      SUPPORTED. Explicit two-role composition.
-#   - --all-features:      SUPPORTED. Future-facing superset gate, currently
-#                          equivalent to sensor,gateway but kept separate.
+#   - ota:                 SUPPORTED. Shared OTA wire tier (codec + manifest
+#                          digest) without any protocol engine.
+#   - sensor,ota:          SUPPORTED. Adds the OTA receive half.
+#   - gateway,ota:         SUPPORTED. Adds the OTA send half.
+#   - --all-features:      SUPPORTED. Future-facing superset gate (covers the
+#                          dual-role build with both OTA halves).
 #
 # Fixture disposition: no separate feature-matrix fixture files exist and
 # none are required. Every supported configuration is exercised end-to-end
@@ -107,6 +111,15 @@ expect_supported \
 expect_supported \
     "sensor,gateway tests" \
     cargo test --locked --no-default-features --features sensor,gateway
+expect_supported \
+    "ota shared-tier tests" \
+    cargo test --locked --no-default-features --features ota
+expect_supported \
+    "sensor,ota tests" \
+    cargo test --locked --no-default-features --features sensor,ota
+expect_supported \
+    "gateway,ota tests" \
+    cargo test --locked --no-default-features --features gateway,ota
 expect_supported \
     "all-features tests" \
     cargo test --locked --all-features
