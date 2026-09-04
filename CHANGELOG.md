@@ -7,6 +7,10 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-05
+
+- Update link on readme
+
 ## [1.2.1] - 2026-09-05
 
 - Update README.md
