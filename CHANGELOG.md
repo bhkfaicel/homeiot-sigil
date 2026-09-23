@@ -7,6 +7,29 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-24
+
+- Add the USB-serial link tier (`src/usbserial`) behind the new `usbserial`
+  cargo feature (off by default; never implied by another feature, following
+  the `ota` precedent). The tier frames the byte stream between the gateway
+  host and the SAMD21 radio head:
+  - Plain profile: COBS blocks with a `0x00` delimiter, CRC-16/CCITT-FALSE
+    over type + body, link message types RX / TX_REQ / TX_RESULT / PING /
+    PONG (0x01..0x05), 255-byte radio payload bound (SX1278 8-bit length
+    register), streaming `Decoder` with bounded queue, drop counters and
+    delimiter resync.
+  - Secure profile: HELLO handshake (clear 16-byte nonces both directions,
+    last HELLO wins), HKDF-SHA256 over a 32-byte PSK with
+    `salt = host_nonce || head_nonce` and fixed directional OKM split
+    (key + 4-byte nonce prefix per direction), ChaCha20-Poly1305 sealing
+    with the clear counter and type byte bound as AAD, strictly increasing
+    receive counters with the watermark advanced only after tag
+    verification, PSK/keys zeroized on drop and redacted from `Debug`.
+- Feature contract: the standalone `usbserial` configuration (and its
+  combinations `gateway,usbserial`, `--all-features`) is now supported and
+  exercised by `scripts/test-feature-matrix.sh`; the `compile_error!` guard
+  accepts the new tier.
+
 ## [1.2.2] - 2026-09-05
 
 - Update link on readme
