@@ -257,3 +257,250 @@ fn decoder_ram_footprint_is_bounded() {
         size_of::<Decoder>()
     );
 }
+
+// ===================== Secure profile (opt-in) tests ======================
+
+use super::{
+    COUNTER_WIRE_LEN, HELLO_FRAME_MAX, PSK_LEN, Role, SECURE_MAX_FRAME_LEN, SECURE_MAX_MSG_LEN,
+    SecureChannel, TAG_LEN,
+};
+
+const PSK_A: [u8; PSK_LEN] = [0xA5; PSK_LEN];
+const PSK_B: [u8; PSK_LEN] = [0x5A; PSK_LEN];
+
+fn nonce(byte: u8) -> [u8; NONCE_LEN] {
+    [byte; NONCE_LEN]
+}
+
+/// Builds a host/head pair that completed the HELLO handshake.
+fn established_pair(
+    psk: &[u8; PSK_LEN],
+    host_nonce: u8,
+    head_nonce: u8,
+) -> (SecureChannel, SecureChannel) {
+    let mut host = SecureChannel::new(Role::Host, psk, &nonce(host_nonce));
+    let mut head = SecureChannel::new(Role::Head, psk, &nonce(head_nonce));
+    let mut buf = [0u8; HELLO_FRAME_MAX];
+    let n = host.hello_frame(&mut buf).expect("hello fits");
+    head.feed(&buf[..n]);
+    let n = head.hello_frame(&mut buf).expect("hello fits");
+    host.feed(&buf[..n]);
+    assert!(host.is_established(), "host must be established");
+    assert!(head.is_established(), "head must be established");
+    (host, head)
+}
+
+fn tx_req(payload: &[u8]) -> Msg {
+    Msg::TxReq {
+        payload: HeapVec::from_slice(payload).expect("fits"),
+    }
+}
+
+#[test]
+fn secure_constants_are_consistent() {
+    assert_eq!(
+        SECURE_MAX_MSG_LEN,
+        1 + COUNTER_WIRE_LEN + (1 + 2 + 1 + 1 + MAX_RADIO_PAYLOAD) + TAG_LEN + 2
+    );
+    assert_eq!(
+        SECURE_MAX_FRAME_LEN,
+        SECURE_MAX_MSG_LEN + SECURE_MAX_MSG_LEN.div_ceil(254) + 1 + 1
+    );
+}
+
+#[test]
+fn secure_handshake_and_data_roundtrip() {
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let msg = tx_req(b"hello sensor");
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host.seal(&msg, &mut out).expect("seal fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(msg), "host→head message must roundtrip");
+    let rx_msg = rx(3);
+    let n = head.seal(&rx_msg, &mut out).expect("seal fits");
+    host.feed(&out[..n]);
+    assert_eq!(host.pop(), Some(rx_msg), "head→host message must roundtrip");
+    assert_eq!(host.dropped(), 0);
+    assert_eq!(head.dropped(), 0);
+}
+
+#[test]
+fn secure_seal_requires_established_session() {
+    let mut host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    assert_eq!(host.seal(&Msg::Ping, &mut out), Err(Error::NotEstablished));
+}
+
+#[test]
+fn secure_corrupted_tag_rejected() {
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host.seal(&Msg::Ping, &mut out).expect("seal fits");
+    out[12] ^= 0xFF; // inside the ciphertext region (type + 8 counter bytes precede it)
+    head.feed(&out[..n]);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), None);
+}
+
+#[test]
+fn secure_replay_rejected_then_valid_accepted() {
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n1 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    let f1 = HeapVec::<u8, MAX_FRAME_LEN>::from_slice(&out[..n1]).expect("fits");
+    let n2 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    let f2 = HeapVec::<u8, MAX_FRAME_LEN>::from_slice(&out[..n2]).expect("fits");
+    let n3 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&f1);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    head.feed(&f2);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    // Replayed frame 1: counter 1 <= watermark 2 → dropped, watermark intact.
+    head.feed(&f1);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), None);
+    // A later, genuinely fresh counter must still be accepted.
+    head.feed(&out[..n3]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+}
+
+#[test]
+fn secure_type_confusion_rejected() {
+    // Rewrite the clear type byte AND fix the CRC so the frame reaches the
+    // AEAD layer: the tag must fail because the type is bound as AAD.
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    let block = &mut out[..n - 1]; // strip delimiter
+    let mut clear = [0u8; SECURE_MAX_MSG_LEN];
+    let cl = cobs_decode(block, &mut clear).expect("block decodes");
+    clear[0] = TYPE_PONG; // RX→(here) PONG-style type rewrite
+    let end = cl - 2;
+    let crc = crc16_ccitt_false(&clear[..end]);
+    clear[end] = crc as u8;
+    clear[end + 1] = (crc >> 8) as u8;
+    let mut scratch = [0u8; SECURE_MAX_FRAME_LEN];
+    let bl = cobs_encode(&clear[..cl], &mut scratch).expect("fits");
+    scratch[bl] = 0;
+    head.feed(&scratch[..bl + 1]);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), None);
+}
+
+#[test]
+fn secure_wrong_psk_rejected_at_first_data() {
+    // The clear HELLO cannot authenticate by itself; the wrong PSK is
+    // detected by the first sealed message's tag check.
+    let mut host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let mut head = SecureChannel::new(Role::Head, &PSK_B, &nonce(2));
+    let mut buf = [0u8; HELLO_FRAME_MAX];
+    let n = host.hello_frame(&mut buf).expect("fits");
+    head.feed(&buf[..n]);
+    let n = head.hello_frame(&mut buf).expect("fits");
+    host.feed(&buf[..n]);
+    assert!(host.is_established() && head.is_established());
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.dropped(), 1, "wrong PSK must fail the first data tag");
+    assert_eq!(head.pop(), None);
+}
+
+#[test]
+fn secure_forged_premature_hello_recovered() {
+    // A forged HELLO before the legitimate one must not poison the channel:
+    // last HELLO pair wins and the real host completes the handshake.
+    let mut head = SecureChannel::new(Role::Head, &PSK_A, &nonce(9));
+    let impostor = SecureChannel::new(Role::Host, &PSK_B, &nonce(77));
+    let mut buf = [0u8; HELLO_FRAME_MAX];
+    let n = impostor.hello_frame(&mut buf).expect("fits");
+    head.feed(&buf[..n]);
+    assert!(
+        head.is_established(),
+        "forged hello derives wrong keys, not refusal"
+    );
+    let mut host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let n = host.hello_frame(&mut buf).expect("fits");
+    head.feed(&buf[..n]);
+    // Full exchange now works with the legitimate host: the head replies and
+    // the host completes its own handshake with the head's HELLO.
+    let n = head.hello_frame(&mut buf).expect("fits");
+    host.feed(&buf[..n]);
+    assert!(
+        host.is_established(),
+        "host must be established by the head reply"
+    );
+    let msg = tx_req(b"open");
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host.seal(&msg, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(
+        head.pop(),
+        Some(msg),
+        "legitimate traffic must flow after re-hello"
+    );
+}
+
+#[test]
+fn secure_nonce_uniqueness_changes_traffic_keys() {
+    // Same PSK, different host nonces → different keys → different wire bytes.
+    let (mut host_a, _head_a) = established_pair(&PSK_A, 1, 2);
+    let (mut host_b, _head_b) = established_pair(&PSK_A, 3, 2);
+    let mut out_a = [0u8; SECURE_MAX_FRAME_LEN];
+    let mut out_b = [0u8; SECURE_MAX_FRAME_LEN];
+    let na = host_a.seal(&Msg::Ping, &mut out_a).expect("fits");
+    let nb = host_b.seal(&Msg::Ping, &mut out_b).expect("fits");
+    assert_eq!(na, nb, "same shape expected");
+    assert_ne!(
+        &out_a[..na],
+        &out_b[..nb],
+        "different sessions must produce different sealed bytes"
+    );
+}
+
+#[test]
+fn secure_resync_after_garbage() {
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut wire = HeapVec::<u8, 512>::new();
+    wire.extend([0x33u8; 40]);
+    wire.push(0).expect("fits");
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    wire.extend_from_slice(&out[..n]).expect("fits");
+    head.feed(&wire);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+}
+
+#[test]
+fn secure_secrets_never_rendered() {
+    // The PSK (0xA5 = 165 decimal) and any key material must not leak
+    // through Debug formatting.
+    let host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let rendered = alloc::format!("{host:?}");
+    assert!(rendered.contains("SecureChannel"));
+    assert!(
+        !rendered.contains("165"),
+        "PSK bytes leaked through Debug: {rendered}"
+    );
+    assert!(!rendered.to_lowercase().contains("psk"));
+}
+
+#[test]
+fn secure_zeroize_on_drop_compiles_and_runs() {
+    // Zeroization of the PSK happens in the Drop impl; safe Rust cannot
+    // observe freed memory, so this pins the API contract: dropping is the
+    // supported teardown and the Drop impl is the single zeroize point for
+    // the PSK (DirectionalKeys zeroizes itself the same way).
+    let host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    drop(host);
+}
+
+#[test]
+fn secure_channel_ram_footprint_is_bounded() {
+    assert!(
+        size_of::<SecureChannel>() <= 2944,
+        "SecureChannel grew beyond its approved bound: {} bytes",
+        size_of::<SecureChannel>()
+    );
+}

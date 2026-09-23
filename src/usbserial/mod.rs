@@ -112,6 +112,10 @@ pub enum Error {
     Malformed,
     /// CRC-16 mismatch: the frame is corrupt or torn.
     Crc,
+    /// Secure operation attempted before the HELLO handshake completed.
+    NotEstablished,
+    /// AEAD encryption/decryption failed (tag verification or cipher error).
+    Crypto,
 }
 
 /// One radio payload worth of bytes, bounded by the physical radio limit.
@@ -160,9 +164,10 @@ impl Msg {
         Ok(block_len + 1)
     }
 
-    /// Writes `[type][body][crc]` into `out` (capacity is guaranteed by the
-    /// only caller, which passes a `MAX_MSG_LEN` buffer); returns the length.
-    fn encode_clear(&self, out: &mut [u8; MAX_MSG_LEN]) -> usize {
+    /// Writes `[type][body]` (no CRC) into `out`; returns the written length.
+    /// Shared by the plain frame builder and the secure seal path (which
+    /// encrypts the body instead of CRC-protecting it).
+    fn write_body(&self, out: &mut [u8]) -> usize {
         match self {
             Msg::Rx { rssi, snr, payload } => {
                 out[0] = TYPE_RX;
@@ -170,35 +175,36 @@ impl Msg {
                 out[3] = *snr as u8;
                 out[4] = payload.len() as u8;
                 out[5..5 + payload.len()].copy_from_slice(payload);
-                let end = 5 + payload.len();
-                write_crc(out, end);
-                end + 2
+                5 + payload.len()
             }
             Msg::TxReq { payload } => {
                 out[0] = TYPE_TX_REQ;
                 out[1] = payload.len() as u8;
                 out[2..2 + payload.len()].copy_from_slice(payload);
-                let end = 2 + payload.len();
-                write_crc(out, end);
-                end + 2
+                2 + payload.len()
             }
             Msg::TxResult { status } => {
                 out[0] = TYPE_TX_RESULT;
                 out[1] = *status;
-                write_crc(out, 2);
-                4
+                2
             }
             Msg::Ping => {
                 out[0] = TYPE_PING;
-                write_crc(out, 1);
-                3
+                1
             }
             Msg::Pong => {
                 out[0] = TYPE_PONG;
-                write_crc(out, 1);
-                3
+                1
             }
         }
+    }
+
+    /// Writes `[type][body][crc]` into `out` (capacity is guaranteed by the
+    /// only caller, which passes a `MAX_MSG_LEN` buffer); returns the length.
+    fn encode_clear(&self, out: &mut [u8; MAX_MSG_LEN]) -> usize {
+        let end = self.write_body(out);
+        write_crc(out, end);
+        end + 2
     }
 }
 
@@ -399,7 +405,14 @@ fn parse_msg(decoded: &[u8]) -> Result<Msg, Error> {
         return Err(Error::Crc);
     }
     let (ty, body) = msg_bytes.split_first().ok_or(Error::Malformed)?;
-    match *ty {
+    parse_body(*ty, body)
+}
+
+/// Parses one message body (type byte stripped, CRC already verified).
+/// Shared by the plain decoder and the secure open path (the decrypted
+/// plaintext has exactly this shape).
+fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, Error> {
+    match ty {
         TYPE_RX => {
             if body.len() < 4 {
                 return Err(Error::Malformed);
@@ -430,5 +443,449 @@ fn parse_msg(decoded: &[u8]) -> Result<Msg, Error> {
         TYPE_PING if body.is_empty() => Ok(Msg::Ping),
         TYPE_PONG if body.is_empty() => Ok(Msg::Pong),
         _ => Err(Error::Malformed),
+    }
+}
+
+// ======================= Secure profile (opt-in) ==========================
+//
+// PSK-authenticated AEAD channel layered on the same framing. Wire layout of
+// a sealed data message (types 0x01..=0x05):
+//
+//   frame = COBS( [type] [counter:u64BE] [ciphertext||tag] [crc] ) 0x00
+//
+// - the type byte stays IN CLEAR (pre-decryption routing, HELLO detection)
+//   but is AUTHENTICATED: AAD = [type] || counter_be, so a rewritten clear
+//   type fails the tag check;
+// - the counter rides in the clear and binds the replay window; the receiver
+//   accepts strictly increasing counters only, and advances its watermark
+//   only AFTER the tag verified (a forged huge counter cannot desync);
+// - HELLO (0x06) travels clear (both directions, body = nonce[16]): it is
+//   salt material, not a secret; authentication comes from the PSK through
+//   the first sealed message.
+//
+// Key schedule (mirrors `core::aead` / `core::derive`, re-declared locally
+// because those modules are session-gated and `usbserial` must build
+// standalone):
+//
+//   salt = host_nonce[16] || head_nonce[16]
+//   HKDF-SHA256(ikm = PSK[32], salt, info = "sigil-usbserial-v1") -> okm[72]
+//   okm[0..32]   = host→head key      okm[32..36] = host→head nonce prefix
+//   okm[36..68]  = head→host key      okm[68..72] = head→host nonce prefix
+//   nonce = prefix[4] || counter_be[8]
+//
+// Honest property statement: link-layer PSK channel — NO forward secrecy,
+// symmetric PSK (compromise reveals both directions), protects the
+// host↔head link only; end-to-end sensor security remains the Sigil
+// sessions above.
+
+use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag, aead::AeadInPlace};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use zeroize::Zeroize;
+
+/// Secure-profile handshake message (clear, body = `nonce[16]`).
+pub const TYPE_HELLO: u8 = 0x06;
+/// Length of one HELLO nonce.
+pub const NONCE_LEN: usize = 16;
+/// Length of the pre-shared key.
+pub const PSK_LEN: usize = 32;
+/// Poly1305 tag length appended to every sealed message.
+pub const TAG_LEN: usize = 16;
+/// Clear counter bytes prefixing every sealed message body.
+pub const COUNTER_WIRE_LEN: usize = 8;
+
+const KEY_LEN: usize = 32;
+const PREFIX_LEN: usize = 4;
+const NONCE_SIZE: usize = PREFIX_LEN + 8;
+const DIRECTIONAL_HALF: usize = KEY_LEN + PREFIX_LEN;
+const OKM_LEN: usize = DIRECTIONAL_HALF * 2;
+const HKDF_INFO: &[u8] = b"sigil-usbserial-v1";
+
+/// Worst-case clear sealed message: type + counter + Rx worst body + tag
+/// + CRC.
+const SECURE_MAX_MSG_LEN: usize =
+    1 + COUNTER_WIRE_LEN + (1 + 2 + 1 + 1 + MAX_RADIO_PAYLOAD) + TAG_LEN + 2;
+/// Worst-case COBS block of a sealed message.
+const SECURE_MAX_BLOCK_LEN: usize = SECURE_MAX_MSG_LEN + SECURE_MAX_MSG_LEN.div_ceil(254) + 1;
+/// Worst-case wire frame of a sealed message.
+pub const SECURE_MAX_FRAME_LEN: usize = SECURE_MAX_BLOCK_LEN + 1;
+/// Worst-case wire frame of a HELLO: `1+16+2` clear, COBS + delimiter.
+pub const HELLO_FRAME_MAX: usize = (NONCE_LEN + 3) + (NONCE_LEN + 3).div_ceil(254) + 1 + 1;
+
+/// Endpoint role of a [`SecureChannel`]. The role fixes the direction split
+/// of the derived keys (see the key schedule above) and the salt order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Gateway host side (sends TX_REQ/PING, receives RX/TX_RESULT/PONG).
+    Host,
+    /// SAMD21 radio head side (sends RX/TX_RESULT/PONG, receives TX_REQ/PING).
+    Head,
+}
+
+/// Directional AEAD material. Zeroized on drop.
+struct DirectionalKeys {
+    /// Key sealing messages flowing host → head.
+    host_to_head_key: [u8; KEY_LEN],
+    host_to_head_prefix: [u8; PREFIX_LEN],
+    /// Key sealing messages flowing head → host.
+    head_to_host_key: [u8; KEY_LEN],
+    head_to_host_prefix: [u8; PREFIX_LEN],
+}
+
+impl Drop for DirectionalKeys {
+    fn drop(&mut self) {
+        self.host_to_head_key.zeroize();
+        self.host_to_head_prefix.zeroize();
+        self.head_to_host_key.zeroize();
+        self.head_to_host_prefix.zeroize();
+    }
+}
+
+impl DirectionalKeys {
+    /// Derives the directional material from the PSK and the two HELLO
+    /// nonces. Fails only on HKDF length overflow, which the fixed 72-byte
+    /// OKM request cannot reach.
+    fn derive(
+        psk: &[u8; PSK_LEN],
+        host_nonce: &[u8; NONCE_LEN],
+        head_nonce: &[u8; NONCE_LEN],
+    ) -> Result<Self, Error> {
+        let mut salt = [0u8; NONCE_LEN * 2];
+        salt[..NONCE_LEN].copy_from_slice(host_nonce);
+        salt[NONCE_LEN..].copy_from_slice(head_nonce);
+        let hk = Hkdf::<Sha256>::new(Some(&salt), psk);
+        let mut okm = [0u8; OKM_LEN];
+        hk.expand(HKDF_INFO, &mut okm).map_err(|_| Error::Crypto)?;
+        let mut keys = Self {
+            host_to_head_key: [0u8; KEY_LEN],
+            host_to_head_prefix: [0u8; PREFIX_LEN],
+            head_to_host_key: [0u8; KEY_LEN],
+            head_to_host_prefix: [0u8; PREFIX_LEN],
+        };
+        keys.host_to_head_key.copy_from_slice(&okm[0..KEY_LEN]);
+        keys.host_to_head_prefix
+            .copy_from_slice(&okm[KEY_LEN..DIRECTIONAL_HALF]);
+        keys.head_to_host_key
+            .copy_from_slice(&okm[DIRECTIONAL_HALF..DIRECTIONAL_HALF + KEY_LEN]);
+        keys.head_to_host_prefix
+            .copy_from_slice(&okm[DIRECTIONAL_HALF + KEY_LEN..OKM_LEN]);
+        okm.zeroize();
+        Ok(keys)
+    }
+
+    /// Selects the sealing half for this role.
+    fn send_half(&self, role: Role) -> (&[u8; KEY_LEN], &[u8; PREFIX_LEN]) {
+        match role {
+            Role::Host => (&self.host_to_head_key, &self.host_to_head_prefix),
+            Role::Head => (&self.head_to_host_key, &self.head_to_host_prefix),
+        }
+    }
+
+    /// Selects the receiving half for this role.
+    fn recv_half(&self, role: Role) -> (&[u8; KEY_LEN], &[u8; PREFIX_LEN]) {
+        match role {
+            Role::Host => (&self.head_to_host_key, &self.head_to_host_prefix),
+            Role::Head => (&self.host_to_head_key, &self.host_to_head_prefix),
+        }
+    }
+}
+
+/// Constructs the 12-byte AEAD nonce `prefix[4] || counter_be[8]`
+/// (identical construction to `core::aead::build_nonce`).
+fn build_nonce(prefix: &[u8; PREFIX_LEN], counter: u64) -> [u8; NONCE_SIZE] {
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce[0..PREFIX_LEN].copy_from_slice(prefix);
+    nonce[PREFIX_LEN..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+/// Handshake/channel state.
+#[derive(Default)]
+enum SecureState {
+    /// Waiting for the peer HELLO (or a re-HELLO replacing a live session —
+    /// last HELLO pair wins, no stale state survives a restart).
+    #[default]
+    AwaitingPeerHello,
+    /// Keys derived; counters reset to zero (first sealed counter is 1).
+    Established(DirectionalKeys),
+}
+
+/// PSK-authenticated secure channel over the framed USB-serial link.
+///
+/// Lifecycle: `new(role, psk, local_nonce)` → send [`SecureChannel::hello_frame`]
+/// → `feed(peer bytes)` → once [`SecureChannel::is_established`], exchange
+/// data with [`SecureChannel::seal`] / [`SecureChannel::pop`]. A late or
+/// forged HELLO simply restarts the handshake (fresh keys, reset counters).
+/// The PSK and derived keys never appear in `Debug` output and are zeroized
+/// on drop.
+pub struct SecureChannel {
+    role: Role,
+    psk: [u8; PSK_LEN],
+    local_nonce: [u8; NONCE_LEN],
+    state: SecureState,
+    /// Counter of the last sealed message (0 = none sent this session).
+    send_counter: u64,
+    /// Highest accepted receive counter (0 = none accepted this session).
+    recv_last: u64,
+    /// Bytes of the current, not-yet-delimited block (same accumulator
+    /// discipline as [`Decoder`]).
+    acc: Vec<u8, DECODER_ACC_CAP>,
+    overflowing: bool,
+    dropped: u32,
+    queue: heapless::Deque<Msg, DECODER_QUEUE_CAP>,
+}
+
+impl core::fmt::Debug for SecureChannel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Redacted on purpose: the PSK and the derived keys must never be
+        // rendered by formatting (enforced by a test).
+        f.debug_struct("SecureChannel")
+            .field("role", &self.role)
+            .field("established", &self.is_established())
+            .field("send_counter", &self.send_counter)
+            .field("recv_last", &self.recv_last)
+            .field("dropped", &self.dropped)
+            .finish()
+    }
+}
+
+impl Drop for SecureChannel {
+    fn drop(&mut self) {
+        self.psk.zeroize();
+    }
+}
+
+impl SecureChannel {
+    /// Creates a channel for `role` with the shared `psk` and a locally
+    /// generated `local_nonce` (uniqueness token: the host draws it from its
+    /// OS CSPRNG, the head from a boot counter + jitter mix — the strong
+    /// entropy of the salt comes from the host nonce).
+    pub fn new(role: Role, psk: &[u8; PSK_LEN], local_nonce: &[u8; NONCE_LEN]) -> Self {
+        Self {
+            role,
+            psk: *psk,
+            local_nonce: *local_nonce,
+            state: SecureState::AwaitingPeerHello,
+            send_counter: 0,
+            recv_last: 0,
+            acc: Vec::new(),
+            overflowing: false,
+            dropped: 0,
+            queue: heapless::Deque::new(),
+        }
+    }
+
+    /// `true` once a peer HELLO completed the key derivation.
+    pub fn is_established(&self) -> bool {
+        matches!(self.state, SecureState::Established(_))
+    }
+
+    /// Serializes the local HELLO frame (clear, COBS + delimiter). Sent on
+    /// link open; the peer's HELLO completes the handshake.
+    pub fn hello_frame(&self, out: &mut [u8]) -> Result<usize, Error> {
+        if out.len() < HELLO_FRAME_MAX {
+            return Err(Error::Overrun);
+        }
+        let mut clear = [0u8; NONCE_LEN + 3];
+        clear[0] = TYPE_HELLO;
+        clear[1..1 + NONCE_LEN].copy_from_slice(&self.local_nonce);
+        let end = 1 + NONCE_LEN;
+        let crc = crc16_ccitt_false(&clear[..end]);
+        clear[end..end + 2].copy_from_slice(&crc.to_le_bytes());
+        let block_len = cobs_encode(&clear, out)?;
+        out[block_len] = 0;
+        Ok(block_len + 1)
+    }
+
+    /// Seals one data message into a complete wire frame. Requires an
+    /// established session; every seal bumps the send counter.
+    pub fn seal(&mut self, msg: &Msg, out: &mut [u8]) -> Result<usize, Error> {
+        if out.len() < SECURE_MAX_FRAME_LEN {
+            return Err(Error::Overrun);
+        }
+        if matches!(self.state, SecureState::AwaitingPeerHello) {
+            return Err(Error::NotEstablished);
+        }
+        self.send_counter += 1;
+        let counter = self.send_counter;
+        let (key, prefix) = match &mut self.state {
+            SecureState::Established(keys) => keys.send_half(self.role),
+            SecureState::AwaitingPeerHello => return Err(Error::NotEstablished),
+        };
+        // Wire layout: [type][counter][ciphertext][tag][crc], then COBS.
+        let mut clear = [0u8; SECURE_MAX_MSG_LEN];
+        let body_len = msg.write_body(&mut clear);
+        let mut block = [0u8; SECURE_MAX_MSG_LEN];
+        block[0] = clear[0];
+        block[1..1 + COUNTER_WIRE_LEN].copy_from_slice(&counter.to_be_bytes());
+        block[1 + COUNTER_WIRE_LEN..1 + COUNTER_WIRE_LEN + body_len]
+            .copy_from_slice(&clear[..body_len]);
+        let nonce = build_nonce(prefix, counter);
+        let mut aad = [0u8; 1 + COUNTER_WIRE_LEN];
+        aad[0] = block[0];
+        aad[1..].copy_from_slice(&counter.to_be_bytes());
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        let tag = cipher
+            .encrypt_in_place_detached(
+                &Nonce::from(nonce),
+                &aad,
+                &mut block[1 + COUNTER_WIRE_LEN..1 + COUNTER_WIRE_LEN + body_len],
+            )
+            .map_err(|_| Error::Crypto)?;
+        let end = 1 + COUNTER_WIRE_LEN + body_len + TAG_LEN;
+        block[end - TAG_LEN..end].copy_from_slice(&tag);
+        let crc = crc16_ccitt_false(&block[..end]);
+        block[end..end + 2].copy_from_slice(&crc.to_le_bytes());
+        let block_len = cobs_encode(&block[..end + 2], out)?;
+        out[block_len] = 0;
+        Ok(block_len + 1)
+    }
+
+    /// Consumes one chunk of raw USB bytes (HELLO handling, sealed frames,
+    /// resync — same accumulator discipline as [`Decoder::feed`]).
+    pub fn feed(&mut self, data: &[u8]) {
+        for &byte in data {
+            if byte == 0 {
+                if self.overflowing {
+                    self.overflowing = false;
+                    self.dropped += 1;
+                } else {
+                    self.finish_block();
+                }
+                self.acc.clear();
+            } else if self.overflowing {
+                // Discarded until the delimiter resynchronizes the stream.
+            } else if self.acc.len() == DECODER_ACC_CAP {
+                self.overflowing = true;
+            } else {
+                // Cannot fail: capacity was checked one branch above.
+                let _ = self.acc.push(byte);
+            }
+        }
+    }
+
+    /// Pops the oldest opened message, if any.
+    pub fn pop(&mut self) -> Option<Msg> {
+        self.queue.pop_front()
+    }
+
+    /// Number of frames dropped (garbage, corrupt, oversize, replay,
+    /// queue overflow) since construction.
+    pub const fn dropped(&self) -> u32 {
+        self.dropped
+    }
+
+    /// CRC-checks and routes one accumulated block.
+    fn finish_block(&mut self) {
+        if self.acc.is_empty() {
+            return;
+        }
+        let mut clear = [0u8; SECURE_MAX_MSG_LEN];
+        let len = match cobs_decode(&self.acc, &mut clear) {
+            Ok(len) if len >= 3 => len,
+            _ => {
+                self.dropped += 1;
+                return;
+            }
+        };
+        let expected = u16::from_le_bytes([clear[len - 2], clear[len - 1]]);
+        if crc16_ccitt_false(&clear[..len - 2]) != expected {
+            self.dropped += 1;
+            return;
+        }
+        let ty = clear[0];
+        match ty {
+            TYPE_HELLO => self.on_hello(&clear[1..len - 2]),
+            TYPE_RX | TYPE_TX_REQ | TYPE_TX_RESULT | TYPE_PING | TYPE_PONG => {
+                self.on_sealed(ty, &mut clear, len);
+            }
+            _ => self.dropped += 1,
+        }
+    }
+
+    /// (Re)establishes the session from a peer HELLO; last HELLO pair wins.
+    fn on_hello(&mut self, body: &[u8]) {
+        let peer_nonce: [u8; NONCE_LEN] = match body.try_into() {
+            Ok(nonce) => nonce,
+            Err(_) => {
+                self.dropped += 1;
+                return;
+            }
+        };
+        let (host_nonce, head_nonce) = match self.role {
+            Role::Host => (&self.local_nonce, &peer_nonce),
+            Role::Head => (&peer_nonce, &self.local_nonce),
+        };
+        match DirectionalKeys::derive(&self.psk, host_nonce, head_nonce) {
+            Ok(keys) => {
+                self.state = SecureState::Established(keys);
+                // Fresh session: counters restart, stale state cannot leak.
+                self.send_counter = 0;
+                self.recv_last = 0;
+            }
+            Err(_) => self.dropped += 1,
+        }
+    }
+
+    /// Opens one sealed data message: tag verification FIRST, then the
+    /// strict replay check, then the watermark advance.
+    ///
+    /// `clear[0..len]` holds the CRC-checked wire message
+    /// `[type][counter][ciphertext][tag][crc]`; the ciphertext is decrypted
+    /// in place.
+    fn on_sealed(&mut self, ty: u8, clear: &mut [u8; SECURE_MAX_MSG_LEN], len: usize) {
+        let (key, prefix) = match &self.state {
+            SecureState::Established(keys) => keys.recv_half(self.role),
+            SecureState::AwaitingPeerHello => {
+                self.dropped += 1;
+                return;
+            }
+        };
+        let body_start = 1 + COUNTER_WIRE_LEN;
+        let body_end = len - 2; // strip CRC
+        if body_end < body_start + TAG_LEN {
+            self.dropped += 1;
+            return;
+        }
+        let counter = u64::from_be_bytes(clear[1..body_start].try_into().expect("8 bytes"));
+        let mut nonce = build_nonce(prefix, counter);
+        let mut aad = [0u8; 1 + COUNTER_WIRE_LEN];
+        aad[0] = ty;
+        aad[1..].copy_from_slice(&counter.to_be_bytes());
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&clear[body_end - TAG_LEN..body_end]);
+        let ct_end = body_end - TAG_LEN;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        let open = cipher.decrypt_in_place_detached(
+            &Nonce::from(nonce),
+            &aad,
+            &mut clear[body_start..ct_end],
+            Tag::from_slice(&tag),
+        );
+        nonce.zeroize();
+        if open.is_err() {
+            // Wrong key or tampered frame: watermark untouched.
+            self.dropped += 1;
+            return;
+        }
+        if counter <= self.recv_last {
+            // Replay (or late duplicate): watermark untouched.
+            self.dropped += 1;
+            return;
+        }
+        self.recv_last = counter;
+        // Defense in depth: the decrypted type must match the clear type.
+        if clear[body_start] != ty {
+            self.dropped += 1;
+            return;
+        }
+        match parse_body(ty, &clear[body_start + 1..ct_end]) {
+            Ok(msg) => {
+                if self.queue.push_back(msg).is_err() {
+                    self.dropped += 1;
+                }
+            }
+            Err(_) => self.dropped += 1,
+        }
     }
 }
