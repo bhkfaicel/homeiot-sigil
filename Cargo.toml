@@ -47,6 +47,20 @@ gateway = ["session"]
 # It is never implied by another feature, so plain `sensor` or `gateway`
 # builds carry zero OTA code.
 ota = ["dep:sha2"]
+#
+# `usbserial` enables the USB-serial link tier between the gateway host and
+# the SAMD21 radio head: plain COBS+CRC framing plus the PSK-secured channel.
+# Like `ota`, it is never implied by another feature, so plain role builds
+# carry zero usbserial code; `usbserial` alone is a supported build shape
+# (that is what the head firmware compiles).
+usbserial = [
+    "dep:chacha20poly1305",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:zeroize",
+    "dep:subtle",
+    "dep:heapless",
+]
 
 [dependencies]
 # Cryptographic primitives

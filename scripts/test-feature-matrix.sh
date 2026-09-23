@@ -15,8 +15,12 @@
 #                          digest) without any protocol engine.
 #   - sensor,ota:          SUPPORTED. Adds the OTA receive half.
 #   - gateway,ota:         SUPPORTED. Adds the OTA send half.
+#   - usbserial:           SUPPORTED. USB-serial link tier to the SAMD21
+#                          radio head (plain framing + secured channel).
+#   - gateway,usbserial:   SUPPORTED. Gateway host build consuming the head.
 #   - --all-features:      SUPPORTED. Future-facing superset gate (covers the
-#                          dual-role build with both OTA halves).
+#                          dual-role build with both OTA halves and the
+#                          usbserial tier).
 #
 # Fixture disposition: no separate feature-matrix fixture files exist and
 # none are required. Every supported configuration is exercised end-to-end
@@ -120,6 +124,12 @@ expect_supported \
 expect_supported \
     "gateway,ota tests" \
     cargo test --locked --no-default-features --features gateway,ota
+expect_supported \
+    "usbserial shared-tier tests" \
+    cargo test --locked --no-default-features --features usbserial
+expect_supported \
+    "gateway,usbserial tests" \
+    cargo test --locked --no-default-features --features gateway,usbserial
 expect_supported \
     "all-features tests" \
     cargo test --locked --all-features
