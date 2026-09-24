@@ -7,6 +7,19 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `usbserial`: the `TX_RESULT` message now enforces an exact one-byte body
+  like every other message type. Frames with trailing bytes are dropped as
+  malformed instead of silently accepted; no legitimate peer emits them (the
+  encoder always writes exactly one status byte) and the wire format is
+  unchanged.
+
+### Fixed
+
+- `usbserial`: corrected the `TX_RESULT` type-constant doc comment — the
+  completion report flows head → host, matching the message-types table.
+
 ## [1.3.0] - 2026-09-24
 
 - Add the USB-serial link tier (`src/usbserial`) behind the new `usbserial`

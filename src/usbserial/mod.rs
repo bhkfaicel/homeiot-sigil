@@ -90,7 +90,7 @@ const DECODER_QUEUE_CAP: usize = 8;
 pub const TYPE_RX: u8 = 0x01;
 /// Link message type: transmit request (host → head).
 pub const TYPE_TX_REQ: u8 = 0x02;
-/// Link message type: transmit result (head → head completion report).
+/// Link message type: transmit result (head → host completion report).
 pub const TYPE_TX_RESULT: u8 = 0x03;
 /// Link message type: health probe (host → head).
 pub const TYPE_PING: u8 = 0x04;
@@ -437,8 +437,13 @@ fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, Error> {
             })
         }
         TYPE_TX_RESULT => {
-            let status = *body.first().ok_or(Error::Malformed)?;
-            Ok(Msg::TxResult { status })
+            // Exact-body rule like every sibling type: the encoder writes
+            // exactly one status byte, so any trailing byte is malformed
+            // (status itself stays unvalidated for head forward-compat).
+            if body.len() != 1 {
+                return Err(Error::Malformed);
+            }
+            Ok(Msg::TxResult { status: body[0] })
         }
         TYPE_PING if body.is_empty() => Ok(Msg::Ping),
         TYPE_PONG if body.is_empty() => Ok(Msg::Pong),
@@ -446,7 +451,7 @@ fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, Error> {
     }
 }
 
-// ======================= Secure profile (opt-in) ==========================
+// Secure profile (opt-in)
 //
 // PSK-authenticated AEAD channel layered on the same framing. Wire layout of
 // a sealed data message (types 0x01..=0x05):

@@ -247,6 +247,27 @@ fn unknown_type_and_short_bodies_are_malformed() {
 }
 
 #[test]
+fn tx_result_with_trailing_byte_is_malformed() {
+    // Crafted clear TX_RESULT with a valid CRC but one trailing extra byte
+    // past the single status byte: the exact-body rule must drop the frame
+    // instead of silently ignoring trailing bytes.
+    let mut clear = [0u8; 8];
+    clear[0] = TYPE_TX_RESULT;
+    clear[1] = TX_STATUS_OK;
+    clear[2] = 0x42;
+    let crc = crc16_ccitt_false(&clear[..3]);
+    clear[3] = crc as u8;
+    clear[4] = (crc >> 8) as u8;
+    let mut block = [0u8; 16];
+    let len = cobs_encode(&clear[..5], &mut block).expect("fits");
+    block[len] = 0;
+    let mut decoder = Decoder::new();
+    decoder.feed(&block[..len + 1]);
+    assert_eq!(decoder.dropped(), 1);
+    assert_eq!(decoder.pop(), None);
+}
+
+#[test]
 fn decoder_ram_footprint_is_bounded() {
     // Regression bound in the crate convention: the decoder is meant to be
     // instantiated once per direction on RAM-constrained targets. The queue
@@ -258,7 +279,7 @@ fn decoder_ram_footprint_is_bounded() {
     );
 }
 
-// ===================== Secure profile (opt-in) tests ======================
+// Secure profile (opt-in) tests
 
 use super::{
     COUNTER_WIRE_LEN, HELLO_FRAME_MAX, PSK_LEN, Role, SECURE_MAX_FRAME_LEN, SECURE_MAX_MSG_LEN,
