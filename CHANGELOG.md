@@ -14,6 +14,10 @@ and this project adheres to semantic versioning.
   malformed instead of silently accepted; no legitimate peer emits them (the
   encoder always writes exactly one status byte) and the wire format is
   unchanged.
+- `usbserial`: the feature no longer activates the optional `subtle`
+  dependency, which no usbserial code uses. `subtle` still reaches those
+  builds transitively via `chacha20poly1305` and remains a direct dependency
+  of the `session` feature, so all builds are unchanged.
 
 ### Fixed
 

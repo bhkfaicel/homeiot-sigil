@@ -58,7 +58,6 @@ usbserial = [
     "dep:hkdf",
     "dep:sha2",
     "dep:zeroize",
-    "dep:subtle",
     "dep:heapless",
 ]
 
