@@ -504,3 +504,92 @@ fn secure_channel_ram_footprint_is_bounded() {
         size_of::<SecureChannel>()
     );
 }
+
+#[test]
+fn secure_max_payload_roundtrips_both_directions() {
+    // Regression: the secure receive accumulator must hold the SEALED
+    // frame bound (290-byte COBS blocks), not the plain 265-byte one — a
+    // max-size sealed RX (289 wire bytes) was silently dropped before.
+    let mut host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let mut head = SecureChannel::new(Role::Head, &PSK_A, &nonce(2));
+    let mut buf = [0u8; HELLO_FRAME_MAX];
+    let n = host.hello_frame(&mut buf).expect("hello fits");
+    head.feed(&buf[..n]);
+    let n = head.hello_frame(&mut buf).expect("hello fits");
+    host.feed(&buf[..n]);
+
+    // Head → host: max-size RX payload.
+    let rx_max = rx(MAX_RADIO_PAYLOAD);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = head.seal(&rx_max, &mut out).expect("sealed rx fits");
+    assert_eq!(
+        host.dropped(),
+        0,
+        "host must not drop the sealed max RX (wire len {n})"
+    );
+    host.feed(&out[..n]);
+
+    assert_eq!(
+        host.pop(),
+        Some(rx_max),
+        "max-size sealed RX must roundtrip"
+    );
+
+    // Host → head: max-size TX_REQ payload.
+    let tx_max = Msg::TxReq {
+        payload: Payload::from_slice(&[0x5Cu8; MAX_RADIO_PAYLOAD]).expect("fits"),
+    };
+    let n = host.seal(&tx_max, &mut out).expect("sealed tx fits");
+    head.feed(&out[..n]);
+    assert_eq!(
+        head.pop(),
+        Some(tx_max),
+        "max-size sealed TX_REQ must roundtrip"
+    );
+    assert_eq!(host.dropped(), 0);
+    assert_eq!(head.dropped(), 0);
+}
+
+#[test]
+fn secure_fresh_host_channel_establishes_against_established_head() {
+    // End-to-end reconnect shape: the head stays up while the HOST channel
+    // is rebuilt from scratch (host reconnect / process restart). The
+    // fresh host HELLO re-derives the head keys (last HELLO wins); the
+    // head answers via take_peer_hello_seen so the new host channel can
+    // establish; traffic flows again.
+    let mut head = SecureChannel::new(Role::Head, &PSK_A, &nonce(9));
+
+    // First host session establishes, then goes away (reconnect).
+    let mut host_a = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let mut buf = [0u8; HELLO_FRAME_MAX];
+    let n = host_a.hello_frame(&mut buf).expect("fits");
+    head.feed(&buf[..n]);
+    let n = head.hello_frame(&mut buf).expect("fits");
+    host_a.feed(&buf[..n]);
+    assert!(head.is_established());
+    drop(host_a);
+
+    // Fresh host channel (new nonce — the reconnect shape).
+    let mut host_b = SecureChannel::new(Role::Host, &PSK_A, &nonce(42));
+    let n = host_b.hello_frame(&mut buf).expect("fits");
+    head.feed(&buf[..n]);
+    assert!(
+        head.take_peer_hello_seen(),
+        "the head must see the fresh host HELLO and answer it"
+    );
+    let n = head.hello_frame(&mut buf).expect("fits");
+    host_b.feed(&buf[..n]);
+    assert!(
+        host_b.is_established(),
+        "the fresh host channel must establish against the established head"
+    );
+
+    // Traffic flows on the new session.
+    let msg = Msg::TxReq {
+        payload: Payload::from_slice(b"post-reconnect").expect("fits"),
+    };
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host_b.seal(&msg, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(msg));
+}

@@ -501,6 +501,10 @@ const DIRECTIONAL_HALF: usize = KEY_LEN + PREFIX_LEN;
 const OKM_LEN: usize = DIRECTIONAL_HALF * 2;
 const HKDF_INFO: &[u8] = b"sigil-usbserial-v1";
 
+/// Accumulator capacity of the secure receive path: the worst-case COBS
+/// block of a sealed message.
+const SECURE_DECODER_ACC_CAP: usize = SECURE_MAX_MSG_LEN + SECURE_MAX_MSG_LEN.div_ceil(254) + 1;
+
 /// Worst-case clear sealed message: type + counter + Rx worst body + tag
 /// + CRC.
 const SECURE_MAX_MSG_LEN: usize =
@@ -627,12 +631,18 @@ pub struct SecureChannel {
     send_counter: u64,
     /// Highest accepted receive counter (0 = none accepted this session).
     recv_last: u64,
-    /// Bytes of the current, not-yet-delimited block (same accumulator
-    /// discipline as [`Decoder`]).
-    acc: Vec<u8, DECODER_ACC_CAP>,
+    /// Bytes of the current, not-yet-delimited block. The bound is the
+    /// SEALED frame maximum ([`SECURE_MAX_BLOCK_LEN`], 290 bytes), NOT the
+    /// plain one: a max-size sealed RX reaches 289 wire bytes and a plain
+    /// 265-byte accumulator would silently drop payloads ≥ 233 bytes.
+    acc: Vec<u8, SECURE_DECODER_ACC_CAP>,
     overflowing: bool,
     dropped: u32,
     queue: heapless::Deque<Msg, DECODER_QUEUE_CAP>,
+    /// Sticky flag: a peer HELLO arrived since the last
+    /// [`SecureChannel::take_peer_hello_seen`]. Firmware answers it with
+    /// its own HELLO so a (re)connecting host can establish.
+    peer_hello_seen: bool,
 }
 
 impl core::fmt::Debug for SecureChannel {
@@ -672,6 +682,7 @@ impl SecureChannel {
             overflowing: false,
             dropped: 0,
             queue: heapless::Deque::new(),
+            peer_hello_seen: false,
         }
     }
 
@@ -755,7 +766,7 @@ impl SecureChannel {
                 self.acc.clear();
             } else if self.overflowing {
                 // Discarded until the delimiter resynchronizes the stream.
-            } else if self.acc.len() == DECODER_ACC_CAP {
+            } else if self.acc.len() == SECURE_DECODER_ACC_CAP {
                 self.overflowing = true;
             } else {
                 // Cannot fail: capacity was checked one branch above.
@@ -767,6 +778,15 @@ impl SecureChannel {
     /// Pops the oldest opened message, if any.
     pub fn pop(&mut self) -> Option<Msg> {
         self.queue.pop_front()
+    }
+
+    /// Returns and clears the sticky peer-HELLO flag. Firmware calls this
+    /// after draining the channel: `true` means a peer HELLO arrived and
+    /// the local HELLO must be sent in answer (request/response cadence —
+    /// required for a fresh host channel to establish against an
+    /// already-established head after any host-side reconnect).
+    pub fn take_peer_hello_seen(&mut self) -> bool {
+        core::mem::replace(&mut self.peer_hello_seen, false)
     }
 
     /// Number of frames dropped (garbage, corrupt, oversize, replay,
@@ -822,6 +842,7 @@ impl SecureChannel {
                 // Fresh session: counters restart, stale state cannot leak.
                 self.send_counter = 0;
                 self.recv_last = 0;
+                self.peer_hello_seen = true;
             }
             Err(_) => self.dropped += 1,
         }
