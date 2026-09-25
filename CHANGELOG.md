@@ -9,6 +9,14 @@ and this project adheres to semantic versioning.
 
 ### Changed
 
+- `usbserial`: `Decoder` and `SecureChannel` now share one private block
+  accumulator (byte loop until the `0x00` delimiter, oversize discard and
+  delimiter resync) instead of two hand-synced copies of the same state
+  machine. The accumulator only reports closed-block, oversize-block and
+  idle-delimiter events; each type keeps its single drop counter and its own
+  frame routing, so behavior is unchanged. The secure receive capacity is now
+  declared as an alias of the sealed-frame block bound instead of re-deriving
+  the same worst-case formula.
 - `usbserial`: `SecureChannel::seal` now refuses to seal once its send counter
   reaches `u64::MAX` with the new `Error::CounterExhausted` variant instead of
   silently wrapping into AEAD nonce reuse, and commits the counter only after

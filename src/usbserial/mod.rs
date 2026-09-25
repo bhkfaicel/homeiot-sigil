@@ -309,6 +309,86 @@ pub fn cobs_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
     Ok(dst_len)
 }
 
+/// Event reported by [`BlockAcc`] when a `0x00` delimiter closes the
+/// current block.
+#[derive(Debug)]
+enum BlockEvent {
+    /// A non-empty block closed; its bytes are readable via
+    /// [`BlockAcc::bytes`] until the owner clears the accumulator.
+    Closed,
+    /// The delimiter closes an oversized garbage block: its bytes were
+    /// already discarded and the stream resynchronizes here.
+    OversizeClosed,
+    /// Stray delimiter over an empty accumulator (idle pattern or
+    /// post-resync): not an error, nothing to route.
+    Idle,
+}
+
+/// Shared receive-side block accumulator: gathers stream bytes until the
+/// `0x00` delimiter, discarding oversized garbage blocks (the stream
+/// resynchronizes at the next delimiter). It owns only the byte loop and
+/// reports [`BlockEvent`]s; drop counting stays with the embedding type,
+/// which maps events onto its single `dropped` counter and routes closed
+/// blocks through its own `finish_block`.
+#[derive(Debug)]
+struct BlockAcc<const CAP: usize> {
+    /// Bytes of the current, not-yet-delimited block.
+    acc: Vec<u8, CAP>,
+    /// Set when the current block exceeded `CAP`: further bytes are
+    /// discarded until the next delimiter (resync).
+    overflowing: bool,
+}
+
+impl<const CAP: usize> BlockAcc<CAP> {
+    /// Creates an empty accumulator.
+    const fn new() -> Self {
+        Self {
+            acc: Vec::new(),
+            overflowing: false,
+        }
+    }
+
+    /// Consumes one stream byte; returns `Some` exactly when a delimiter
+    /// closed a block. On [`BlockEvent::Closed`] the block bytes stay
+    /// readable until the owner calls [`BlockAcc::clear`].
+    fn feed_byte(&mut self, byte: u8) -> Option<BlockEvent> {
+        if byte == 0 {
+            if self.overflowing {
+                // The delimiter closes an oversized garbage block.
+                self.overflowing = false;
+                self.acc.clear();
+                Some(BlockEvent::OversizeClosed)
+            } else if self.acc.is_empty() {
+                // Stray delimiter (idle pattern or post-resync).
+                Some(BlockEvent::Idle)
+            } else {
+                Some(BlockEvent::Closed)
+            }
+        } else if self.overflowing {
+            // Discarded until the delimiter resynchronizes the stream.
+            None
+        } else if self.acc.len() == CAP {
+            // One more byte would exceed any legal block.
+            self.overflowing = true;
+            None
+        } else {
+            // Cannot fail: capacity was checked one branch above.
+            let _ = self.acc.push(byte);
+            None
+        }
+    }
+
+    /// Bytes of the block closed by the last [`BlockEvent::Closed`].
+    fn bytes(&self) -> &[u8] {
+        &self.acc
+    }
+
+    /// Discards the closed block, ready for the next one.
+    fn clear(&mut self) {
+        self.acc.clear();
+    }
+}
+
 /// Streaming frame decoder for the USB byte stream.
 ///
 /// Feed raw USB bytes ([`Decoder::feed`]) in arbitrary chunks; complete
@@ -318,11 +398,8 @@ pub fn cobs_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
 /// stream resynchronizes at the next `0x00`.
 #[derive(Debug)]
 pub struct Decoder {
-    /// Bytes of the current, not-yet-delimited block.
-    acc: Vec<u8, DECODER_ACC_CAP>,
-    /// Set when the current block exceeded [`DECODER_ACC_CAP`]: bytes are
-    /// discarded until the next delimiter (resync).
-    overflowing: bool,
+    /// Shared receive accumulator: byte loop until the `0x00` delimiter.
+    acc: BlockAcc<DECODER_ACC_CAP>,
     /// Decoded messages waiting to be popped (FIFO: arrival order).
     queue: heapless::Deque<Msg, DECODER_QUEUE_CAP>,
     /// Frames dropped as garbage, corrupt or queue-overflow since creation.
@@ -339,8 +416,7 @@ impl Decoder {
     /// Creates an empty decoder.
     pub const fn new() -> Self {
         Self {
-            acc: Vec::new(),
-            overflowing: false,
+            acc: BlockAcc::new(),
             queue: heapless::Deque::new(),
             dropped: 0,
         }
@@ -349,23 +425,16 @@ impl Decoder {
     /// Consumes one chunk of raw USB bytes.
     pub fn feed(&mut self, data: &[u8]) {
         for &byte in data {
-            if byte == 0 {
-                if self.overflowing {
-                    // The delimiter closes an oversized garbage block.
-                    self.overflowing = false;
-                    self.dropped += 1;
-                } else {
+            match self.acc.feed_byte(byte) {
+                Some(BlockEvent::Closed) => {
                     self.finish_block();
+                    self.acc.clear();
                 }
-                self.acc.clear();
-            } else if self.overflowing {
-                // Discarded until the delimiter resynchronizes the stream.
-            } else if self.acc.len() == DECODER_ACC_CAP {
-                // One more byte would exceed any legal block.
-                self.overflowing = true;
-            } else {
-                // Cannot fail: capacity was checked one branch above.
-                let _ = self.acc.push(byte);
+                // Oversize block closed: the owner counts the drop on its
+                // single `dropped` counter; the stream already resynced.
+                Some(BlockEvent::OversizeClosed) => self.dropped += 1,
+                // Stray delimiter: not an error, nothing to route.
+                Some(BlockEvent::Idle) | None => {}
             }
         }
     }
@@ -381,14 +450,12 @@ impl Decoder {
         self.dropped
     }
 
-    /// Decodes and enqueues the accumulated block (the delimiter arrived).
+    /// Decodes and enqueues one closed, non-empty block. Stray delimiters
+    /// never reach this: the accumulator reports them as idle events.
     fn finish_block(&mut self) {
-        if self.acc.is_empty() {
-            // Stray delimiter (idle pattern or post-resync): not an error.
-            return;
-        }
         let mut clear = [0u8; MAX_MSG_LEN];
-        let decoded = cobs_decode(&self.acc, &mut clear).and_then(|len| parse_msg(&clear[..len]));
+        let decoded =
+            cobs_decode(self.acc.bytes(), &mut clear).and_then(|len| parse_msg(&clear[..len]));
         match decoded {
             Ok(msg) => {
                 // Full queue means the caller is not draining fast enough;
@@ -514,16 +581,15 @@ const DIRECTIONAL_HALF: usize = KEY_LEN + PREFIX_LEN;
 const OKM_LEN: usize = DIRECTIONAL_HALF * 2;
 const HKDF_INFO: &[u8] = b"sigil-usbserial-v1";
 
-/// Accumulator capacity of the secure receive path: the worst-case COBS
-/// block of a sealed message.
-const SECURE_DECODER_ACC_CAP: usize = SECURE_MAX_MSG_LEN + SECURE_MAX_MSG_LEN.div_ceil(254) + 1;
-
 /// Worst-case clear sealed message: type + counter + Rx worst body + tag
 /// + CRC.
 const SECURE_MAX_MSG_LEN: usize =
     1 + COUNTER_WIRE_LEN + (1 + 2 + 1 + 1 + MAX_RADIO_PAYLOAD) + TAG_LEN + 2;
 /// Worst-case COBS block of a sealed message.
 const SECURE_MAX_BLOCK_LEN: usize = SECURE_MAX_MSG_LEN + SECURE_MAX_MSG_LEN.div_ceil(254) + 1;
+/// Accumulator capacity of the secure receive path: an alias of the
+/// worst-case COBS block of a sealed message, never a re-derived formula.
+const SECURE_DECODER_ACC_CAP: usize = SECURE_MAX_BLOCK_LEN;
 /// Worst-case wire frame of a sealed message.
 pub const SECURE_MAX_FRAME_LEN: usize = SECURE_MAX_BLOCK_LEN + 1;
 /// Worst-case wire frame of a HELLO: `1+16+2` clear, COBS + delimiter.
@@ -644,12 +710,12 @@ pub struct SecureChannel {
     send_counter: u64,
     /// Highest accepted receive counter (0 = none accepted this session).
     recv_last: u64,
-    /// Bytes of the current, not-yet-delimited block. The bound is the
-    /// SEALED frame maximum ([`SECURE_MAX_BLOCK_LEN`], 290 bytes), NOT the
-    /// plain one: a max-size sealed RX reaches 289 wire bytes and a plain
-    /// 265-byte accumulator would silently drop payloads ≥ 233 bytes.
-    acc: Vec<u8, SECURE_DECODER_ACC_CAP>,
-    overflowing: bool,
+    /// Shared receive accumulator (byte loop until the `0x00` delimiter).
+    /// The bound is the SEALED frame maximum ([`SECURE_MAX_BLOCK_LEN`],
+    /// 290 bytes), NOT the plain one: a max-size sealed RX reaches 289
+    /// wire bytes and a plain 265-byte accumulator would silently drop
+    /// payloads ≥ 233 bytes.
+    acc: BlockAcc<SECURE_DECODER_ACC_CAP>,
     dropped: u32,
     queue: heapless::Deque<Msg, DECODER_QUEUE_CAP>,
     /// Sticky flag: a peer HELLO arrived since the last
@@ -691,8 +757,7 @@ impl SecureChannel {
             state: SecureState::AwaitingPeerHello,
             send_counter: 0,
             recv_last: 0,
-            acc: Vec::new(),
-            overflowing: false,
+            acc: BlockAcc::new(),
             dropped: 0,
             queue: heapless::Deque::new(),
             peer_hello_seen: false,
@@ -775,24 +840,19 @@ impl SecureChannel {
     }
 
     /// Consumes one chunk of raw USB bytes (HELLO handling, sealed frames,
-    /// resync — same accumulator discipline as [`Decoder::feed`]).
+    /// resync — the same shared block accumulator as [`Decoder::feed`]).
     pub fn feed(&mut self, data: &[u8]) {
         for &byte in data {
-            if byte == 0 {
-                if self.overflowing {
-                    self.overflowing = false;
-                    self.dropped += 1;
-                } else {
+            match self.acc.feed_byte(byte) {
+                Some(BlockEvent::Closed) => {
                     self.finish_block();
+                    self.acc.clear();
                 }
-                self.acc.clear();
-            } else if self.overflowing {
-                // Discarded until the delimiter resynchronizes the stream.
-            } else if self.acc.len() == SECURE_DECODER_ACC_CAP {
-                self.overflowing = true;
-            } else {
-                // Cannot fail: capacity was checked one branch above.
-                let _ = self.acc.push(byte);
+                // Oversize block closed: the owner counts the drop on its
+                // single `dropped` counter; the stream already resynced.
+                Some(BlockEvent::OversizeClosed) => self.dropped += 1,
+                // Stray delimiter: not an error, nothing to route.
+                Some(BlockEvent::Idle) | None => {}
             }
         }
     }
@@ -817,13 +877,11 @@ impl SecureChannel {
         self.dropped
     }
 
-    /// CRC-checks and routes one accumulated block.
+    /// CRC-checks and routes one closed, non-empty block. Stray delimiters
+    /// never reach this: the accumulator reports them as idle events.
     fn finish_block(&mut self) {
-        if self.acc.is_empty() {
-            return;
-        }
         let mut clear = [0u8; SECURE_MAX_MSG_LEN];
-        let len = match cobs_decode(&self.acc, &mut clear) {
+        let len = match cobs_decode(self.acc.bytes(), &mut clear) {
             Ok(len) if len >= 3 => len,
             _ => {
                 self.dropped += 1;

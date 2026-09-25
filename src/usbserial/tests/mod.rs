@@ -509,6 +509,26 @@ fn secure_resync_after_garbage() {
 }
 
 #[test]
+fn secure_oversize_block_resyncs_and_recovers() {
+    // Real secure-path oversize: a non-empty block strictly longer than
+    // the sealed-frame accumulator bound cannot be a legal frame. The
+    // channel drops it once at the delimiter and still decodes the next
+    // sealed frame (the short garbage in `secure_resync_after_garbage`
+    // exercises the CRC-drop path, never this overflow path).
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut wire = HeapVec::<u8, 512>::new();
+    wire.extend([0x77u8; SECURE_DECODER_ACC_CAP + 6]);
+    wire.push(0).expect("delimiter closes the oversize block");
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let n = host.seal(&Msg::Ping, &mut out).expect("seal fits");
+    wire.extend_from_slice(&out[..n]).expect("fits");
+    head.feed(&wire);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    assert_eq!(head.pop(), None);
+}
+
+#[test]
 fn secure_secrets_never_rendered() {
     // The PSK (0xA5 = 165 decimal) and any key material must not leak
     // through Debug formatting.
