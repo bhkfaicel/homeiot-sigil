@@ -39,6 +39,11 @@ and this project adheres to semantic versioning.
   so a future `no_std` or host-build regression surfaces in this crate's
   gate instead of only in the consuming firmware repositories.
 
+- A dev-only `usbserial` performance-measurement test module mirrors the
+  existing `core` AEAD harness: deterministic payloads, best-of-N host
+  timing for the plain and sealed frame round-trips, and printed `size_of`
+  source facts. It changes no production code.
+
 ### Changed
 
 - `usbserial`: the module-local error enum `Error` is renamed to
@@ -69,6 +74,11 @@ and this project adheres to semantic versioning.
   dependency, which no usbserial code uses. `subtle` still reaches those
   builds transitively via `chacha20poly1305` and remains a direct dependency
   of the `session` feature, so all builds are unchanged.
+- `usbserial`: `SecureChannel::seal` now writes the message body directly
+  into the outgoing wire block instead of staging it in a second 287-byte
+  buffer and copying it in, removing 287 bytes of transient stack and one
+  full-body copy per sealed frame on the hot TX path. The frame layout and
+  wire format are unchanged, so every sealed frame stays bit-identical.
 
 ### Fixed
 
