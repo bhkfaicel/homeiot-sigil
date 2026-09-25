@@ -36,8 +36,8 @@
 //!
 //! | id     | name      | direction   | body                                        |
 //! |--------|-----------|-------------|---------------------------------------------|
-//! | `0x01` | RX        | head → host | rssi:i16LE ‖ snr:i8 ‖ len:u8 ‖ payload[len] |
-//! | `0x02` | TX_REQ    | host → head | len:u8 ‖ payload[len]                       |
+//! | `0x01` | RX        | head → host | rssi:i16LE ‖ snr:i8 ‖ len:u8 ‖ payload\[len\] |
+//! | `0x02` | TX_REQ    | host → head | len:u8 ‖ payload\[len\]                       |
 //! | `0x03` | TX_RESULT | head → host | status:u8 (0 = ok, 1 = radio error)         |
 //! | `0x04` | PING      | host → head | —                                           |
 //! | `0x05` | PONG      | head → host | —                                           |
@@ -104,7 +104,7 @@ pub const TX_STATUS_RADIO_ERROR: u8 = 1;
 
 /// Failure taxonomy of the framing layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
+pub enum UsbserialError {
     /// Destination buffer cannot hold the encoded/decoded bytes.
     Overrun,
     /// Input violates a structural rule (zero overhead byte, truncated
@@ -117,7 +117,7 @@ pub enum Error {
     /// The channel's send counter is exhausted (`u64::MAX`): sealing is
     /// refused deterministically instead of wrapping into AEAD nonce reuse
     /// under the same directional key. Re-establish the channel with a fresh
-    /// HELLO handshake. Distinct from [`Error::Crypto`] (an AEAD tag or
+    /// HELLO handshake. Distinct from [`UsbserialError::Crypto`] (an AEAD tag or
     /// cipher failure). New member of a plain `pub enum` (no
     /// `#[non_exhaustive]`): downstream exhaustive matches must gain an arm,
     /// which is a breaking change to ship with a major version bump.
@@ -161,9 +161,9 @@ impl Msg {
     /// Serializes one complete wire frame (COBS block + `0x00` delimiter)
     /// into `out`; returns the number of bytes written,
     /// `<= [`MAX_FRAME_LEN`]`.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, Error> {
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, UsbserialError> {
         if out.len() < MAX_FRAME_LEN {
-            return Err(Error::Overrun);
+            return Err(UsbserialError::Overrun);
         }
         let mut clear = [0u8; MAX_MSG_LEN];
         let clear_len = self.encode_clear(&mut clear);
@@ -242,10 +242,10 @@ pub fn crc16_ccitt_false(data: &[u8]) -> u16 {
 /// Encodes `src` into `dst` with COBS; returns the encoded length, which is
 /// at most `src.len() + src.len().div_ceil(254) + 1`. The output never
 /// contains `0x00`.
-pub fn cobs_encode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
+pub fn cobs_encode(src: &[u8], dst: &mut [u8]) -> Result<usize, UsbserialError> {
     let worst = src.len() + src.len().div_ceil(254) + 1;
     if dst.len() < worst {
-        return Err(Error::Overrun);
+        return Err(UsbserialError::Overrun);
     }
     // Every block is [code][data]: reserve the first code slot up front and
     // patch each overhead byte when its block closes.
@@ -279,7 +279,7 @@ pub fn cobs_encode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
 
 /// Decodes one COBS block back into `dst`; returns the decoded length.
 /// A block encoded by [`cobs_encode`] always round-trips.
-pub fn cobs_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
+pub fn cobs_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, UsbserialError> {
     let mut src_index = 0usize;
     let mut dst_len = 0usize;
     while src_index < src.len() {
@@ -287,11 +287,11 @@ pub fn cobs_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
         src_index += 1;
         if code == 0 {
             // A legal encoder never emits a zero overhead byte.
-            return Err(Error::Malformed);
+            return Err(UsbserialError::Malformed);
         }
         let block = code - 1;
         if src_index + block > src.len() || dst_len + block > dst.len() {
-            return Err(Error::Malformed);
+            return Err(UsbserialError::Malformed);
         }
         dst[dst_len..dst_len + block].copy_from_slice(&src[src_index..src_index + block]);
         dst_len += block;
@@ -300,7 +300,7 @@ pub fn cobs_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, Error> {
             // This block was terminated by a real zero byte: restore it.
             // The final block has no such trailing zero.
             if dst_len >= dst.len() {
-                return Err(Error::Malformed);
+                return Err(UsbserialError::Malformed);
             }
             dst[dst_len] = 0;
             dst_len += 1;
@@ -470,45 +470,45 @@ impl Decoder {
 }
 
 /// Parses one decoded clear message `[type][body][crc]`.
-fn parse_msg(decoded: &[u8]) -> Result<Msg, Error> {
+fn parse_msg(decoded: &[u8]) -> Result<Msg, UsbserialError> {
     if decoded.len() < 3 {
-        return Err(Error::Malformed);
+        return Err(UsbserialError::Malformed);
     }
     let (msg_bytes, crc_bytes) = decoded.split_at(decoded.len() - 2);
     let expected = u16::from_le_bytes([crc_bytes[0], crc_bytes[1]]);
     if crc16_ccitt_false(msg_bytes) != expected {
-        return Err(Error::Crc);
+        return Err(UsbserialError::Crc);
     }
-    let (ty, body) = msg_bytes.split_first().ok_or(Error::Malformed)?;
+    let (ty, body) = msg_bytes.split_first().ok_or(UsbserialError::Malformed)?;
     parse_body(*ty, body)
 }
 
 /// Parses one message body (type byte stripped, CRC already verified).
 /// Shared by the plain decoder and the secure open path (the decrypted
 /// plaintext has exactly this shape).
-fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, Error> {
+fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, UsbserialError> {
     match ty {
         TYPE_RX => {
             if body.len() < 4 {
-                return Err(Error::Malformed);
+                return Err(UsbserialError::Malformed);
             }
             let len = body[3] as usize;
             if body.len() != 4 + len {
-                return Err(Error::Malformed);
+                return Err(UsbserialError::Malformed);
             }
             Ok(Msg::Rx {
                 rssi: i16::from_le_bytes([body[0], body[1]]),
                 snr: body[2] as i8,
-                payload: Payload::from_slice(&body[4..]).map_err(|_| Error::Malformed)?,
+                payload: Payload::from_slice(&body[4..]).map_err(|_| UsbserialError::Malformed)?,
             })
         }
         TYPE_TX_REQ => {
-            let len = body.first().copied().ok_or(Error::Malformed)? as usize;
+            let len = body.first().copied().ok_or(UsbserialError::Malformed)? as usize;
             if body.len() != 1 + len {
-                return Err(Error::Malformed);
+                return Err(UsbserialError::Malformed);
             }
             Ok(Msg::TxReq {
-                payload: Payload::from_slice(&body[1..]).map_err(|_| Error::Malformed)?,
+                payload: Payload::from_slice(&body[1..]).map_err(|_| UsbserialError::Malformed)?,
             })
         }
         TYPE_TX_RESULT => {
@@ -516,13 +516,13 @@ fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, Error> {
             // exactly one status byte, so any trailing byte is malformed
             // (status itself stays unvalidated for head forward-compat).
             if body.len() != 1 {
-                return Err(Error::Malformed);
+                return Err(UsbserialError::Malformed);
             }
             Ok(Msg::TxResult { status: body[0] })
         }
         TYPE_PING if body.is_empty() => Ok(Msg::Ping),
         TYPE_PONG if body.is_empty() => Ok(Msg::Pong),
-        _ => Err(Error::Malformed),
+        _ => Err(UsbserialError::Malformed),
     }
 }
 
@@ -632,13 +632,14 @@ impl DirectionalKeys {
         psk: &[u8; PSK_LEN],
         host_nonce: &[u8; NONCE_LEN],
         head_nonce: &[u8; NONCE_LEN],
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, UsbserialError> {
         let mut salt = [0u8; NONCE_LEN * 2];
         salt[..NONCE_LEN].copy_from_slice(host_nonce);
         salt[NONCE_LEN..].copy_from_slice(head_nonce);
         let hk = Hkdf::<Sha256>::new(Some(&salt), psk);
         let mut okm = [0u8; OKM_LEN];
-        hk.expand(HKDF_INFO, &mut okm).map_err(|_| Error::Crypto)?;
+        hk.expand(HKDF_INFO, &mut okm)
+            .map_err(|_| UsbserialError::Crypto)?;
         let mut keys = Self {
             host_to_head_key: [0u8; KEY_LEN],
             host_to_head_prefix: [0u8; PREFIX_LEN],
@@ -771,9 +772,9 @@ impl SecureChannel {
 
     /// Serializes the local HELLO frame (clear, COBS + delimiter). Sent on
     /// link open; the peer's HELLO completes the handshake.
-    pub fn hello_frame(&self, out: &mut [u8]) -> Result<usize, Error> {
+    pub fn hello_frame(&self, out: &mut [u8]) -> Result<usize, UsbserialError> {
         if out.len() < HELLO_FRAME_MAX {
-            return Err(Error::Overrun);
+            return Err(UsbserialError::Overrun);
         }
         let mut clear = [0u8; NONCE_LEN + 3];
         clear[0] = TYPE_HELLO;
@@ -788,14 +789,14 @@ impl SecureChannel {
 
     /// Seals one data message into a complete wire frame. Requires an
     /// established session; every seal bumps the send counter. An exhausted
-    /// counter fails with [`Error::CounterExhausted`] and leaves the channel
+    /// counter fails with [`UsbserialError::CounterExhausted`] and leaves the channel
     /// untouched.
-    pub fn seal(&mut self, msg: &Msg, out: &mut [u8]) -> Result<usize, Error> {
+    pub fn seal(&mut self, msg: &Msg, out: &mut [u8]) -> Result<usize, UsbserialError> {
         if out.len() < SECURE_MAX_FRAME_LEN {
-            return Err(Error::Overrun);
+            return Err(UsbserialError::Overrun);
         }
         let SecureState::Established(keys) = &self.state else {
-            return Err(Error::NotEstablished);
+            return Err(UsbserialError::NotEstablished);
         };
         // The counter feeds the AEAD nonce: wrapping at `u64::MAX` would
         // silently reuse nonces under the same directional key, so refuse
@@ -805,7 +806,7 @@ impl SecureChannel {
         let counter = self
             .send_counter
             .checked_add(1)
-            .ok_or(Error::CounterExhausted)?;
+            .ok_or(UsbserialError::CounterExhausted)?;
         let (key, prefix) = keys.send_half(self.role);
         // Wire layout: [type][counter][ciphertext][tag][crc], then COBS.
         let mut clear = [0u8; SECURE_MAX_MSG_LEN];
@@ -826,7 +827,7 @@ impl SecureChannel {
                 &aad,
                 &mut block[1 + COUNTER_WIRE_LEN..1 + COUNTER_WIRE_LEN + body_len],
             )
-            .map_err(|_| Error::Crypto)?;
+            .map_err(|_| UsbserialError::Crypto)?;
         let end = 1 + COUNTER_WIRE_LEN + body_len + TAG_LEN;
         block[end - TAG_LEN..end].copy_from_slice(&tag);
         let crc = crc16_ccitt_false(&block[..end]);

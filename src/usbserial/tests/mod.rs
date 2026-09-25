@@ -204,7 +204,7 @@ fn cobs_known_vectors() {
     // 254 non-zero bytes: the 0xFF flush patch closes the full block, then
     // the final empty block emits its own code byte.
     let long = [0x42u8; 254];
-    assert_eq!(cobs_encode(&long, &mut out), Err(Error::Overrun)); // 8-byte buffer too small
+    assert_eq!(cobs_encode(&long, &mut out), Err(UsbserialError::Overrun)); // 8-byte buffer too small
     let mut big = [0xFFu8; 256];
     assert_eq!(cobs_encode(&long, &mut big), Ok(256));
     assert_eq!(big[0], 0xFF);
@@ -214,7 +214,10 @@ fn cobs_known_vectors() {
 #[test]
 fn cobs_decode_rejects_zero_code_byte() {
     let mut out = [0u8; 8];
-    assert_eq!(cobs_decode(&[0x00, 0x01], &mut out), Err(Error::Malformed));
+    assert_eq!(
+        cobs_decode(&[0x00, 0x01], &mut out),
+        Err(UsbserialError::Malformed)
+    );
 }
 
 #[test]
@@ -349,7 +352,10 @@ fn secure_handshake_and_data_roundtrip() {
 fn secure_seal_requires_established_session() {
     let mut host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
     let mut out = [0u8; SECURE_MAX_FRAME_LEN];
-    assert_eq!(host.seal(&Msg::Ping, &mut out), Err(Error::NotEstablished));
+    assert_eq!(
+        host.seal(&Msg::Ping, &mut out),
+        Err(UsbserialError::NotEstablished)
+    );
 }
 
 #[test]
@@ -360,7 +366,7 @@ fn seal_at_exhausted_counter_fails_without_advancing() {
     let mut out = [0u8; SECURE_MAX_FRAME_LEN];
     assert_eq!(
         host.seal(&tx_req(b"x"), &mut out),
-        Err(Error::CounterExhausted)
+        Err(UsbserialError::CounterExhausted)
     );
     // The failed seal must not advance the counter: a re-HELLO resets it
     // unconditionally, so only this direct readout pins the guarantee.

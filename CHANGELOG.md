@@ -9,6 +9,10 @@ and this project adheres to semantic versioning.
 
 ### Changed
 
+- `usbserial`: the module-local error enum `Error` is renamed to
+  `UsbserialError` for consistency with the `OtaError` naming precedent of
+  `src/core/ota`. No `Error` alias is kept: downstream code must switch to the
+  new name, which is a breaking change to ship with a major version bump.
 - `usbserial`: `Decoder` and `SecureChannel` now share one private block
   accumulator (byte loop until the `0x00` delimiter, oversize discard and
   delimiter resync) instead of two hand-synced copies of the same state
@@ -18,10 +22,10 @@ and this project adheres to semantic versioning.
   declared as an alias of the sealed-frame block bound instead of re-deriving
   the same worst-case formula.
 - `usbserial`: `SecureChannel::seal` now refuses to seal once its send counter
-  reaches `u64::MAX` with the new `Error::CounterExhausted` variant instead of
+  reaches `u64::MAX` with the new `UsbserialError::CounterExhausted` variant instead of
   silently wrapping into AEAD nonce reuse, and commits the counter only after
   the frame is fully sealed, so a failed seal leaves the channel untouched.
-  This variant is a new member of the plain `pub enum` `usbserial::Error`
+  This variant is a new member of the plain `pub enum` `usbserial::UsbserialError`
   (no `#[non_exhaustive]`): downstream exhaustive matches must gain an arm,
   which is a breaking change to ship with a major version bump.
 - `usbserial`: the `TX_RESULT` message now enforces an exact one-byte body
