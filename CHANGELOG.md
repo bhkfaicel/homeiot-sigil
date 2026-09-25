@@ -7,6 +7,15 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- The project gate (`scripts/test.sh`) now cross-compiles the `usbserial`
+  tier for its real targets: the SAMD21 head build (`--features usbserial`
+  on `thumbv6m-none-eabi`) and the gateway host build
+  (`--features gateway,usbserial` on `armv7-unknown-linux-gnueabihf`),
+  so a future `no_std` or host-build regression surfaces in this crate's
+  gate instead of only in the consuming firmware repositories.
+
 ### Changed
 
 - `usbserial`: the module-local error enum `Error` is renamed to

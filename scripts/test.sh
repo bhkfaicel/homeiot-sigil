@@ -18,9 +18,9 @@ cargo clippy --locked --no-default-features --features sensor -- -D warnings
 cargo clippy --locked --no-default-features --features gateway -- -D warnings
 # Authoritative feature-matrix gate: asserts the approved diagnostic for the
 # unsupported empty feature set and runs the locked test suites for the wire,
-# sensor, gateway, sensor,gateway, ota, sensor,ota, gateway,ota, and
-# all-features configurations. The matrix logic is owned exclusively by that
-# script; never duplicate it here.
+# sensor, gateway, sensor,gateway, ota, sensor,ota, gateway,ota, usbserial,
+# gateway,usbserial, and all-features configurations. The matrix logic is
+# owned exclusively by that script; never duplicate it here.
 bash scripts/test-feature-matrix.sh
 # Strict documentation gate: broken intra-doc links fail the release docs.
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
@@ -33,3 +33,7 @@ cargo check --locked --target armv7-unknown-linux-gnueabihf --no-default-feature
 # sender code (receive half only), and the gateway build the send half.
 cargo check --locked --target thumbv6m-none-eabi --no-default-features --features sensor,ota
 cargo check --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features gateway,ota
+# USB-serial tier on its real targets: usbserial alone is what the SAMD21 head
+# firmware compiles, and the gateway host links it with the gateway role.
+cargo check --locked --target thumbv6m-none-eabi --no-default-features --features usbserial
+cargo check --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features gateway,usbserial
