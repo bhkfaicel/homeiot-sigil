@@ -9,6 +9,13 @@ and this project adheres to semantic versioning.
 
 ### Changed
 
+- `usbserial`: `SecureChannel::seal` now refuses to seal once its send counter
+  reaches `u64::MAX` with the new `Error::CounterExhausted` variant instead of
+  silently wrapping into AEAD nonce reuse, and commits the counter only after
+  the frame is fully sealed, so a failed seal leaves the channel untouched.
+  This variant is a new member of the plain `pub enum` `usbserial::Error`
+  (no `#[non_exhaustive]`): downstream exhaustive matches must gain an arm,
+  which is a breaking change to ship with a major version bump.
 - `usbserial`: the `TX_RESULT` message now enforces an exact one-byte body
   like every other message type. Frames with trailing bytes are dropped as
   malformed instead of silently accepted; no legitimate peer emits them (the

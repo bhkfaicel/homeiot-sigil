@@ -353,6 +353,21 @@ fn secure_seal_requires_established_session() {
 }
 
 #[test]
+fn seal_at_exhausted_counter_fails_without_advancing() {
+    let (mut host, _head) = established_pair(&PSK_A, 1, 2);
+    // Child test module: pin the counter directly at its ceiling.
+    host.send_counter = u64::MAX;
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    assert_eq!(
+        host.seal(&tx_req(b"x"), &mut out),
+        Err(Error::CounterExhausted)
+    );
+    // The failed seal must not advance the counter: a re-HELLO resets it
+    // unconditionally, so only this direct readout pins the guarantee.
+    assert_eq!(host.send_counter, u64::MAX);
+}
+
+#[test]
 fn secure_corrupted_tag_rejected() {
     let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
     let mut out = [0u8; SECURE_MAX_FRAME_LEN];

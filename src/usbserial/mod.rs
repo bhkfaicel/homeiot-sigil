@@ -114,6 +114,14 @@ pub enum Error {
     Crc,
     /// Secure operation attempted before the HELLO handshake completed.
     NotEstablished,
+    /// The channel's send counter is exhausted (`u64::MAX`): sealing is
+    /// refused deterministically instead of wrapping into AEAD nonce reuse
+    /// under the same directional key. Re-establish the channel with a fresh
+    /// HELLO handshake. Distinct from [`Error::Crypto`] (an AEAD tag or
+    /// cipher failure). New member of a plain `pub enum` (no
+    /// `#[non_exhaustive]`): downstream exhaustive matches must gain an arm,
+    /// which is a breaking change to ship with a major version bump.
+    CounterExhausted,
     /// AEAD encryption/decryption failed (tag verification or cipher error).
     Crypto,
 }
@@ -714,20 +722,26 @@ impl SecureChannel {
     }
 
     /// Seals one data message into a complete wire frame. Requires an
-    /// established session; every seal bumps the send counter.
+    /// established session; every seal bumps the send counter. An exhausted
+    /// counter fails with [`Error::CounterExhausted`] and leaves the channel
+    /// untouched.
     pub fn seal(&mut self, msg: &Msg, out: &mut [u8]) -> Result<usize, Error> {
         if out.len() < SECURE_MAX_FRAME_LEN {
             return Err(Error::Overrun);
         }
-        if matches!(self.state, SecureState::AwaitingPeerHello) {
+        let SecureState::Established(keys) = &self.state else {
             return Err(Error::NotEstablished);
-        }
-        self.send_counter += 1;
-        let counter = self.send_counter;
-        let (key, prefix) = match &mut self.state {
-            SecureState::Established(keys) => keys.send_half(self.role),
-            SecureState::AwaitingPeerHello => return Err(Error::NotEstablished),
         };
+        // The counter feeds the AEAD nonce: wrapping at `u64::MAX` would
+        // silently reuse nonces under the same directional key, so refuse
+        // deterministically (fresh HELLO re-establishes the channel) instead.
+        // The bumped counter is committed only on the success path below, so
+        // a failed seal never advances it.
+        let counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
+        let (key, prefix) = keys.send_half(self.role);
         // Wire layout: [type][counter][ciphertext][tag][crc], then COBS.
         let mut clear = [0u8; SECURE_MAX_MSG_LEN];
         let body_len = msg.write_body(&mut clear);
@@ -754,6 +768,9 @@ impl SecureChannel {
         block[end..end + 2].copy_from_slice(&crc.to_le_bytes());
         let block_len = cobs_encode(&block[..end + 2], out)?;
         out[block_len] = 0;
+        // Success path only: the counter advances once the frame is fully
+        // built and encoded into `out`.
+        self.send_counter = counter;
         Ok(block_len + 1)
     }
 
