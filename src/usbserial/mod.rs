@@ -809,13 +809,14 @@ impl SecureChannel {
             .ok_or(UsbserialError::CounterExhausted)?;
         let (key, prefix) = keys.send_half(self.role);
         // Wire layout: [type][counter][ciphertext][tag][crc], then COBS.
-        let mut clear = [0u8; SECURE_MAX_MSG_LEN];
-        let body_len = msg.write_body(&mut clear);
+        // The body (type byte included) is written straight into the wire
+        // block and its clear-text type byte is mirrored into the header —
+        // no staging buffer, no body copy.
+        let body_start = 1 + COUNTER_WIRE_LEN;
         let mut block = [0u8; SECURE_MAX_MSG_LEN];
-        block[0] = clear[0];
+        let body_len = msg.write_body(&mut block[body_start..]);
+        block[0] = block[body_start];
         block[1..1 + COUNTER_WIRE_LEN].copy_from_slice(&counter.to_be_bytes());
-        block[1 + COUNTER_WIRE_LEN..1 + COUNTER_WIRE_LEN + body_len]
-            .copy_from_slice(&clear[..body_len]);
         let nonce = build_nonce(prefix, counter);
         let mut aad = [0u8; 1 + COUNTER_WIRE_LEN];
         aad[0] = block[0];
