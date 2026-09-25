@@ -5,6 +5,11 @@ use super::*;
 use core::mem::size_of;
 use heapless::Vec as HeapVec;
 
+// Host-side performance measurement suite (dev-only, prints with
+// --nocapture). The tier itself is already feature-gated in `lib.rs`, so no
+// extra feature cfg is needed here.
+mod perf_measurements;
+
 /// Builds an RX message with a payload of `len` bytes (0..=255).
 fn rx(len: usize) -> Msg {
     Msg::Rx {
