@@ -20,6 +20,13 @@ repository = "https://code.bhk-itsolutions.com/homeiot/sigil"
 #                     digest) without any engine.
 #   - sensor,ota:     SUPPORTED. Adds the OTA receive half.
 #   - gateway,ota:    SUPPORTED. Adds the OTA send half.
+#   - usbserial:      SUPPORTED. Standalone USB-serial link tier (the radio
+#                     head firmware build shape).
+#   - gateway,usbserial:
+#                     SUPPORTED. Gateway host build consuming the head link.
+#   `sensor,usbserial` compiles (features are additive) but is neither
+#   contractual nor gated: a sensor is a battery LoRa device with no USB
+#   link to the gateway host.
 # Safe smallest default for sensor firmware. Gateways must disable defaults and
 # select `gateway`; pairwise development uses `--all-features` explicitly.
 default = ["sensor"]

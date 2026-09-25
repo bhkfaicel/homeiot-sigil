@@ -23,7 +23,9 @@
 // - Supported: `wire` (manufacturing contract), `sensor`, `gateway`, the
 //   explicit two-role composition `sensor,gateway`, `ota` (OTA protocol
 //   tiers, optionally crossed with the roles), and `usbserial` (USB-serial
-//   link tier to the SAMD21 radio head, optionally crossed with the roles);
+//   link tier to the SAMD21 radio head, crossed with `gateway` for the
+//   gateway host; `sensor,usbserial` compiles but is not a contractual
+//   shape and is not gated);
 //   `--all-features` is the future-facing superset gate.
 // - Unsupported: the empty feature set. It is rejected here at compile time
 //   with a deliberate diagnostic so integrators always select a documented

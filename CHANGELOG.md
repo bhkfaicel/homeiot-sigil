@@ -9,6 +9,29 @@ and this project adheres to semantic versioning.
 
 ### Added
 
+- Document the `usbserial` tier across the integration docs (documentation
+  only): the README gains the `usbserial` feature paragraph (plain + secure
+  profiles, the PSK/HELLO model, and the honest no-forward-secrecy
+  statement), radio-head (`usbserial`) and gateway-host
+  (`gateway,usbserial`) dependency snippets with the stale example version
+  pins bumped to the current release, the bidirectional host bridge
+  contract (head→host `Msg::Rx` payloads into
+  `SessionManager::process_incoming_packet`; session egress
+  (`SigilAction::Transmit`) sealed as `Msg::TxReq`; never a whole `Msg` as
+  engine input), and the host duties (32-byte link PSK from the OS CSPRNG,
+  never reusing `resume_psk`/session keys as the link PSK, HELLO nonce
+  uniqueness, plain-profile manufacturing/bench-only exposure, answering
+  `take_peer_hello_seen` with `hello_frame`, prompt `pop()` draining).
+  CLAUDE.md gains the `src/usbserial/` module entry (profiles, framing,
+  RAM bounds, CRC→tag→watermark ordering, `UsbserialError` taxonomy) and
+  the second-top-level-tier architecture note. The feature-contract
+  wordings in the `Cargo.toml` comment, `src/lib.rs`, and the README now
+  state one supported set — standalone `usbserial` and `gateway,usbserial`
+  are contractual, `sensor,usbserial` compiles but is not contractual or
+  gated — the README references the empty-feature diagnostic in
+  `src/lib.rs` instead of quoting it, and its long horizontal rules are
+  gone.
+
 - The project gate (`scripts/test.sh`) now cross-compiles the `usbserial`
   tier for its real targets: the SAMD21 head build (`--features usbserial`
   on `thumbv6m-none-eabi`) and the gateway host build

@@ -6,13 +6,9 @@
 
 `no_std` Rust library for secure cryptographic communication over LoRa networks on embedded IoT devices. It provides device identification, authentication, and encrypted messaging primitives for LoRa-based sensor/gateway communication.
 
----
-
 ## What is a Sigil?
 
 **Sigil** (from Latin _sigillum_, “seal”) traditionally denotes a symbol or mark that represents an identity, intent, or authority—like a seal on a document. In this project, **sigil** is the “seal” of your device stack: the layer that defines how devices identify, authenticate, and exchange encrypted messages over LoRa.
-
----
 
 ## Architecture
 
@@ -42,8 +38,6 @@ incoming frames **without decryption**, returning a typed `SigilEvent`:
 
 The host routes `*Request` to `handle_*` and challenge/confirm/ack/**CommitConfirmed** to `continue_*`.
 
----
-
 ## Features
 
 - **Role-scoped builds** — `sensor` is the safe, smallest default. Gateway
@@ -55,6 +49,19 @@ The host routes `*Request` to `handle_*` and challenge/confirm/ack/**CommitConfi
   `gateway,ota`. Hardware effects stay host-side behind `OtaStorage` /
   `OtaImageSource`; authenticity is verified through the existing
   `SecureElement::verify_ecdsa` trait.
+- **USB-serial link tier (opt-in `usbserial` feature)** — framed byte
+  protocol between the gateway host and the SAMD21 radio head: a plain
+  profile (COBS + CRC-16 framing: RX / TX_REQ / TX_RESULT / PING / PONG)
+  and a secure profile (clear-nonce HELLO handshake, HKDF-SHA256 over a
+  32-byte link PSK, ChaCha20-Poly1305 sealing with a strictly increasing
+  receive watermark). A transport **below** the session engine with zero
+  coupling to the core; the host bridges the two directions (see the
+  USB-serial bridge section). Honest security statement (from the module
+  docs): the secure profile is a symmetric-PSK link channel with **no
+  forward secrecy** — it protects the host↔head link only; end-to-end
+  sensor security remains the Sigil sessions above. Supported shapes are
+  `usbserial` (radio head firmware) and `gateway,usbserial` (gateway
+  host); `sensor,usbserial` compiles but is not a contractual build.
 - **Non-blocking core** — Host-owned radio + secure element via the `SecureElement` / `RandomSource` traits. Provides `SessionManager<N>`, a single ingress (`process_incoming_packet`), egress (`encrypt_data`), and three host-driven phases: install, sensor-initiated renew, and fast resume.
 - **`N` must be a power of two and `>= 2`** (constraint from `heapless::FnvIndexMap`); use `<2>` for single-peer sensors, `<128>` for gateways.
 - **Host-owned footprint budgets** — final flash, static RAM, and stack budgets
@@ -63,8 +70,6 @@ The host routes `*Request` to `handle_*` and challenge/confirm/ack/**CommitConfi
   regression bounds (see the crate-level rustdoc); those recorded sizes are
   planning inputs for host budgeting, not a substitute for target-level
   measurement.
-
----
 
 ## Handshake flows
 
@@ -253,7 +258,37 @@ Install chains multiple secure-element ops in one call. Product priority:
 defer install if a critical sensing window needs the main loop. See CLAUDE.md
 and `SecureElement` rustdoc.
 
----
+## USB-serial bridge (opt-in `usbserial` feature)
+
+The `usbserial` tier is the transport between the gateway host and the
+SAMD21 radio head. The host bridges it to the session engine in **both**
+directions; a whole `Msg` is never engine input, only payloads are:
+
+- **Ingress (head → host):** drain `SecureChannel::pop()` (secure profile)
+  or `Decoder::pop()` (plain profile, bench use only); take **only**
+  `Msg::Rx` frames and feed `msg.payload` into
+  `SessionManager::process_incoming_packet`. `Msg::TxResult` / `Msg::Pong`
+  are link bookkeeping, never engine input.
+- **Egress (host → head):** session output
+  (`SigilAction::Transmit { payload, .. }`) is wrapped as
+  `Msg::TxReq { payload }`, sealed with `SecureChannel::seal`, and written
+  to the head; consume `Msg::TxResult` as the completion report.
+
+Host responsibilities:
+
+- Derive the 32-byte link PSK from the OS CSPRNG. Never reuse a
+  `resume_psk`, session key, or any other Sigil-derived key as the link
+  PSK.
+- HELLO nonce uniqueness salts the key derivation: the host draws its
+  nonce from the OS CSPRNG, the head from a boot counter + jitter mix (the
+  `SecureChannel::new` contract).
+- The plain profile is unauthenticated and unencrypted: anyone with USB
+  access controls the radio TX. Manufacturing/bench use only.
+- After draining `pop()`, answer `take_peer_hello_seen() == true` with
+  `hello_frame` so a reconnecting host can re-establish against an
+  already-established head.
+- Drain `pop()` promptly: both queues are fixed-capacity; overflow drops
+  the newest frame and counts it in `dropped()`.
 
 ## Security and threat model
 
@@ -285,8 +320,6 @@ Integrator guidance:
 - Prefer Renew rotation over re-install/resume cycles to refresh ongoing
   sessions.
 
----
-
 ## Usage
 
 Choose the product role explicitly in its `Cargo.toml`. This is important on
@@ -296,26 +329,32 @@ gateway-only API/events/state from being compiled into the sensor firmware.
 ```toml
 [dependencies]
 # SAMD21 sensor firmware (session + OTA receive half)
-sigil = { version = "1.2.0", registry = "forgejo", default-features = false, features = ["sensor", "ota"] }
+sigil = { version = "1.3.0", registry = "forgejo", default-features = false, features = ["sensor", "ota"] }
 
 # Raspberry Pi (or equivalent) gateway software (session + OTA send half)
-# sigil = { version = "1.2.0", registry = "forgejo", default-features = false, features = ["gateway", "ota"] }
+# sigil = { version = "1.3.0", registry = "forgejo", default-features = false, features = ["gateway", "ota"] }
 
 # Offline signing tooling (shared OTA wire tier only, no engines)
-# sigil = { version = "1.2.0", registry = "forgejo", default-features = false, features = ["ota"] }
+# sigil = { version = "1.3.0", registry = "forgejo", default-features = false, features = ["ota"] }
+
+# SAMD21 radio head firmware (USB-serial link tier only, no session stack)
+# sigil = { version = "1.3.0", registry = "forgejo", default-features = false, features = ["usbserial"] }
+
+# Gateway host driving the radio head over USB (session + USB-serial link tier)
+# sigil = { version = "1.3.0", registry = "forgejo", default-features = false, features = ["gateway", "usbserial"] }
 ```
 
 The default feature is `sensor`, the safe smallest build for sensor firmware.
 Supported configurations are `wire` (manufacturing contract), `sensor`,
-`gateway`, the explicit two-role composition `sensor,gateway`, and the OTA
-tiers `ota` / `sensor,ota` / `gateway,ota` (the dual-role plus both halves is
-covered by `--all-features`). A plain `sensor` or `gateway` dependency never
-pulls in OTA code; a build without any supported feature set (no role, no
-`wire`, no `ota`) is rejected at compile time with an explicit diagnostic:
-
-```text
-sigil: no supported feature configuration selected; enable `wire` (manufacturing contract), one of the session roles `sensor` / `gateway`, or the OTA protocol tiers via `ota`
-```
+`gateway`, the explicit two-role composition `sensor,gateway`, the OTA tiers
+`ota` / `sensor,ota` / `gateway,ota`, and the USB-serial tiers `usbserial`
+(radio head) / `gateway,usbserial` (gateway host); the dual-role build with
+both OTA halves and the link tier is covered by `--all-features`. Plain
+`sensor` or `gateway` dependencies never pull in OTA or usbserial code.
+`sensor,usbserial` compiles (features are additive) but is not a contractual
+build shape and is not exercised by the feature-matrix gate. A build without
+any supported feature set is rejected at compile time; the authoritative
+diagnostic lives in `src/lib.rs`.
 
 `SigilEvent` intentionally keeps the complete wire-classification enum in both
 role builds so shared host adapters can remain exhaustive. Role-disabled frames
@@ -423,8 +462,6 @@ The authoritative integration contract is this document together with the
 crate rustdoc (`cargo doc --open`); every public API carries its host-facing
 contract inline.
 
----
-
 ## Project structure
 
 ```
@@ -451,13 +488,9 @@ sigil/
 └── Cargo.toml
 ```
 
----
-
 ## Status
 
 Active development. The non-blocking core is the single supported API as of v1.0.0.
-
----
 
 ## License
 
