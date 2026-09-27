@@ -158,6 +158,15 @@ fn perf_measurements_secure_channel_roundtrip() {
             black_box(&out[..n]);
         });
 
+        // The seal-only loop above advanced the send counter by ITERATIONS
+        // frames that were never fed to the receiver, so the RX watermark
+        // now trails the send counter far beyond the replay-gap window and
+        // every further frame would be dropped. Realign the watermark to
+        // the sender (direct field access, the same test-only precedent as
+        // the counter tests): the unsent frames count as seen, keeping the
+        // timed round-trip below inside the window.
+        head.recv_last = host.send_counter;
+
         // End to end: seal + feed + pop, one fresh sealed frame per op.
         let roundtrip_ns = time_ns_per_op(ITERATIONS, || {
             let mut out = [0u8; SECURE_MAX_FRAME_LEN];

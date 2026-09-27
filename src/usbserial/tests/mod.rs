@@ -471,6 +471,78 @@ fn secure_replay_rejected_then_valid_accepted() {
 }
 
 #[test]
+fn secure_gap_beyond_window_rejected_then_in_window_accepted() {
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    // Counter 1 accepted; the watermark advances to 1.
+    let n1 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n1]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    // Direct-field pattern (exhaustion-test precedent): force a far-ahead
+    // send counter so the next sealed frame lands one past the RX window
+    // (counter 258 = watermark 1 + RX_COUNTER_MAX_GAP + 1).
+    host.send_counter = 257;
+    let n_gap = host.seal(&Msg::Ping, &mut out).expect("fits");
+    let gap = HeapVec::<u8, MAX_FRAME_LEN>::from_slice(&out[..n_gap]).expect("fits");
+    // Roll the sender back behind the watermark so the recovery frame is a
+    // normal in-window counter (2; that nonce was never used, so sealing
+    // stays sound).
+    host.send_counter = 1;
+    let n2 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    let f2 = HeapVec::<u8, MAX_FRAME_LEN>::from_slice(&out[..n2]).expect("fits");
+    // Gap-257 frame: beyond the window → dropped, watermark untouched.
+    head.feed(&gap);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), None);
+    // The in-window recovery frame is accepted: the receiver did not wedge.
+    head.feed(&f2);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+}
+
+#[test]
+fn secure_rx_gap_window_boundaries_including_counter_limit() {
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    // Counter 1 accepted; the watermark advances to 1.
+    let n1 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n1]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    // Normal-range boundary: gap exactly RX_COUNTER_MAX_GAP is accepted.
+    // Direct-field pattern (exhaustion-test precedent): force the send
+    // counter so the next sealed frame lands on counter 257 (gap 256).
+    host.send_counter = 256;
+    let n_edge = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n_edge]);
+    assert_eq!(head.pop(), Some(Msg::Ping), "gap-256 edge is in window");
+    assert_eq!(head.recv_last, 257);
+    // Near-limit regime, one below the counter ceiling: the window
+    // truncates to the single remaining counter `u64::MAX` (gap 1).
+    head.recv_last = u64::MAX - 1;
+    host.send_counter = u64::MAX - 1;
+    let n_max = host.seal(&Msg::Ping, &mut out).expect("fits"); // counter u64::MAX
+    let f_max = HeapVec::<u8, MAX_FRAME_LEN>::from_slice(&out[..n_max]).expect("fits");
+    head.feed(&f_max);
+    assert_eq!(
+        head.pop(),
+        Some(Msg::Ping),
+        "gap-1 at the ceiling is in window"
+    );
+    assert_eq!(head.recv_last, u64::MAX);
+    // Reception is exhausted at the ceiling and every candidate is now out
+    // of window: a small counter is `None` on `checked_sub` (never wraps
+    // into acceptance) and the ceiling frame itself is gap 0. The
+    // documented recovery is a re-HELLO/rekey, not a counter wrap.
+    host.send_counter = 0;
+    let n_small = host.seal(&Msg::Ping, &mut out).expect("fits"); // counter 1
+    head.feed(&out[..n_small]);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), None);
+    head.feed(&f_max);
+    assert_eq!(head.dropped(), 2);
+    assert_eq!(head.pop(), None);
+}
+
+#[test]
 fn secure_type_confusion_rejected() {
     // Rewrite the clear type byte AND fix the CRC so the frame reaches the
     // AEAD layer: the tag must fail because the type is bound as AAD.

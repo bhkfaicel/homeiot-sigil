@@ -546,8 +546,9 @@ fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, UsbserialError> {
 //   but is AUTHENTICATED: AAD = [type] || counter_be, so a rewritten clear
 //   type fails the tag check;
 // - the counter rides in the clear and binds the replay window; the receiver
-//   accepts strictly increasing counters only, and advances its watermark
-//   only AFTER the tag verified (a forged huge counter cannot desync);
+//   accepts counters strictly ahead of its watermark and at most
+//   `RX_COUNTER_MAX_GAP` beyond it, and advances the watermark only AFTER
+//   the tag verified (a forged huge counter cannot desync);
 // - HELLO (0x06) travels clear (both directions, body = nonce[16] ‖ kind[1],
 //   kind `0x00` INIT / `0x01` RESP, any other kind dropped): it is salt
 //   material, not a secret; authentication comes from the PSK through the
@@ -614,6 +615,19 @@ pub const PSK_LEN: usize = 32;
 pub const TAG_LEN: usize = 16;
 /// Clear counter bytes prefixing every sealed message body.
 pub const COUNTER_WIRE_LEN: usize = 8;
+
+/// Maximum accepted distance between the receive watermark and a sealed
+/// frame's clear counter (mirrors `core::aead`'s window of the same name).
+/// A sealed frame is accepted only when `counter.checked_sub(recv_last)`
+/// yields a gap in `1..=RX_COUNTER_MAX_GAP`; everything else (replay, late
+/// duplicate, jump beyond the window) is dropped with the watermark
+/// untouched. The check is deliberately subtraction-based: a sum
+/// (`recv_last + gap`) would overflow near `u64::MAX`. As the watermark
+/// approaches `u64::MAX` the effective window truncates (fewer counters
+/// remain acceptable); once the watermark reaches `u64::MAX` reception is
+/// exhausted and the documented recovery is a re-HELLO/rekey (fresh epoch,
+/// fresh counters), never a wrap.
+const RX_COUNTER_MAX_GAP: u64 = 256;
 
 const KEY_LEN: usize = 32;
 const PREFIX_LEN: usize = 4;
@@ -1203,8 +1217,9 @@ impl SecureChannel {
 
     /// Opens one sealed data message: tag verification FIRST (ACTIVE half,
     /// then the staged candidate on failure — a staged-tag success is a PSK
-    /// proof and activates the candidate epoch), then the strict replay
-    /// check, then the watermark advance. On AEAD tag failure the plaintext
+    /// proof and activates the candidate epoch), then the bounded
+    /// replay-gap check, then the watermark advance. On AEAD tag failure
+    /// the plaintext
     /// is never released and the ciphertext stays intact, so the second
     /// attempt over the same buffer is sound.
     ///
@@ -1293,8 +1308,20 @@ impl SecureChannel {
                 self.init_pending = None;
             }
         }
-        if counter <= self.recv_last {
-            // Replay (or late duplicate): watermark untouched.
+        // Replay-gap window (mirrors `core::aead`): accept only counters
+        // strictly ahead of the watermark and at most `RX_COUNTER_MAX_GAP`
+        // beyond it. `checked_sub` keeps the comparison overflow-safe near
+        // `u64::MAX` (never `recv_last + gap`); a gap of 0 or `None` (at or
+        // behind the watermark) rejects the replay / late-duplicate case
+        // exactly like the former strict-increase check. Near the counter
+        // ceiling the window truncates; at `u64::MAX` reception is
+        // exhausted until a re-HELLO/rekey.
+        let in_window = counter
+            .checked_sub(self.recv_last)
+            .is_some_and(|gap| (1..=RX_COUNTER_MAX_GAP).contains(&gap));
+        if !in_window {
+            // Replay, late duplicate, or jump beyond the window:
+            // watermark untouched.
             self.dropped += 1;
             return;
         }

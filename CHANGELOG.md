@@ -102,6 +102,16 @@ and this project adheres to semantic versioning.
   half (no automatic active fallback): a dead staged pair means transient
   TX unavailability recovered by one host-timed rekey retry, while RX keeps
   accepting old-epoch traffic throughout.
+- `usbserial`: sealed-frame receive counters are now bounded by a replay-gap
+  window like the core AEAD path: a frame is accepted only when its counter
+  is strictly ahead of the receive watermark and at most
+  `RX_COUNTER_MAX_GAP` (256) beyond it, computed overflow-safely with
+  `checked_sub` so the comparison stays correct near `u64::MAX`. A frame
+  beyond the window is dropped with the watermark untouched, so an
+  authenticated but buggy or hostile peer can no longer wedge reception
+  with a huge counter jump. As the watermark approaches `u64::MAX` the
+  window truncates; once reception is exhausted the documented recovery is
+  a re-HELLO/rekey (fresh epoch, fresh counters), never a wrap.
 
 ### Fixed
 
