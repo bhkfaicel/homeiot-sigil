@@ -373,6 +373,48 @@ fn craft_hello(peer_nonce: &[u8; NONCE_LEN], kind: u8) -> HeapVec<u8, HELLO_FRAM
     craft_hello_raw(&body)
 }
 
+/// Seals a RAW body (type byte included) under the sender's ACTIVE send
+/// half, mirroring `seal`'s wire assembly — the only way to put a payload
+/// on the secure path that no `Msg` can encode (here: a TX_RESULT with a
+/// trailing byte). Read-only on the sender: the crafted frame claims the
+/// next send counter without committing it.
+fn seal_raw(sender: &SecureChannel, body: &[u8]) -> HeapVec<u8, SECURE_MAX_FRAME_LEN> {
+    let SecureState::Established { keys, .. } = &sender.state else {
+        panic!("seal_raw requires an established channel");
+    };
+    let (key, prefix) = keys.send_half(sender.role);
+    let counter = sender
+        .send_counter
+        .checked_add(1)
+        .expect("test never reaches the counter ceiling");
+    // Same clear layout as `seal`: [type][counter][ciphertext][tag][crc].
+    let mut block = [0u8; SECURE_MAX_MSG_LEN];
+    let body_start = 1 + COUNTER_WIRE_LEN;
+    block[body_start..body_start + body.len()].copy_from_slice(body);
+    block[0] = body[0]; // clear type byte mirrors the body's, like `seal`
+    block[1..1 + COUNTER_WIRE_LEN].copy_from_slice(&counter.to_be_bytes());
+    let nonce = build_nonce(prefix, counter);
+    let mut aad = [0u8; 1 + COUNTER_WIRE_LEN];
+    aad[0] = block[0];
+    aad[1..].copy_from_slice(&counter.to_be_bytes());
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let tag = cipher
+        .encrypt_in_place_detached(
+            &Nonce::from(nonce),
+            &aad,
+            &mut block[body_start..body_start + body.len()],
+        )
+        .expect("AEAD over a test-sized body cannot fail");
+    let end = 1 + COUNTER_WIRE_LEN + body.len() + TAG_LEN;
+    block[end - TAG_LEN..end].copy_from_slice(&tag);
+    let crc = crc16_ccitt_false(&block[..end]);
+    block[end..end + 2].copy_from_slice(&crc.to_le_bytes());
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let len = cobs_encode(&block[..end + 2], &mut out).expect("frame fits");
+    out[len] = 0;
+    HeapVec::from_slice(&out[..len + 1]).expect("fits")
+}
+
 /// Snapshot of a wire frame for later replay.
 fn snap(frame_bytes: &[u8]) -> HeapVec<u8, SECURE_MAX_FRAME_LEN> {
     HeapVec::from_slice(frame_bytes).expect("fits")
@@ -563,6 +605,20 @@ fn secure_type_confusion_rejected() {
     head.feed(&scratch[..bl + 1]);
     assert_eq!(head.dropped(), 1);
     assert_eq!(head.pop(), None);
+}
+
+#[test]
+fn secure_tx_result_with_trailing_byte_is_malformed() {
+    // Sealed twin of `tx_result_with_trailing_byte_is_malformed`: a
+    // tag-valid frame whose DECRYPTED payload is TX_RESULT plus one
+    // trailing byte must die in the shared `parse_body` exactly like the
+    // clear-text frame, not arrive by silently truncating the extra byte.
+    let (mut host, head) = established_pair(&PSK_A, 1, 2);
+    let body = [TYPE_TX_RESULT, TX_STATUS_OK, 0x42];
+    let wire = seal_raw(&head, &body);
+    host.feed(&wire);
+    assert_eq!(host.dropped(), 1);
+    assert_eq!(host.pop(), None);
 }
 
 #[test]
