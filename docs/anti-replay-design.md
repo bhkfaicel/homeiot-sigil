@@ -1,4 +1,4 @@
-# Bounded Authenticated-Initiator Replay Defense — Design (2026-08-22, rev 5)
+# Bounded Authenticated-Initiator Replay Defense — Design (2026-08-22, rev 6)
 
 Gateway-side design deliverable of the validated security-audit remediation
 plan. Revision 3 superseded revision 2, which revalidation rejected; its
@@ -34,6 +34,11 @@ pre-authentication saturation-refusal exposure, explicitly accepted and
 pinned, and the adversarial suite is renumbered one-function-per-entry
 (28 named tests). Design only;
 the only public-API additions are two error variants (Section 9).
+Changes in revision 6 (2026-09-27) — one addition, nothing else:
+a new Section 15 appendix cross-references the USB-serial link tier's
+replay discipline in its shipped form; every statement there was verified
+against `src/usbserial`, and no existing section, table, or decision record
+above is modified.
 
 ## 1. Problem statement
 
@@ -669,3 +674,71 @@ with the suite renumbered to 28 one-function-per-entry named tests.
 Open, non-blocking: optional
 `tick(now)` early reclamation; host telemetry should alert on both new
 variants and on sustained `ReplayCacheFull` rates.
+
+## 15. Appendix — replay discipline of the usbserial link tier (cross-reference)
+
+The cache of Sections 1–14 defends the LoRa clear-text Install/Resume
+initiators. The opt-in `usbserial` tier — the PSK-secured
+ChaCha20-Poly1305 channel between the gateway host and the SAMD21 radio
+head — is a separate trust boundary with its own, independent replay
+defense: no shared state, no shared key material, no shared horizon, and
+neither mechanism bounds or excuses the other. This appendix documents that
+defense so this document remains the single replay reference.
+
+Attack class closed: HELLO (type `0x06`) travels clear by design, and a
+recorded HELLO replayed into an ESTABLISHED channel once re-derived the
+active keys identically (the local HELLO nonce never rotated) while
+resetting both directional counters to zero — after which a stale sealed
+frame's tag verified again and its clear counter passed the ordering check:
+stale-frame injection without any PSK knowledge. The shipped design makes
+that replay structurally impossible rather than detectable.
+
+Defense as implemented (staged rekey): the HELLO body is exactly
+`nonce[16] ‖ kind[1]` — `0x00` INIT, `0x01` RESP; any other kind value and
+any body not exactly 17 bytes is dropped with no state mutation beyond the
+drop counter (the tier's trust boundary for unauthenticated input). A fresh
+channel derives directly from a peer HELLO of either kind — there is no
+established state to protect — counters restart at zero, and only an INIT
+is answered. A HELLO received while ESTABLISHED never replaces active keys
+or counters: the endpoint rotates its local nonce (interpreted as
+`boot_base[8] ‖ counter_be[8]`, counter half incremented on every answered
+INIT and every rekey INIT), stages candidate keys derived from the fresh
+nonce pair in a SINGLE overwriteable slot, and activates them only when an
+inbound sealed frame's tag verifies under them — a PSK-possession proof a
+PSK-less attacker cannot forge. A replayed current-epoch INIT therefore
+stages a candidate that never equals the active keys (inert), and a
+replayed old-epoch INIT plus its old sealed frame fails under both key
+sets: the monotonic rotation closes same-epoch replay and cross-epoch
+resurrection alike. Hostile HELLO floods consume no irreversible resource —
+the slot is overwritten, never accumulated, so there is no capacity to
+poison — and the dialogue INIT → RESP → consume-or-drop is acyclic (a RESP
+is never answered; a RESP with no outstanding initiation is a terminal
+drop), which excludes HELLO ping-pong. Rekey initiation is host-only:
+`begin_rekey` returns `UsbserialError::WrongRole` on a head (the head
+rekeys solely by rebooting, which is the fresh-channel link-open INIT).
+Once the initiator has consumed the peer RESP it seals on the STAGED half;
+if that staged epoch is dead at the peer, the sender sees transient TX
+unavailability with no automatic ACTIVE fallback (the sender cannot know
+the peer dropped its frames), and recovery is one host-timed `begin_rekey`
+retry — RX keeps accepting old-epoch traffic throughout, because the active
+receive half is tried first and the staged candidate only on its failure.
+
+Per-frame ordering and counter discipline: every sealed frame passes the
+CRC (cheap pre-filter), then AEAD tag verification, and only then the
+receive watermark check and advance — the watermark moves only after the
+tag verified, under both key halves. Acceptance is the bounded gap window
+mirroring `core::aead`: `counter.checked_sub(recv_last)` must fall in
+`1..=RX_COUNTER_MAX_GAP` (256), computed subtraction-based so the
+comparison cannot overflow near `u64::MAX`; the effective window truncates
+as the watermark approaches the counter ceiling, and once the watermark
+reaches `u64::MAX` reception is exhausted until a re-HELLO/rekey — never a
+wrap. On the transmit side, the active and staged send counters use
+identical last-sent semantics, refuse deterministically at `u64::MAX`
+(`UsbserialError::CounterExhausted`), and commit only on the success path —
+a failed seal advances nothing and the next attempt reuses the same
+candidate counter safely, so nonce reuse is impossible by construction.
+
+Independence: this tier's defense is cache-free by construction; it neither
+uses nor alters the gateway initiator cache of Sections 1–14, and its
+residual risk statement (no forward secrecy, symmetric PSK compromise
+domain) is documented in the module's own header, not here.
