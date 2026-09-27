@@ -7,6 +7,8 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-27
+
 ### Added
 
 - Document the `usbserial` tier across the integration docs (documentation
@@ -27,10 +29,16 @@ and this project adheres to semantic versioning.
   the second-top-level-tier architecture note. The feature-contract
   wordings in the `Cargo.toml` comment, `src/lib.rs`, and the README now
   state one supported set — standalone `usbserial` and `gateway,usbserial`
-  are contractual, `sensor,usbserial` compiles but is not contractual or
-  gated —   the README references the empty-feature diagnostic in
-  `src/lib.rs` instead of quoting it, and its long horizontal rules are
-  gone.
+are contractual, `sensor,usbserial` compiles but is not contractual or
+gated. The README references the empty-feature diagnostic in
+`src/lib.rs` instead of quoting it, and its long horizontal rules are
+gone. The README security duties now pin one independent link PSK per
+host-head pair with its explicit compromise domain, and a secure-profile
+protocol block documents the staged-rekey surface (HELLO kind byte,
+host-only `begin_rekey`, transient TX unavailability, host-owned retry
+policy); `docs/anti-replay-design.md` gains an appendix cross-referencing
+the usbserial replay discipline (activation on PSK-possession proof,
+monotonic nonce rotation, watermark ordering, receive gap window).
 - `usbserial`: hosts can now drive an explicit channel rekey with
   `SecureChannel::begin_rekey` (advance the local nonce, emit a HELLO INIT,
   consume the peer RESP into a TX-switched staged pair). Rekey initiation
@@ -43,14 +51,12 @@ and this project adheres to semantic versioning.
   `pub enum` `usbserial::UsbserialError` (no `#[non_exhaustive]`):
   downstream exhaustive matches must gain an arm, which is a breaking
   change to ship with a major version bump.
-
 - The project gate (`scripts/test.sh`) now cross-compiles the `usbserial`
   tier for its real targets: the SAMD21 head build (`--features usbserial`
   on `thumbv6m-none-eabi`) and the gateway host build
   (`--features gateway,usbserial` on `armv7-unknown-linux-gnueabihf`),
   so a future `no_std` or host-build regression surfaces in this crate's
   gate instead of only in the consuming firmware repositories.
-
 - A dev-only `usbserial` performance-measurement test module mirrors the
   existing `core` AEAD harness: deterministic payloads, best-of-N host
   timing for the plain and sealed frame round-trips, and printed `size_of`
@@ -66,7 +72,6 @@ and this project adheres to semantic versioning.
   secret). The wipe runs through one shared wipe-on-return helper, so no
   plaintext residue survives a failed operation on the stack; the HELLO
   frame buffer is untouched (public nonce + CRC, no secret).
-
 - `usbserial`: the module-local error enum `Error` is renamed to
   `UsbserialError` for consistency with the `OtaError` naming precedent of
   `src/core/ota`. No `Error` alias is kept: downstream code must switch to the
@@ -136,7 +141,6 @@ and this project adheres to semantic versioning.
   dialogue is acyclic (INIT answered by at most one RESP, a RESP never
   answered), so no exchange can loop, and unauthenticated HELLOs consume no
   irreversible resource.
-
 - `usbserial`: corrected the `TX_RESULT` type-constant doc comment — the
   completion report flows head → host, matching the message-types table.
 
