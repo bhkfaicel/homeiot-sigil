@@ -122,6 +122,15 @@ pub enum UsbserialError {
     /// `#[non_exhaustive]`): downstream exhaustive matches must gain an arm,
     /// which is a breaking change to ship with a major version bump.
     CounterExhausted,
+    /// A rekey initiation ([`SecureChannel::begin_rekey`]) was attempted on
+    /// the wrong endpoint role. Rekey initiation is normatively host-only:
+    /// the radio head rekeys solely by rebooting (its fresh-channel
+    /// link-open HELLO INIT), and two simultaneous initiators could never
+    /// converge, so a `Role::Head` call is refused with no state change.
+    /// New member of a plain `pub enum` (no `#[non_exhaustive]`): downstream
+    /// exhaustive matches must gain an arm, which is a breaking change to
+    /// ship with a major version bump.
+    WrongRole,
     /// AEAD encryption/decryption failed (tag verification or cipher error).
     Crypto,
 }
@@ -539,9 +548,34 @@ fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, UsbserialError> {
 // - the counter rides in the clear and binds the replay window; the receiver
 //   accepts strictly increasing counters only, and advances its watermark
 //   only AFTER the tag verified (a forged huge counter cannot desync);
-// - HELLO (0x06) travels clear (both directions, body = nonce[16]): it is
-//   salt material, not a secret; authentication comes from the PSK through
-//   the first sealed message.
+// - HELLO (0x06) travels clear (both directions, body = nonce[16] ‖ kind[1],
+//   kind `0x00` INIT / `0x01` RESP, any other kind dropped): it is salt
+//   material, not a secret; authentication comes from the PSK through the
+//   first sealed frame of every epoch.
+//
+// Staged rekey (replay defense): a HELLO received while ESTABLISHED never
+// replaces active state. The endpoint derives CANDIDATE keys with a freshly
+// rotated local nonce, stores them in the single overwriteable staged slot
+// and activates them ONLY when an inbound sealed frame verifies under them —
+// a PSK-possession proof a PSK-less attacker cannot forge. The local nonce
+// rotates monotonically on every answer / rekey INIT (`boot_base ‖
+// counter_be`, counter half incremented), so a recorded HELLO can never
+// re-derive the active keys nor any past epoch's keys: same-epoch replay
+// stages an inert candidate, and a replayed old INIT plus its old sealed
+// frame fails under both key sets. Unauthenticated HELLOs consume no
+// irreversible resource: one overwriteable staged slot whose garbage
+// candidates can never activate. The dialogue is acyclic (INIT → RESP →
+// consume-or-drop; a RESP is never answered), so no exchange can loop.
+//
+// Rekey initiation is host-owned: the host calls `begin_rekey` (explicit
+// INIT; `WrongRole` for a head — the head rekeys solely by rebooting, which
+// is the fresh-channel link-open INIT). Once the initiator has consumed the
+// peer RESP it seals on the STAGED TX half; the responder switches its TX
+// only at its own activation. Until activation (or if a hostile INIT
+// overwrote the staged slot) the initiator may hit TRANSIENT TX
+// UNAVAILABILITY — no automatic ACTIVE fallback exists because the sender
+// cannot know the peer dropped its frames; recovery is one host-timed
+// `begin_rekey` retry (RX keeps accepting old-epoch traffic throughout).
 //
 // Key schedule (mirrors `core::aead` / `core::derive`, re-declared locally
 // because those modules are session-gated and `usbserial` must build
@@ -563,8 +597,15 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
-/// Secure-profile handshake message (clear, body = `nonce[16]`).
+/// Secure-profile handshake message (clear, body = `nonce[16] ‖ kind[1]`).
 pub const TYPE_HELLO: u8 = 0x06;
+/// HELLO kind byte: initiation (fresh-channel link open, or an explicit
+/// host [`SecureChannel::begin_rekey`]). Always answered by one RESP.
+pub const HELLO_KIND_INIT: u8 = 0x00;
+/// HELLO kind byte: answer to a received INIT. Never answered — consumed
+/// by the outstanding initiator, dropped by everyone else (the dialogue
+/// INIT → RESP → consume-or-drop is acyclic, so no ping-pong exists).
+pub const HELLO_KIND_RESP: u8 = 0x01;
 /// Length of one HELLO nonce.
 pub const NONCE_LEN: usize = 16;
 /// Length of the pre-shared key.
@@ -592,8 +633,9 @@ const SECURE_MAX_BLOCK_LEN: usize = SECURE_MAX_MSG_LEN + SECURE_MAX_MSG_LEN.div_
 const SECURE_DECODER_ACC_CAP: usize = SECURE_MAX_BLOCK_LEN;
 /// Worst-case wire frame of a sealed message.
 pub const SECURE_MAX_FRAME_LEN: usize = SECURE_MAX_BLOCK_LEN + 1;
-/// Worst-case wire frame of a HELLO: `1+16+2` clear, COBS + delimiter.
-pub const HELLO_FRAME_MAX: usize = (NONCE_LEN + 3) + (NONCE_LEN + 3).div_ceil(254) + 1 + 1;
+/// Worst-case wire frame of a HELLO: `1+16+1+2` clear (type, nonce, kind,
+/// CRC), COBS + delimiter.
+pub const HELLO_FRAME_MAX: usize = (NONCE_LEN + 4) + (NONCE_LEN + 4).div_ceil(254) + 1 + 1;
 
 /// Endpoint role of a [`SecureChannel`]. The role fixes the direction split
 /// of the derived keys (see the key schedule above) and the salt order.
@@ -683,33 +725,108 @@ fn build_nonce(prefix: &[u8; PREFIX_LEN], counter: u64) -> [u8; NONCE_SIZE] {
     nonce
 }
 
+/// Orders the two HELLO nonces into the salt's `(host, head)` positions.
+fn ordered_nonces<'a>(
+    role: Role,
+    local: &'a [u8; NONCE_LEN],
+    peer: &'a [u8; NONCE_LEN],
+) -> (&'a [u8; NONCE_LEN], &'a [u8; NONCE_LEN]) {
+    match role {
+        Role::Host => (local, peer),
+        Role::Head => (peer, local),
+    }
+}
+
+/// Advances the monotonic local-nonce counter (`boot_base[8] ‖
+/// counter_be[8]`): the counter half wraps around at its 64-bit ceiling,
+/// which cannot recur in practice. Every answer / rekey INIT rotates the
+/// salt, so no candidate epoch ever equals the active one or any recorded
+/// past epoch (replay defense).
+fn advance_local_nonce(local: &mut [u8; NONCE_LEN]) {
+    let ctr = u64::from_be_bytes(local[NONCE_LEN - 8..].try_into().expect("8 bytes"));
+    local[NONCE_LEN - 8..].copy_from_slice(&ctr.wrapping_add(1).to_be_bytes());
+}
+
+/// Candidate keys staged by an in-flight rekey dialogue. Activates only on
+/// a tag-valid inbound sealed frame (a PSK-possession proof); garbage
+/// candidates can never activate and the slot is simply overwritten by the
+/// next dance.
+struct StagedCandidate {
+    /// CANDIDATE directional material (never mixed with the active keys).
+    keys: DirectionalKeys,
+    /// Staged TX last-sent counter, uniform with `send_counter` semantics
+    /// (`0` = nothing sealed under these keys this epoch; initialized `0`
+    /// at staging; success-only commit identical to the active counter).
+    tx_counter: u64,
+    /// `true` once this endpoint SWITCHED its emissions to the staged half.
+    /// Only the initiator does (after consuming the RESP); a responder's
+    /// staged slot never seals — its TX switches only at its own activation.
+    tx_switched: bool,
+}
+
 /// Handshake/channel state.
 #[derive(Default)]
 enum SecureState {
-    /// Waiting for the peer HELLO (or a re-HELLO replacing a live session —
-    /// last HELLO pair wins, no stale state survives a restart).
+    /// Waiting for the peer HELLO: either kind derives the channel directly
+    /// (no established state exists to protect).
     #[default]
     AwaitingPeerHello,
-    /// Keys derived; counters reset to zero (first sealed counter is 1).
-    Established(DirectionalKeys),
+    /// Keys derived and active. A HELLO received in this state stages a
+    /// CANDIDATE epoch instead of touching active keys or counters.
+    Established {
+        /// Active directional material (full TX+RX halves until a staged
+        /// candidate proves itself, at which point it replaces this
+        /// wholesale).
+        keys: DirectionalKeys,
+        /// The single overwriteable staged slot (rekey candidate keys).
+        staged: Option<StagedCandidate>,
+    },
+}
+
+/// Which key half opened a sealed frame.
+enum Opened {
+    /// The ACTIVE half (normal path, in-flight old-epoch traffic during
+    /// a staged rekey included).
+    Active,
+    /// The STAGED half: a PSK-possession proof → activates the staged
+    /// epoch before delivery.
+    Staged,
 }
 
 /// PSK-authenticated secure channel over the framed USB-serial link.
 ///
-/// Lifecycle: `new(role, psk, local_nonce)` → send [`SecureChannel::hello_frame`]
-/// → `feed(peer bytes)` → once [`SecureChannel::is_established`], exchange
-/// data with [`SecureChannel::seal`] / [`SecureChannel::pop`]. A late or
-/// forged HELLO simply restarts the handshake (fresh keys, reset counters).
-/// The PSK and derived keys never appear in `Debug` output and are zeroized
-/// on drop.
+/// Lifecycle: `new(role, psk, local_nonce)` → send
+/// [`SecureChannel::hello_frame`] (INIT on a fresh channel; RESP while a
+/// peer HELLO still awaits its answer) → `feed(peer bytes)` → once
+/// [`SecureChannel::is_established`], exchange data with
+/// [`SecureChannel::seal`] / [`SecureChannel::pop`].
+///
+/// Replay defense (staged rekey): a HELLO received while established NEVER
+/// replaces active keys or counters — it stages candidate keys, derived
+/// with a freshly rotated local nonce, that activate only when an inbound
+/// sealed frame verifies under them (PSK-possession proof). Hosts drive an
+/// explicit rekey with [`SecureChannel::begin_rekey`] (host-only); until
+/// the peer's staged proof arrives the initiator may see transient TX
+/// unavailability and retries the rekey (host-timed; RX keeps accepting
+/// old-epoch traffic throughout). The PSK and derived keys never appear in
+/// `Debug` output and are zeroized on drop.
 pub struct SecureChannel {
     role: Role,
     psk: [u8; PSK_LEN],
+    /// Local HELLO nonce, interpreted as `boot_base[8] ‖ counter_be[8]`:
+    /// the counter half is advanced on every answer / rekey INIT so each
+    /// staged candidate epoch derives from fresh salt material and no
+    /// nonce pair ever repeats.
     local_nonce: [u8; NONCE_LEN],
     state: SecureState,
-    /// Counter of the last sealed message (0 = none sent this session).
+    /// Nonce this endpoint sent in an outstanding [`SecureChannel::begin_rekey`]
+    /// INIT; the pending RESP is consumed against it. `None` = no initiation
+    /// outstanding (RESP HELLOs are dropped as strays).
+    init_pending: Option<[u8; NONCE_LEN]>,
+    /// Counter of the last sealed message, LAST-SENT semantics
+    /// (0 = none sent this epoch; first seal emits 1).
     send_counter: u64,
-    /// Highest accepted receive counter (0 = none accepted this session).
+    /// Highest accepted receive counter (0 = none accepted this epoch).
     recv_last: u64,
     /// Shared receive accumulator (byte loop until the `0x00` delimiter).
     /// The bound is the SEALED frame maximum ([`SECURE_MAX_BLOCK_LEN`],
@@ -719,9 +836,9 @@ pub struct SecureChannel {
     acc: BlockAcc<SECURE_DECODER_ACC_CAP>,
     dropped: u32,
     queue: heapless::Deque<Msg, DECODER_QUEUE_CAP>,
-    /// Sticky flag: a peer HELLO arrived since the last
-    /// [`SecureChannel::take_peer_hello_seen`]. Firmware answers it with
-    /// its own HELLO so a (re)connecting host can establish.
+    /// Sticky answer-owed flag: a peer INIT arrived whose RESP has not been
+    /// emitted yet. Observed by [`SecureChannel::take_peer_hello_seen`],
+    /// consumed by [`SecureChannel::hello_frame`] when the RESP goes out.
     peer_hello_seen: bool,
 }
 
@@ -756,6 +873,7 @@ impl SecureChannel {
             psk: *psk,
             local_nonce: *local_nonce,
             state: SecureState::AwaitingPeerHello,
+            init_pending: None,
             send_counter: 0,
             recv_last: 0,
             acc: BlockAcc::new(),
@@ -767,19 +885,38 @@ impl SecureChannel {
 
     /// `true` once a peer HELLO completed the key derivation.
     pub fn is_established(&self) -> bool {
-        matches!(self.state, SecureState::Established(_))
+        matches!(self.state, SecureState::Established { .. })
     }
 
-    /// Serializes the local HELLO frame (clear, COBS + delimiter). Sent on
-    /// link open; the peer's HELLO completes the handshake.
-    pub fn hello_frame(&self, out: &mut [u8]) -> Result<usize, UsbserialError> {
+    /// Serializes the local HELLO frame (clear, COBS + delimiter) and
+    /// consumes a pending answer: on a fresh channel (or as a same-nonce
+    /// retransmission) this emits HELLO(INIT) with the current local nonce;
+    /// while a peer INIT still awaits its RESP (see
+    /// [`SecureChannel::take_peer_hello_seen`]) it emits HELLO(RESP) —
+    /// exactly once, which clears the answer-owed flag. Requires `&mut
+    /// self` because emitting the RESP is the act that discharges it.
+    pub fn hello_frame(&mut self, out: &mut [u8]) -> Result<usize, UsbserialError> {
+        if self.peer_hello_seen {
+            let len = self.hello_frame_kind(HELLO_KIND_RESP, out)?;
+            // The answer is discharged exactly when it goes on the wire.
+            self.peer_hello_seen = false;
+            Ok(len)
+        } else {
+            self.hello_frame_kind(HELLO_KIND_INIT, out)
+        }
+    }
+
+    /// Pure HELLO serializer: `[type][nonce16][kind][crc]` + COBS +
+    /// delimiter. No state is read beyond the current local nonce.
+    fn hello_frame_kind(&self, kind: u8, out: &mut [u8]) -> Result<usize, UsbserialError> {
         if out.len() < HELLO_FRAME_MAX {
             return Err(UsbserialError::Overrun);
         }
-        let mut clear = [0u8; NONCE_LEN + 3];
+        let mut clear = [0u8; NONCE_LEN + 4];
         clear[0] = TYPE_HELLO;
         clear[1..1 + NONCE_LEN].copy_from_slice(&self.local_nonce);
-        let end = 1 + NONCE_LEN;
+        clear[1 + NONCE_LEN] = kind;
+        let end = 1 + NONCE_LEN + 1;
         let crc = crc16_ccitt_false(&clear[..end]);
         clear[end..end + 2].copy_from_slice(&crc.to_le_bytes());
         let block_len = cobs_encode(&clear, out)?;
@@ -787,27 +924,82 @@ impl SecureChannel {
         Ok(block_len + 1)
     }
 
+    /// Initiates an explicit rekey (NORMATIVELY HOST-ONLY): advances the
+    /// local nonce, emits HELLO(INIT) and arms the channel to consume the
+    /// peer's RESP into a TX-switched staged pair. Active keys keep sealing
+    /// (and RX keeps accepting them) until the peer proves the staged epoch
+    /// with one tag-valid frame.
+    ///
+    /// Errors: [`UsbserialError::WrongRole`] for a `Role::Head` channel —
+    /// the head rekeys solely by rebooting, and two simultaneous initiators
+    /// could never converge — with no state change;
+    /// [`UsbserialError::NotEstablished`] on a not-yet-established host;
+    /// [`UsbserialError::Overrun`] if `out` is too small (also no state
+    /// change). Retry cadence (response timeout, backoff) is host-owned.
+    pub fn begin_rekey(&mut self, out: &mut [u8]) -> Result<usize, UsbserialError> {
+        if self.role != Role::Host {
+            return Err(UsbserialError::WrongRole);
+        }
+        if !self.is_established() {
+            return Err(UsbserialError::NotEstablished);
+        }
+        if out.len() < HELLO_FRAME_MAX {
+            return Err(UsbserialError::Overrun);
+        }
+        // Fresh salt for the candidate epoch; the RESP must answer THIS
+        // nonce, so the outstanding-initiation slot is armed with it.
+        advance_local_nonce(&mut self.local_nonce);
+        self.init_pending = Some(self.local_nonce);
+        // INIT explicitly (an owed RESP must never leak into a rekey INIT).
+        self.hello_frame_kind(HELLO_KIND_INIT, out)
+    }
+
     /// Seals one data message into a complete wire frame. Requires an
-    /// established session; every seal bumps the send counter. An exhausted
-    /// counter fails with [`UsbserialError::CounterExhausted`] and leaves the channel
-    /// untouched.
+    /// established session; every seal bumps the SELECTED send counter.
+    /// Emission policy (staged rekey): once this endpoint has consumed its
+    /// rekey RESP (a TX-switched staged pair exists) frames seal on the
+    /// STAGED half — there is no automatic ACTIVE fallback (the sender
+    /// cannot know the peer dropped its frames); otherwise on the ACTIVE
+    /// half. Both counters use identical LAST-SENT semantics, an exhausted
+    /// selected counter fails with [`UsbserialError::CounterExhausted`], and
+    /// a failed seal at any stage commits nothing (the next attempt reuses
+    /// the same candidate counter safely — no frame was ever produced with
+    /// that nonce).
     pub fn seal(&mut self, msg: &Msg, out: &mut [u8]) -> Result<usize, UsbserialError> {
+        // Pre-checks consume nothing: capacity/state errors precede key
+        // selection and any counter touch.
         if out.len() < SECURE_MAX_FRAME_LEN {
             return Err(UsbserialError::Overrun);
         }
-        let SecureState::Established(keys) = &self.state else {
+        let SecureState::Established { keys, staged } = &mut self.state else {
             return Err(UsbserialError::NotEstablished);
         };
-        // The counter feeds the AEAD nonce: wrapping at `u64::MAX` would
-        // silently reuse nonces under the same directional key, so refuse
-        // deterministically (fresh HELLO re-establishes the channel) instead.
-        // The bumped counter is committed only on the success path below, so
-        // a failed seal never advances it.
-        let counter = self
-            .send_counter
-            .checked_add(1)
-            .ok_or(UsbserialError::CounterExhausted)?;
-        let (key, prefix) = keys.send_half(self.role);
+        // Key-half selection: STAGED iff a TX-switched staged pair exists
+        // (the initiator after T3; the responder's staged slot never seals).
+        // The commit match at the end mirrors this match arm-for-arm, so
+        // whichever arm selected the counter is the arm that commits it.
+        let (key, prefix, counter) = match staged.as_ref() {
+            Some(s) if s.tx_switched => {
+                let (key, prefix) = s.keys.send_half(self.role);
+                // The counter feeds the AEAD nonce: wrapping at `u64::MAX`
+                // would silently reuse nonces under the same directional
+                // key, so refuse deterministically (the staged escape is a
+                // fresh `begin_rekey` — new keys mean a new nonce prefix).
+                let counter = s
+                    .tx_counter
+                    .checked_add(1)
+                    .ok_or(UsbserialError::CounterExhausted)?;
+                (key, prefix, counter)
+            }
+            _ => {
+                let (key, prefix) = keys.send_half(self.role);
+                let counter = self
+                    .send_counter
+                    .checked_add(1)
+                    .ok_or(UsbserialError::CounterExhausted)?;
+                (key, prefix, counter)
+            }
+        };
         // Wire layout: [type][counter][ciphertext][tag][crc], then COBS.
         // The body (type byte included) is written straight into the wire
         // block and its clear-text type byte is mirrored into the header —
@@ -835,9 +1027,13 @@ impl SecureChannel {
         block[end..end + 2].copy_from_slice(&crc.to_le_bytes());
         let block_len = cobs_encode(&block[..end + 2], out)?;
         out[block_len] = 0;
-        // Success path only: the counter advances once the frame is fully
-        // built and encoded into `out`.
-        self.send_counter = counter;
+        // Success path only: the SELECTED counter advances once the frame
+        // is fully built and encoded into `out` (arm order mirrors the
+        // selection match above).
+        match staged.as_mut() {
+            Some(s) if s.tx_switched => s.tx_counter = counter,
+            _ => self.send_counter = counter,
+        }
         Ok(block_len + 1)
     }
 
@@ -864,13 +1060,15 @@ impl SecureChannel {
         self.queue.pop_front()
     }
 
-    /// Returns and clears the sticky peer-HELLO flag. Firmware calls this
-    /// after draining the channel: `true` means a peer HELLO arrived and
-    /// the local HELLO must be sent in answer (request/response cadence —
-    /// required for a fresh host channel to establish against an
-    /// already-established head after any host-side reconnect).
+    /// Reports whether a peer INIT still awaits its RESP answer (sticky
+    /// until [`SecureChannel::hello_frame`] emits it — the emission is what
+    /// clears it, so repeated polls stay truthful). Firmware calls this
+    /// after draining the channel and answers `true` with `hello_frame`
+    /// (request/response cadence — required for a fresh host channel to
+    /// establish against an already-established head after any host-side
+    /// reconnect, and for rekey answers).
     pub fn take_peer_hello_seen(&mut self) -> bool {
-        core::mem::replace(&mut self.peer_hello_seen, false)
+        self.peer_hello_seen
     }
 
     /// Number of frames dropped (garbage, corrupt, oversize, replay,
@@ -905,45 +1103,115 @@ impl SecureChannel {
         }
     }
 
-    /// (Re)establishes the session from a peer HELLO; last HELLO pair wins.
+    /// Routes one CRC-valid HELLO (`nonce[16] ‖ kind[1]`) through the
+    /// staged-rekey state machine. Trust boundary: the body must be exactly
+    /// `NONCE_LEN + 1` bytes and the kind must be INIT or RESP — anything
+    /// else is dropped with no state change.
     fn on_hello(&mut self, body: &[u8]) {
-        let peer_nonce: [u8; NONCE_LEN] = match body.try_into() {
-            Ok(nonce) => nonce,
-            Err(_) => {
-                self.dropped += 1;
-                return;
+        if body.len() != NONCE_LEN + 1 {
+            self.dropped += 1;
+            return;
+        }
+        let peer_nonce: [u8; NONCE_LEN] = body[..NONCE_LEN].try_into().expect("16 bytes");
+        let kind = body[NONCE_LEN];
+        if kind != HELLO_KIND_INIT && kind != HELLO_KIND_RESP {
+            self.dropped += 1;
+            return;
+        }
+        if matches!(self.state, SecureState::AwaitingPeerHello) {
+            // Fresh channel: either kind establishes directly — there is no
+            // established state to protect. The local nonce is NOT rotated
+            // here (the peer's derivation must see the advertised one).
+            let (host_nonce, head_nonce) =
+                ordered_nonces(self.role, &self.local_nonce, &peer_nonce);
+            match DirectionalKeys::derive(&self.psk, host_nonce, head_nonce) {
+                Ok(keys) => {
+                    self.state = SecureState::Established { keys, staged: None };
+                    // Fresh epoch: counters restart, stale state cannot leak.
+                    self.send_counter = 0;
+                    self.recv_last = 0;
+                    // Only an INIT is answered (RESP: the peer already holds
+                    // our nonce; an answer would be dropped by any
+                    // established peer anyway).
+                    self.peer_hello_seen = kind == HELLO_KIND_INIT;
+                }
+                Err(_) => self.dropped += 1,
             }
+            return;
+        }
+        // Established: active keys and counters are untouchable by HELLOs.
+        let SecureState::Established {
+            keys: _active,
+            staged,
+        } = &mut self.state
+        else {
+            unreachable!("established checked above");
         };
-        let (host_nonce, head_nonce) = match self.role {
-            Role::Host => (&self.local_nonce, &peer_nonce),
-            Role::Head => (&peer_nonce, &self.local_nonce),
-        };
-        match DirectionalKeys::derive(&self.psk, host_nonce, head_nonce) {
-            Ok(keys) => {
-                self.state = SecureState::Established(keys);
-                // Fresh session: counters restart, stale state cannot leak.
-                self.send_counter = 0;
-                self.recv_last = 0;
-                self.peer_hello_seen = true;
+        match kind {
+            HELLO_KIND_INIT => {
+                // Answer INIT: rotate the local nonce, stage the candidate
+                // epoch, and owe one RESP. Replacing (not ignoring) the
+                // staged slot keeps legitimate retries converging even when
+                // interleaved with hostile INITs; the overwritten slot is
+                // inert either way (dropped in place, zeroized). Any
+                // outstanding `init_pending` of our own dance is independent
+                // and untouched.
+                advance_local_nonce(&mut self.local_nonce);
+                let (host_nonce, head_nonce) =
+                    ordered_nonces(self.role, &self.local_nonce, &peer_nonce);
+                match DirectionalKeys::derive(&self.psk, host_nonce, head_nonce) {
+                    Ok(keys) => {
+                        *staged = Some(StagedCandidate {
+                            keys,
+                            tx_counter: 0,
+                            tx_switched: false,
+                        });
+                        self.peer_hello_seen = true;
+                    }
+                    Err(_) => self.dropped += 1,
+                }
             }
-            Err(_) => self.dropped += 1,
+            HELLO_KIND_RESP => match self.init_pending.take() {
+                Some(sent) => {
+                    // Consume the RESP of our own initiation: stage the
+                    // candidate with the answered nonce pair and SWITCH this
+                    // endpoint's TX to the staged half. No local-nonce
+                    // rotation here (both endpoints must derive the SAME
+                    // pair) and no answer (a RESP is never answered).
+                    let (host_nonce, head_nonce) = ordered_nonces(self.role, &sent, &peer_nonce);
+                    match DirectionalKeys::derive(&self.psk, host_nonce, head_nonce) {
+                        Ok(keys) => {
+                            *staged = Some(StagedCandidate {
+                                keys,
+                                tx_counter: 0,
+                                tx_switched: true,
+                            });
+                        }
+                        Err(_) => self.dropped += 1,
+                    }
+                }
+                None => {
+                    // Stray or hostile RESP with no outstanding initiation:
+                    // terminal drop, no state change (this is what makes the
+                    // dialogue acyclic — a RESP is never answered).
+                    self.dropped += 1;
+                }
+            },
+            _ => unreachable!("kind validated above"),
         }
     }
 
-    /// Opens one sealed data message: tag verification FIRST, then the
-    /// strict replay check, then the watermark advance.
+    /// Opens one sealed data message: tag verification FIRST (ACTIVE half,
+    /// then the staged candidate on failure — a staged-tag success is a PSK
+    /// proof and activates the candidate epoch), then the strict replay
+    /// check, then the watermark advance. On AEAD tag failure the plaintext
+    /// is never released and the ciphertext stays intact, so the second
+    /// attempt over the same buffer is sound.
     ///
     /// `clear[0..len]` holds the CRC-checked wire message
     /// `[type][counter][ciphertext][tag][crc]`; the ciphertext is decrypted
     /// in place.
     fn on_sealed(&mut self, ty: u8, clear: &mut [u8; SECURE_MAX_MSG_LEN], len: usize) {
-        let (key, prefix) = match &self.state {
-            SecureState::Established(keys) => keys.recv_half(self.role),
-            SecureState::AwaitingPeerHello => {
-                self.dropped += 1;
-                return;
-            }
-        };
         let body_start = 1 + COUNTER_WIRE_LEN;
         let body_end = len - 2; // strip CRC
         if body_end < body_start + TAG_LEN {
@@ -951,25 +1219,79 @@ impl SecureChannel {
             return;
         }
         let counter = u64::from_be_bytes(clear[1..body_start].try_into().expect("8 bytes"));
-        let mut nonce = build_nonce(prefix, counter);
-        let mut aad = [0u8; 1 + COUNTER_WIRE_LEN];
-        aad[0] = ty;
-        aad[1..].copy_from_slice(&counter.to_be_bytes());
-        let mut tag = [0u8; TAG_LEN];
-        tag.copy_from_slice(&clear[body_end - TAG_LEN..body_end]);
         let ct_end = body_end - TAG_LEN;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-        let open = cipher.decrypt_in_place_detached(
-            &Nonce::from(nonce),
-            &aad,
-            &mut clear[body_start..ct_end],
-            Tag::from_slice(&tag),
-        );
-        nonce.zeroize();
-        if open.is_err() {
-            // Wrong key or tampered frame: watermark untouched.
-            self.dropped += 1;
-            return;
+        let opened = {
+            let SecureState::Established { keys, staged } = &mut self.state else {
+                self.dropped += 1;
+                return;
+            };
+            let mut aad = [0u8; 1 + COUNTER_WIRE_LEN];
+            aad[0] = ty;
+            aad[1..].copy_from_slice(&counter.to_be_bytes());
+            let mut tag = [0u8; TAG_LEN];
+            tag.copy_from_slice(&clear[body_end - TAG_LEN..body_end]);
+            let ct_end = body_end - TAG_LEN;
+            // ACTIVE half first: the dual-RX acceptance window keeps
+            // old-epoch traffic flowing while a rekey dialogue runs.
+            let (key, prefix) = keys.recv_half(self.role);
+            let mut nonce = build_nonce(prefix, counter);
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+            let mut open = cipher.decrypt_in_place_detached(
+                &Nonce::from(nonce),
+                &aad,
+                &mut clear[body_start..ct_end],
+                Tag::from_slice(&tag),
+            );
+            nonce.zeroize();
+            if open.is_ok() {
+                Opened::Active
+            } else if let Some(s) = staged.as_ref() {
+                // CANDIDATE half: a valid tag here is proof the sender holds
+                // the PSK (an attacker without it cannot forge the tag).
+                let (skey, sprefix) = s.keys.recv_half(self.role);
+                let mut snonce = build_nonce(sprefix, counter);
+                let scipher = ChaCha20Poly1305::new(Key::from_slice(skey));
+                open = scipher.decrypt_in_place_detached(
+                    &Nonce::from(snonce),
+                    &aad,
+                    &mut clear[body_start..ct_end],
+                    Tag::from_slice(&tag),
+                );
+                snonce.zeroize();
+                if open.is_ok() {
+                    Opened::Staged
+                } else {
+                    // Wrong keys or tampered frame under both halves:
+                    // watermark untouched.
+                    self.dropped += 1;
+                    return;
+                }
+            } else {
+                self.dropped += 1;
+                return;
+            }
+        };
+        if let Opened::Staged = opened {
+            // ACTIVATE: the staged pair replaces the active epoch wholesale.
+            // Uniform LAST-SENT counters make activation a plain copy (a
+            // responder that sealed nothing staged resumes at 1; an
+            // initiator that sealed k staged frames resumes at exactly
+            // k+1 — no conversion, no reset-to-zero, no nonce reuse). The
+            // RX watermark restarts fresh and any outstanding initiation
+            // of our own is terminal.
+            let staged = match &mut self.state {
+                SecureState::Established { staged, .. } => staged.take(),
+                SecureState::AwaitingPeerHello => unreachable!("opened implies established"),
+            };
+            if let Some(StagedCandidate {
+                keys, tx_counter, ..
+            }) = staged
+            {
+                self.state = SecureState::Established { keys, staged: None };
+                self.send_counter = tx_counter;
+                self.recv_last = 0;
+                self.init_pending = None;
+            }
         }
         if counter <= self.recv_last {
             // Replay (or late duplicate): watermark untouched.

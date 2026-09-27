@@ -325,6 +325,59 @@ fn tx_req(payload: &[u8]) -> Msg {
     }
 }
 
+/// Decodes one HELLO wire frame back to `(nonce, kind)` — the counter/kind
+/// assertions read the CLEAR wire bytes, no private state needed.
+fn wire_hello(frame_bytes: &[u8]) -> ([u8; NONCE_LEN], u8) {
+    let mut clear = [0u8; HELLO_FRAME_MAX];
+    let len = cobs_decode(&frame_bytes[..frame_bytes.len() - 1], &mut clear)
+        .expect("hello block decodes");
+    // Exact shape: [type][nonce16][kind][crc2].
+    assert_eq!(len, 1 + NONCE_LEN + 1 + 2, "hello wire shape");
+    assert_eq!(clear[0], TYPE_HELLO);
+    let peer_nonce: [u8; NONCE_LEN] = clear[1..1 + NONCE_LEN].try_into().expect("16 bytes");
+    (peer_nonce, clear[1 + NONCE_LEN])
+}
+
+/// Reads the clear 8-byte send counter of a sealed wire frame (the counter
+/// rides in clear bytes per the wire layout, so real `seal` output is
+/// directly assertable).
+fn wire_counter(frame_bytes: &[u8]) -> u64 {
+    let mut clear = [0u8; SECURE_MAX_MSG_LEN];
+    let len = cobs_decode(&frame_bytes[..frame_bytes.len() - 1], &mut clear)
+        .expect("sealed block decodes");
+    assert!(len > COUNTER_WIRE_LEN, "sealed wire shape");
+    u64::from_be_bytes(clear[1..1 + COUNTER_WIRE_LEN].try_into().expect("8 bytes"))
+}
+
+/// Crafts one CRC-valid clear HELLO frame with an arbitrary raw body (used
+/// to probe the kind/body trust boundary and to forge RESP frames).
+fn craft_hello_raw(body: &[u8]) -> HeapVec<u8, HELLO_FRAME_MAX> {
+    let mut clear = [0u8; 32];
+    clear[0] = TYPE_HELLO;
+    clear[1..1 + body.len()].copy_from_slice(body);
+    let end = 1 + body.len();
+    let crc = crc16_ccitt_false(&clear[..end]);
+    clear[end] = crc as u8;
+    clear[end + 1] = (crc >> 8) as u8;
+    let mut block = [0u8; HELLO_FRAME_MAX];
+    let len = cobs_encode(&clear[..end + 2], &mut block).expect("fits");
+    block[len] = 0;
+    HeapVec::from_slice(&block[..len + 1]).expect("fits")
+}
+
+/// Crafts a CRC-valid hostile HELLO with the given nonce and kind.
+fn craft_hello(peer_nonce: &[u8; NONCE_LEN], kind: u8) -> HeapVec<u8, HELLO_FRAME_MAX> {
+    let mut body = [0u8; NONCE_LEN + 1];
+    body[..NONCE_LEN].copy_from_slice(peer_nonce);
+    body[NONCE_LEN] = kind;
+    craft_hello_raw(&body)
+}
+
+/// Snapshot of a wire frame for later replay.
+fn snap(frame_bytes: &[u8]) -> HeapVec<u8, SECURE_MAX_FRAME_LEN> {
+    HeapVec::from_slice(frame_bytes).expect("fits")
+}
+
 #[test]
 fn secure_constants_are_consistent() {
     assert_eq!(
@@ -335,6 +388,12 @@ fn secure_constants_are_consistent() {
         SECURE_MAX_FRAME_LEN,
         SECURE_MAX_MSG_LEN + SECURE_MAX_MSG_LEN.div_ceil(254) + 1 + 1
     );
+    // HELLO clear message = type + nonce + kind + CRC = 20 bytes.
+    assert_eq!(
+        HELLO_FRAME_MAX,
+        (NONCE_LEN + 4) + (NONCE_LEN + 4).div_ceil(254) + 1 + 1
+    );
+    assert_eq!(HELLO_FRAME_MAX, 23);
 }
 
 #[test]
@@ -458,7 +517,7 @@ fn secure_forged_premature_hello_recovered() {
     // A forged HELLO before the legitimate one must not poison the channel:
     // last HELLO pair wins and the real host completes the handshake.
     let mut head = SecureChannel::new(Role::Head, &PSK_A, &nonce(9));
-    let impostor = SecureChannel::new(Role::Host, &PSK_B, &nonce(77));
+    let mut impostor = SecureChannel::new(Role::Host, &PSK_B, &nonce(77));
     let mut buf = [0u8; HELLO_FRAME_MAX];
     let n = impostor.hello_frame(&mut buf).expect("fits");
     head.feed(&buf[..n]);
@@ -565,8 +624,11 @@ fn secure_zeroize_on_drop_compiles_and_runs() {
 
 #[test]
 fn secure_channel_ram_footprint_is_bounded() {
+    // Bound tracks the real added state: staged candidate keys (~72 B) +
+    // staged TX counter (8 B) + outstanding-initiation nonce (16 B +
+    // discriminant) + kind handling.
     assert!(
-        size_of::<SecureChannel>() <= 2944,
+        size_of::<SecureChannel>() <= 3080,
         "SecureChannel grew beyond its approved bound: {} bytes",
         size_of::<SecureChannel>()
     );
@@ -659,4 +721,445 @@ fn secure_fresh_host_channel_establishes_against_established_head() {
     let n = host_b.seal(&msg, &mut out).expect("fits");
     head.feed(&out[..n]);
     assert_eq!(head.pop(), Some(msg));
+}
+
+// Staged-rekey replay defenses (public cadence only — hello_frame,
+// begin_rekey, feed, seal, pop, take_peer_hello_seen).
+
+#[test]
+fn secure_same_epoch_init_replay_rejected_on_head() {
+    // Mid-session replay of the CURRENT epoch's host INIT against an
+    // established head must leave active keys, counters and the watermark
+    // untouched: the replayed old sealed frame stays dropped and active
+    // traffic keeps flowing (the pre-fix code re-derived identical keys and
+    // reset the watermark, accepting the stale frame).
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    // Epoch traffic: host frames with counters 1 and 2 delivered.
+    let n1 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    let f1 = snap(&out[..n1]);
+    head.feed(&f1);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    let n2 = host.seal(&Msg::Pong, &mut out).expect("fits");
+    head.feed(&out[..n2]);
+    assert_eq!(head.pop(), Some(Msg::Pong));
+    // Record the current INIT (no owed answer → INIT with the unchanged
+    // epoch nonce) and replay it mid-session.
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    let n = host.hello_frame(&mut hbuf).expect("fits");
+    let (hnonce, kind) = wire_hello(&hbuf[..n]);
+    assert_eq!(kind, HELLO_KIND_INIT);
+    assert_eq!(hnonce, nonce(1), "same-epoch INIT nonce");
+    head.feed(&hbuf[..n]);
+    // The head owes an answer, but the replayed old frame must still drop.
+    assert!(
+        head.take_peer_hello_seen(),
+        "INIT is answered even if hostile"
+    );
+    head.feed(&f1);
+    assert_eq!(head.dropped(), 1, "replayed sealed frame must drop");
+    assert_eq!(head.pop(), None);
+    // Active traffic unaffected: next fresh frame delivers; head TX works.
+    let n3 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n3]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    let n4 = head.seal(&rx(4), &mut out).expect("fits");
+    host.feed(&out[..n4]);
+    assert_eq!(host.pop(), Some(rx(4)));
+    assert_eq!(host.dropped(), 0);
+}
+
+#[test]
+fn secure_cross_epoch_resurrection_rejected() {
+    // After a legitimate reconnect to a second epoch, replay of the FIRST
+    // epoch's INIT plus its first sealed frame must fail under BOTH key
+    // sets: monotonic local-nonce rotation makes the staged candidate equal
+    // no past epoch (this pins the rotation requirement — an
+    // identical-keys check alone would let the old epoch resurrect).
+    let mut head = SecureChannel::new(Role::Head, &PSK_A, &nonce(2));
+    let mut host_a = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    // Epoch 1 handshake.
+    let n = host_a.hello_frame(&mut hbuf).expect("fits");
+    head.feed(&hbuf[..n]);
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    host_a.feed(&hbuf[..n]);
+    assert!(head.is_established() && host_a.is_established());
+    // Record the epoch-1 INIT (re-serialized, same nonce) and first frame.
+    let n_init = host_a.hello_frame(&mut hbuf).expect("fits");
+    let init_e1 = snap(&hbuf[..n_init]);
+    let n_s1 = host_a.seal(&Msg::Ping, &mut out).expect("fits");
+    let s1_e1 = snap(&out[..n_s1]);
+    head.feed(&s1_e1);
+    assert_eq!(
+        head.pop(),
+        Some(Msg::Ping),
+        "epoch-1 frame delivered in epoch 1"
+    );
+    // Legitimate reconnect: fresh host, epoch 2 established and activated.
+    let mut host_b = SecureChannel::new(Role::Host, &PSK_A, &nonce(42));
+    let n = host_b.hello_frame(&mut hbuf).expect("fits");
+    head.feed(&hbuf[..n]);
+    assert!(head.take_peer_hello_seen());
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    host_b.feed(&hbuf[..n]);
+    assert!(host_b.is_established());
+    let n = host_b.seal(&Msg::Pong, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(Msg::Pong), "epoch-2 activation");
+    // ATTACK: epoch-1 INIT + epoch-1 first sealed frame.
+    head.feed(&init_e1);
+    head.feed(&s1_e1);
+    assert_eq!(head.dropped(), 1, "resurrected epoch-1 frame must drop");
+    assert_eq!(head.pop(), None);
+    // Epoch-2 traffic continues.
+    let n = host_b.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+}
+
+#[test]
+fn secure_hostile_init_burst_then_legit_rekey_succeeds() {
+    // 32 arbitrary-nonce hostile INITs must consume no irreversible
+    // resource (one overwriteable staged slot; ≤ 1 RESP per INIT, and the
+    // sticky answer emits exactly one RESP total), never answer a RESP, and
+    // never lock out the next legitimate host rekey.
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    for k in 0..32u8 {
+        let mut hostile = SecureChannel::new(Role::Host, &PSK_B, &nonce(k));
+        let n = hostile.hello_frame(&mut hbuf).expect("fits");
+        head.feed(&hbuf[..n]);
+    }
+    assert_eq!(
+        head.dropped(),
+        0,
+        "protocol-valid hostile INITs are not drops"
+    );
+    assert!(
+        head.take_peer_hello_seen(),
+        "one answer owed after the burst"
+    );
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    let (_n, kind) = wire_hello(&hbuf[..n]);
+    assert_eq!(kind, HELLO_KIND_RESP, "the burst earns exactly one RESP");
+    assert!(
+        !head.take_peer_hello_seen(),
+        "answer discharged by emission"
+    );
+    // A stray RESP is terminal (never answered — no ping-pong).
+    head.feed(&craft_hello(&nonce(123), HELLO_KIND_RESP));
+    assert_eq!(head.dropped(), 1, "stray RESP drops with no state change");
+    // The legitimate rekey MUST still succeed after the burst.
+    let n = host.begin_rekey(&mut hbuf).expect("fits");
+    head.feed(&hbuf[..n]);
+    assert!(head.take_peer_hello_seen());
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    host.feed(&hbuf[..n]);
+    // Host's staged frame activates the head; traffic round-trips.
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(
+        head.pop(),
+        Some(Msg::Ping),
+        "rekey must converge post-burst"
+    );
+    let n = head.seal(&rx(2), &mut out).expect("fits");
+    host.feed(&out[..n]);
+    assert_eq!(host.pop(), Some(rx(2)));
+    assert_eq!(host.dropped(), 0);
+    assert!(!host.take_peer_hello_seen());
+    assert!(!head.take_peer_hello_seen(), "no residual answer flag");
+}
+
+#[test]
+fn secure_hostile_init_race_retry_converges() {
+    // Race: a hostile INIT lands between the legitimate rekey INIT and the
+    // initiator's first staged frame, overwriting the head's staged slot.
+    // The initiator's staged frame is then dropped (transient TX
+    // unavailability), the hostile RESP is a terminal drop, and ONE
+    // begin_rekey retry converges. Counter continuity is read from the
+    // CLEAR wire bytes of REAL seal output: the responder's first
+    // post-activation frame carries 1, the initiator's carries k+1.
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let mut hellos = 0usize;
+    // Honest rekey INIT, staged at the head.
+    let n = host.begin_rekey(&mut hbuf).expect("fits");
+    hellos += 1;
+    head.feed(&hbuf[..n]);
+    // The head answers honestly BEFORE the hostile INIT arrives.
+    assert!(head.take_peer_hello_seen());
+    let n_resp = head.hello_frame(&mut hbuf).expect("fits");
+    let honest_resp = snap(&hbuf[..n_resp]);
+    hellos += 1;
+    // Hostile INIT overwrites the head's staged slot.
+    let mut attacker = SecureChannel::new(Role::Host, &PSK_B, &nonce(200));
+    let n = attacker.hello_frame(&mut hbuf).expect("fits");
+    hellos += 1;
+    head.feed(&hbuf[..n]);
+    // Host consumes the honest RESP (stages an inert pair), then drops the
+    // hostile answer (no outstanding initiation of its own anymore).
+    host.feed(&honest_resp);
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    let hostile_resp = snap(&hbuf[..n]);
+    hellos += 1;
+    host.feed(&hostile_resp);
+    assert_eq!(host.dropped(), 1, "stray hostile RESP is a terminal drop");
+    assert!(!host.take_peer_hello_seen());
+    // The initiator's staged frames go nowhere (head's slot was poisoned).
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.dropped(), 1, "exactly one failed activation attempt");
+    assert_eq!(head.pop(), None);
+    // One retry converges.
+    let n = host.begin_rekey(&mut hbuf).expect("fits");
+    hellos += 1;
+    head.feed(&hbuf[..n]);
+    assert!(head.take_peer_hello_seen());
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    hellos += 1;
+    host.feed(&hbuf[..n]);
+    // Activating frame from the REAL seal on the staged half.
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(Msg::Ping), "retry converges");
+    // Responder continuity: the head staged nothing → first frame = 1.
+    let n = head.seal(&rx(3), &mut out).expect("fits");
+    assert_eq!(wire_counter(&out[..n]), 1, "responder's first frame is 1");
+    host.feed(&out[..n]);
+    assert_eq!(host.pop(), Some(rx(3)), "initiator activates on the reply");
+    // Initiator continuity: k = 1 staged frame sealed → next is k+1 = 2.
+    let n = host.seal(&Msg::Pong, &mut out).expect("fits");
+    assert_eq!(wire_counter(&out[..n]), 2, "initiator resumes at k+1");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(Msg::Pong));
+    assert_eq!(
+        hellos, 6,
+        "bounded HELLO exchange (INIT/RESP per dance + hostile pair)"
+    );
+    assert_eq!(host.dropped(), 1);
+    assert_eq!(head.dropped(), 1);
+}
+
+#[test]
+fn secure_same_epoch_init_replay_rejected_on_host() {
+    // Host-side symmetric variant: replaying the current epoch's head INIT
+    // against an established host must not disturb active keys or the
+    // watermark — the replayed old head→host frame stays dropped.
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    // head→host traffic: counters 1 and 2 delivered.
+    let n1 = head.seal(&rx(4), &mut out).expect("fits");
+    let f1 = snap(&out[..n1]);
+    host.feed(&f1);
+    assert_eq!(host.pop(), Some(rx(4)));
+    let n2 = head.seal(&rx(5), &mut out).expect("fits");
+    host.feed(&out[..n2]);
+    assert_eq!(host.pop(), Some(rx(5)));
+    // Record and replay the current head INIT.
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    let (_n, kind) = wire_hello(&hbuf[..n]);
+    assert_eq!(kind, HELLO_KIND_INIT);
+    host.feed(&hbuf[..n]);
+    host.feed(&f1);
+    assert_eq!(host.dropped(), 1, "replayed head→host frame must drop");
+    assert_eq!(host.pop(), None);
+    // Active traffic continues in both directions.
+    let n3 = head.seal(&rx(6), &mut out).expect("fits");
+    host.feed(&out[..n3]);
+    assert_eq!(host.pop(), Some(rx(6)));
+    let n4 = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n4]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    assert_eq!(head.dropped(), 0);
+}
+
+#[test]
+fn secure_end_to_end_rekey_convergence() {
+    // Full public-cadence dance between two ESTABLISHED endpoints:
+    // begin_rekey → head answer → real-seal activation frames. Exactly one
+    // activation per side, ≤ 2 HELLO frames, no residual answer flags, no
+    // drops, old-epoch frames rejected afterwards, and clear-wire counter
+    // continuity (responder 1, initiator k+1 = 2).
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    let mut hellos = 0usize;
+    // Old-epoch frame (delivered now, replayed after the dance).
+    let n_old = host.seal(&Msg::Ping, &mut out).expect("fits");
+    let old_epoch = snap(&out[..n_old]);
+    head.feed(&old_epoch);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    // The dance.
+    let n = host.begin_rekey(&mut hbuf).expect("fits");
+    hellos += 1;
+    head.feed(&hbuf[..n]);
+    assert!(head.take_peer_hello_seen());
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    hellos += 1;
+    host.feed(&hbuf[..n]);
+    assert_eq!(hellos, 2, "the dance is at most 2 HELLO frames");
+    // Activation: the host's staged frame from the REAL seal.
+    let n = host.seal(&Msg::Pong, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(Msg::Pong), "head activates on the proof");
+    // The head's activating reply (responder staged nothing → counter 1).
+    let n = head.seal(&rx(3), &mut out).expect("fits");
+    assert_eq!(wire_counter(&out[..n]), 1, "responder's first frame is 1");
+    host.feed(&out[..n]);
+    assert_eq!(host.pop(), Some(rx(3)), "host activates on the proof");
+    // Initiator continuity: k = 1 staged frame → next frame is 2.
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    assert_eq!(wire_counter(&out[..n]), 2, "initiator resumes at k+1");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    // One activation per side, no residual flags, no drops.
+    assert!(!host.take_peer_hello_seen());
+    assert!(!head.take_peer_hello_seen());
+    assert_eq!(host.dropped(), 0);
+    assert_eq!(head.dropped(), 0);
+    // Old-epoch frames are rejected after the dance.
+    head.feed(&old_epoch);
+    assert_eq!(head.dropped(), 1);
+    assert_eq!(head.pop(), None);
+}
+
+#[test]
+fn secure_rebuilt_head_against_established_host() {
+    // Scenario B: the head REBOOTS (fresh channel, new boot base) while the
+    // host stays established. The host stages on the head INIT, answers
+    // RESP, and activates on the head's first real-sealed frame — exactly
+    // one activation, responder continuity (host staged nothing → its next
+    // frame is 1), no ping-pong, no drops, no residual flags.
+    let mut host = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    let mut head_a = SecureChannel::new(Role::Head, &PSK_A, &nonce(2));
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    // Epoch-1 handshake and traffic.
+    let n = host.hello_frame(&mut hbuf).expect("fits");
+    head_a.feed(&hbuf[..n]);
+    let n = head_a.hello_frame(&mut hbuf).expect("fits");
+    host.feed(&hbuf[..n]);
+    assert!(head_a.is_established() && host.is_established());
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head_a.feed(&out[..n]);
+    assert_eq!(head_a.pop(), Some(Msg::Ping));
+    drop(head_a); // the head "reboots"
+    // Rebuilt head: fresh channel, new boot base → link-open INIT.
+    let mut head_b = SecureChannel::new(Role::Head, &PSK_A, &nonce(99));
+    let n = head_b.hello_frame(&mut hbuf).expect("fits");
+    let (hnonce, kind) = wire_hello(&hbuf[..n]);
+    assert_eq!(kind, HELLO_KIND_INIT);
+    assert_eq!(hnonce, nonce(99), "fresh boot base");
+    host.feed(&hbuf[..n]);
+    assert!(host.take_peer_hello_seen());
+    let n = host.hello_frame(&mut hbuf).expect("fits");
+    let (_n, kind) = wire_hello(&hbuf[..n]);
+    assert_eq!(kind, HELLO_KIND_RESP);
+    head_b.feed(&hbuf[..n]);
+    assert!(head_b.is_established(), "fresh head derives directly");
+    assert!(!head_b.take_peer_hello_seen(), "RESP earns no answer");
+    // The head's first real-sealed frame is the host's activation trigger.
+    let n = head_b.seal(&rx(5), &mut out).expect("fits");
+    assert_eq!(wire_counter(&out[..n]), 1);
+    host.feed(&out[..n]);
+    assert_eq!(host.pop(), Some(rx(5)), "host activates on the proof");
+    // Responder-side continuity: the host staged nothing (its staged slot
+    // is a responder slot) → its next frame is 1.
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    assert_eq!(wire_counter(&out[..n]), 1, "responder's first frame is 1");
+    head_b.feed(&out[..n]);
+    assert_eq!(head_b.pop(), Some(Msg::Ping));
+    // Bidirectional traffic continues.
+    let n = head_b.seal(&rx(6), &mut out).expect("fits");
+    host.feed(&out[..n]);
+    assert_eq!(host.pop(), Some(rx(6)));
+    assert_eq!(host.dropped(), 0);
+    assert_eq!(head_b.dropped(), 0);
+    assert!(!host.take_peer_hello_seen());
+    assert!(!head_b.take_peer_hello_seen());
+}
+
+#[test]
+fn secure_begin_rekey_role_rule() {
+    // Rekey initiation is normatively HOST-only: a head call returns
+    // WrongRole with NO state change (no nonce advance, no outstanding
+    // initiation), fresh or established alike; an established host emits
+    // INIT with the advanced nonce; a fresh host is NotEstablished.
+    let mut head = SecureChannel::new(Role::Head, &PSK_A, &nonce(9));
+    let mut hbuf = [0u8; HELLO_FRAME_MAX];
+    assert_eq!(
+        head.begin_rekey(&mut hbuf),
+        Err(UsbserialError::WrongRole),
+        "head must never initiate"
+    );
+    // No nonce advance: the head's INIT still carries the original nonce.
+    let n = head.hello_frame(&mut hbuf).expect("fits");
+    let (hnonce, kind) = wire_hello(&hbuf[..n]);
+    assert_eq!(kind, HELLO_KIND_INIT);
+    assert_eq!(hnonce, nonce(9), "WrongRole must not rotate the nonce");
+    // The fresh-head WrongRole probe must not leave an outstanding
+    // initiation either (fresh channels answer RESP through T1, so the
+    // init_pending pin runs on the established head below).    // Established head: still refused.
+    let (mut host, mut head_est) = established_pair(&PSK_A, 1, 2);
+    assert_eq!(
+        head_est.begin_rekey(&mut hbuf),
+        Err(UsbserialError::WrongRole)
+    );
+    // Established host: emits INIT with the advanced local nonce.
+    let n = host.begin_rekey(&mut hbuf).expect("fits");
+    let (hnonce, kind) = wire_hello(&hbuf[..n]);
+    assert_eq!(kind, HELLO_KIND_INIT);
+    let mut advanced = nonce(1);
+    advanced[NONCE_LEN - 1] = 2;
+    assert_eq!(hnonce, advanced, "begin_rekey rotates the local nonce");
+    // No outstanding initiation on the refused head: a stray RESP on the
+    // ESTABLISHED head drops (a staged dance would have consumed it).
+    head_est.feed(&craft_hello(&nonce(77), HELLO_KIND_RESP));
+    assert_eq!(head_est.dropped(), 1, "no init_pending after WrongRole");
+    // Fresh host: nothing to rekey yet.
+    let mut fresh = SecureChannel::new(Role::Host, &PSK_A, &nonce(1));
+    assert_eq!(
+        fresh.begin_rekey(&mut hbuf),
+        Err(UsbserialError::NotEstablished)
+    );
+}
+
+#[test]
+fn secure_hello_kind_body_trust_boundary() {
+    // HELLO trust boundary: a CRC-valid frame with an unknown kind is a
+    // plain drop (no staged mutation, no answer flag, active traffic
+    // unaffected), and non-exact bodies (missing kind / trailing byte) drop
+    // with no state change.
+    let (mut host, mut head) = established_pair(&PSK_A, 1, 2);
+    let mut out = [0u8; SECURE_MAX_FRAME_LEN];
+    // Active-traffic baseline.
+    let n = host.seal(&Msg::Ping, &mut out).expect("fits");
+    head.feed(&out[..n]);
+    assert_eq!(head.pop(), Some(Msg::Ping));
+    // kind = 0x02: CRC-valid, structurally well-formed, unknown kind.
+    let mut bad = [0u8; NONCE_LEN + 1];
+    bad[..NONCE_LEN].copy_from_slice(&nonce(123));
+    bad[NONCE_LEN] = 0x02;
+    head.feed(&craft_hello_raw(&bad));
+    assert_eq!(head.dropped(), 1, "unknown kind drops");
+    assert!(!head.take_peer_hello_seen(), "no answer owed");
+    // Short body: 16 bytes (nonce only, kind missing).
+    head.feed(&craft_hello_raw(&[0x42; NONCE_LEN]));
+    assert_eq!(head.dropped(), 2, "missing kind drops");
+    // Long body: 18 bytes (one trailing byte past kind).
+    head.feed(&craft_hello_raw(&[0x42; NONCE_LEN + 2]));
+    assert_eq!(head.dropped(), 3, "trailing byte drops");
+    assert_eq!(head.pop(), None);
+    // Active traffic unaffected throughout.
+    let n = head.seal(&rx(7), &mut out).expect("fits");
+    host.feed(&out[..n]);
+    assert_eq!(host.pop(), Some(rx(7)));
+    assert_eq!(host.dropped(), 0);
+    assert_eq!(head.dropped(), 3);
 }

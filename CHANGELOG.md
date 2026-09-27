@@ -28,9 +28,21 @@ and this project adheres to semantic versioning.
   wordings in the `Cargo.toml` comment, `src/lib.rs`, and the README now
   state one supported set — standalone `usbserial` and `gateway,usbserial`
   are contractual, `sensor,usbserial` compiles but is not contractual or
-  gated — the README references the empty-feature diagnostic in
+  gated —   the README references the empty-feature diagnostic in
   `src/lib.rs` instead of quoting it, and its long horizontal rules are
   gone.
+- `usbserial`: hosts can now drive an explicit channel rekey with
+  `SecureChannel::begin_rekey` (advance the local nonce, emit a HELLO INIT,
+  consume the peer RESP into a TX-switched staged pair). Rekey initiation
+  is normatively host-only — the radio head rekeys solely by rebooting —
+  so a head call returns the new `UsbserialError::WrongRole` variant with
+  no state change, and a not-yet-established host gets `NotEstablished`.
+  Active keys keep working until the peer proves the staged epoch; a
+  host-owned response timeout plus one retry converges even when a hostile
+  INIT overwrote the staged slot. `WrongRole` is a new member of the plain
+  `pub enum` `usbserial::UsbserialError` (no `#[non_exhaustive]`):
+  downstream exhaustive matches must gain an arm, which is a breaking
+  change to ship with a major version bump.
 
 - The project gate (`scripts/test.sh`) now cross-compiles the `usbserial`
   tier for its real targets: the SAMD21 head build (`--features usbserial`
@@ -79,8 +91,32 @@ and this project adheres to semantic versioning.
   buffer and copying it in, removing 287 bytes of transient stack and one
   full-body copy per sealed frame on the hot TX path. The frame layout and
   wire format are unchanged, so every sealed frame stays bit-identical.
+- `usbserial`: the HELLO wire format carries a one-byte kind discriminator
+  (`nonce[16] ‖ kind[1]`, `0x00` INIT / `0x01` RESP, other values dropped),
+  growing the clear HELLO from 19 to 20 bytes and `HELLO_FRAME_MAX` from 22
+  to 23. `SecureChannel::hello_frame` now requires `&mut self` and emits
+  RESP when a peer HELLO still awaits its answer, INIT otherwise;
+  `SecureChannel::take_peer_hello_seen` reports that pending answer without
+  clearing it — the emission of the RESP is what discharges it. Until the
+  peer proves a staged epoch, the initiator's emissions stay on the staged
+  half (no automatic active fallback): a dead staged pair means transient
+  TX unavailability recovered by one host-timed rekey retry, while RX keeps
+  accepting old-epoch traffic throughout.
 
 ### Fixed
+
+- `usbserial`: closed the replay blocker in the secure profile. A HELLO
+  replayed against an ESTABLISHED channel used to re-derive the identical
+  keys and reset the replay watermark, letting an attacker with link access
+  but no PSK inject stale sealed frames. A HELLO received while established
+  now only stages CANDIDATE keys that activate on the first tag-valid
+  sealed frame (a PSK-possession proof), and the local HELLO nonce rotates
+  monotonically on every answer and rekey initiation, so a recorded HELLO
+  can re-derive neither the active keys nor any past epoch's keys
+  (same-epoch replay and cross-epoch resurrection both fail). The HELLO
+  dialogue is acyclic (INIT answered by at most one RESP, a RESP never
+  answered), so no exchange can loop, and unauthenticated HELLOs consume no
+  irreversible resource.
 
 - `usbserial`: corrected the `TX_RESULT` type-constant doc comment — the
   completion report flows head → host, matching the message-types table.
