@@ -276,19 +276,51 @@ directions; a whole `Msg` is never engine input, only payloads are:
 
 Host responsibilities:
 
-- Derive the 32-byte link PSK from the OS CSPRNG. Never reuse a
-  `resume_psk`, session key, or any other Sigil-derived key as the link
-  PSK.
+- Derive the 32-byte link PSK from the OS CSPRNG. Provision ONE
+  INDEPENDENT PSK PER host-head LINK: the compromise domain of a link
+  PSK is exactly the set of links sharing it — extracted from any one
+  link, it decrypts and forges traffic on every link provisioned with
+  the same key, and nothing else. The link HKDF (`info =
+  "sigil-usbserial-v1"`, PSK as IKM) is domain-separated from LoRa
+  session-key derivation, so a leaked link PSK exposes no LoRa session
+  key. Never reuse a `resume_psk`, session key, or any other
+  Sigil-derived key as the link PSK — reuse collapses that separation.
 - HELLO nonce uniqueness salts the key derivation: the host draws its
   nonce from the OS CSPRNG, the head from a boot counter + jitter mix (the
   `SecureChannel::new` contract).
 - The plain profile is unauthenticated and unencrypted: anyone with USB
   access controls the radio TX. Manufacturing/bench use only.
 - After draining `pop()`, answer `take_peer_hello_seen() == true` with
-  `hello_frame` so a reconnecting host can re-establish against an
-  already-established head.
+  `hello_frame` so a fresh host channel can re-establish against an
+  already-established head (and to answer rekey INITs). The poll is
+  non-destructive: the sticky flag clears only when `hello_frame`
+  emits the owed RESP.
 - Drain `pop()` promptly: both queues are fixed-capacity; overflow drops
   the newest frame and counts it in `dropped()`.
+
+Secure profile protocol:
+
+- HELLO (`0x06`) travels clear with body `nonce[16] ‖ kind[1]`:
+  `0x00` is INIT (fresh-channel link open, or an explicit rekey) and
+  `0x01` is RESP (the single answer an INIT receives); any other kind,
+  or a non-exact body length, is dropped with no state change.
+- A HELLO received on an ESTABLISHED channel never replaces the active
+  keys or counters. Candidate keys are staged and activate only when an
+  inbound sealed frame verifies under them — a proof of PSK possession
+  a PSK-less attacker cannot forge. Replaying a recorded HELLO plus its
+  sealed frame therefore stages an inert candidate and is dropped.
+- Rekey initiation is host-only: `SecureChannel::begin_rekey` on a head
+  returns `UsbserialError::WrongRole`; the head rekeys only by
+  rebooting, which opens a fresh channel whose link-open INIT is the
+  rekey.
+- While a staged pair is pending, the initiator seals on the staged
+  half with no automatic fallback to the active keys: if the peer's
+  staged slot was overwritten (for example by a hostile INIT), its
+  frames go nowhere — TRANSIENT TX UNAVAILABILITY. Recovery is
+  host-owned: an application-level response timeout, then one
+  `begin_rekey` retry (backoff per host policy). RX keeps accepting
+  old-epoch traffic throughout; activation drops at most one
+  round-trip of old-epoch in-flight frames per direction.
 
 ## Security and threat model
 
