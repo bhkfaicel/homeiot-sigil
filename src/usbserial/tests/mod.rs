@@ -1235,3 +1235,40 @@ fn secure_hello_kind_body_trust_boundary() {
     assert_eq!(host.dropped(), 0);
     assert_eq!(head.dropped(), 3);
 }
+
+/// Staging-wipe pin, Ok exit: the closure fills the buffer with marker
+/// bytes and returns `Ok`; the snapshot returned by the `#[cfg(test)]`-only
+/// twin is taken AFTER the shared wipe body runs, so any removed or
+/// reordered wipe leaks the markers into the snapshot and fails this test.
+/// Production `with_staging` and this twin share one wipe body, so the pin
+/// covers the wipe every plain/secure staging site actually goes through.
+#[test]
+fn staging_wipe_covers_ok_exit() {
+    let (snapshot, ret) = with_staging_observed(|buf: &mut [u8; 32]| {
+        buf.fill(0xAA);
+        (32, Ok::<usize, UsbserialError>(7))
+    });
+    assert_eq!(ret, Ok(7));
+    assert!(
+        snapshot.iter().all(|&b| b == 0),
+        "staging residue after an Ok exit: {:?}",
+        &snapshot[..8]
+    );
+}
+
+/// Staging-wipe pin, Err exit: bytes written before an early `Err` return
+/// must be wiped too — error aborts are exactly where plaintext would
+/// otherwise survive on the stack.
+#[test]
+fn staging_wipe_covers_err_exit() {
+    let (snapshot, ret) = with_staging_observed(|buf: &mut [u8; 32]| {
+        buf[..16].fill(0x5A);
+        (16, Err::<usize, UsbserialError>(UsbserialError::Crypto))
+    });
+    assert_eq!(ret, Err(UsbserialError::Crypto));
+    assert!(
+        snapshot.iter().all(|&b| b == 0),
+        "staging residue after an Err exit: {:?}",
+        &snapshot[..8]
+    );
+}

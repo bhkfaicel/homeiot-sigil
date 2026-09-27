@@ -174,11 +174,17 @@ impl Msg {
         if out.len() < MAX_FRAME_LEN {
             return Err(UsbserialError::Overrun);
         }
-        let mut clear = [0u8; MAX_MSG_LEN];
-        let clear_len = self.encode_clear(&mut clear);
-        let block_len = cobs_encode(&clear[..clear_len], out)?;
-        out[block_len] = 0;
-        Ok(block_len + 1)
+        // The clear frame (`[type][body][crc]`) is unencrypted staging:
+        // build it inside the wipe-on-every-exit helper so no plaintext
+        // residue stays on the stack if the COBS encode errors out.
+        with_staging(|clear: &mut [u8; MAX_MSG_LEN]| {
+            let clear_len = self.encode_clear(clear);
+            let ret = cobs_encode(&clear[..clear_len], out).map(|block_len| {
+                out[block_len] = 0;
+                block_len + 1
+            });
+            (clear_len, ret)
+        })
     }
 
     /// Writes `[type][body]` (no CRC) into `out`; returns the written length.
@@ -316,6 +322,44 @@ pub fn cobs_decode(src: &[u8], dst: &mut [u8]) -> Result<usize, UsbserialError> 
         }
     }
     Ok(dst_len)
+}
+
+/// Runs `f` over a zeroed fixed-size staging buffer and wipes the used
+/// prefix (`buf[..used]`, reported by `f`) as soon as `f` returns — Ok and
+/// Err alike — so unencrypted plaintext or key material never outlives the
+/// call on the stack, error aborts included. Returns `f`'s result; the
+/// wiped staging itself is never exposed to production callers.
+fn with_staging<const N: usize, F, R>(f: F) -> R
+where
+    F: FnOnce(&mut [u8; N]) -> (usize, R),
+{
+    staging_wipe_after(f).1
+}
+
+/// Test-observable twin of [`with_staging`]: runs the SAME shared wipe body
+/// and additionally returns the post-wipe buffer so tests can assert, in
+/// safe Rust, that the used prefix is all zeros. `#[cfg(test)]`-only by
+/// design — production code never needs to inspect wiped staging.
+#[cfg(test)]
+fn with_staging_observed<const N: usize, F, R>(f: F) -> ([u8; N], R)
+where
+    F: FnOnce(&mut [u8; N]) -> (usize, R),
+{
+    staging_wipe_after(f)
+}
+
+/// Single wipe body shared by [`with_staging`] and
+/// [`with_staging_observed`]: the tests observe this exact code path, so
+/// removing the wipe — or reordering it to run before `f` — regresses the
+/// wipe tests instead of silently weakening production.
+fn staging_wipe_after<const N: usize, F, R>(f: F) -> ([u8; N], R)
+where
+    F: FnOnce(&mut [u8; N]) -> (usize, R),
+{
+    let mut staging = [0u8; N];
+    let (used, ret) = f(&mut staging);
+    staging[..used].zeroize();
+    (staging, ret)
 }
 
 /// Event reported by [`BlockAcc`] when a `0x00` delimiter closes the
@@ -462,19 +506,29 @@ impl Decoder {
     /// Decodes and enqueues one closed, non-empty block. Stray delimiters
     /// never reach this: the accumulator reports them as idle events.
     fn finish_block(&mut self) {
-        let mut clear = [0u8; MAX_MSG_LEN];
-        let decoded =
-            cobs_decode(self.acc.bytes(), &mut clear).and_then(|len| parse_msg(&clear[..len]));
-        match decoded {
-            Ok(msg) => {
-                // Full queue means the caller is not draining fast enough;
-                // the newest frame is sacrificed and counted.
-                if self.queue.push_back(msg).is_err() {
-                    self.dropped += 1;
+        // The decoded block is plaintext staging: wipe its used prefix on
+        // every exit (decode/pull errors included) via the helper.
+        with_staging(|clear: &mut [u8; MAX_MSG_LEN]| {
+            // Wipe bound: a successful decode writes `len <= acc.len()`
+            // bytes, a failing one at most the buffer capacity (every
+            // `cobs_decode` write is capacity-guarded) — so `acc.len()`
+            // clamped to the buffer covers the used prefix on every exit;
+            // `parse_msg` writes nothing.
+            let used = self.acc.bytes().len().min(clear.len());
+            let decoded =
+                cobs_decode(self.acc.bytes(), clear).and_then(|len| parse_msg(&clear[..len]));
+            match decoded {
+                Ok(msg) => {
+                    // Full queue means the caller is not draining fast enough;
+                    // the newest frame is sacrificed and counted.
+                    if self.queue.push_back(msg).is_err() {
+                        self.dropped += 1;
+                    }
                 }
+                Err(_) => self.dropped += 1,
             }
-            Err(_) => self.dropped += 1,
-        }
+            (used, ())
+        });
     }
 }
 
@@ -591,7 +645,11 @@ fn parse_body(ty: u8, body: &[u8]) -> Result<Msg, UsbserialError> {
 // Honest property statement: link-layer PSK channel — NO forward secrecy,
 // symmetric PSK (compromise reveals both directions), protects the
 // host↔head link only; end-to-end sensor security remains the Sigil
-// sessions above.
+// sessions above. Transient staging buffers holding unencrypted plaintext
+// (the clear-frame encode/decode arrays, the decrypted receive `clear`
+// buffer, `seal`'s wire block on an error exit) are wiped on every exit
+// through the `with_staging` wipe-on-return helper, so no plaintext
+// residue survives an error abort on the stack.
 
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, Tag, aead::AeadInPlace};
 use hkdf::Hkdf;
@@ -1032,9 +1090,17 @@ impl SecureChannel {
             .encrypt_in_place_detached(
                 &Nonce::from(nonce),
                 &aad,
-                &mut block[1 + COUNTER_WIRE_LEN..1 + COUNTER_WIRE_LEN + body_len],
+                &mut block[body_start..body_start + body_len],
             )
-            .map_err(|_| UsbserialError::Crypto)?;
+            .map_err(|_| {
+                // Error exit: the block still holds the (already partially
+                // transformed) plaintext body — wipe it so nothing survives
+                // the failed seal on the stack. The success path wipes
+                // nothing: the block then holds ciphertext + tag, which are
+                // not secret.
+                block[body_start..body_start + body_len].zeroize();
+                UsbserialError::Crypto
+            })?;
         let end = 1 + COUNTER_WIRE_LEN + body_len + TAG_LEN;
         block[end - TAG_LEN..end].copy_from_slice(&tag);
         let crc = crc16_ccitt_false(&block[..end]);
@@ -1094,27 +1160,41 @@ impl SecureChannel {
     /// CRC-checks and routes one closed, non-empty block. Stray delimiters
     /// never reach this: the accumulator reports them as idle events.
     fn finish_block(&mut self) {
-        let mut clear = [0u8; SECURE_MAX_MSG_LEN];
-        let len = match cobs_decode(self.acc.bytes(), &mut clear) {
-            Ok(len) if len >= 3 => len,
-            _ => {
+        // The decrypted message is THE secret-bearing staging buffer of the
+        // secure receive path: run the whole route inside the wipe-on-every-
+        // exit helper so the plaintext is wiped no matter how `on_sealed`
+        // exits (replay drop, type mismatch, parse error, queue overflow
+        // included) — one wipe point, no per-exit duplication.
+        with_staging(|clear: &mut [u8; SECURE_MAX_MSG_LEN]| {
+            // Wipe bound: a successful decode writes `len <= acc.len()`
+            // bytes, a failing one at most the buffer capacity (every
+            // `cobs_decode` write is capacity-guarded) — so `acc.len()`
+            // clamped to the buffer covers the used prefix on every exit.
+            // The in-place decryption in `on_sealed` acts only inside
+            // `[..len] ⊆ [..used]`, so the wipe always covers the plaintext.
+            let used = self.acc.bytes().len().min(clear.len());
+            let len = match cobs_decode(self.acc.bytes(), clear) {
+                Ok(len) if len >= 3 => len,
+                _ => {
+                    self.dropped += 1;
+                    return (used, ());
+                }
+            };
+            let expected = u16::from_le_bytes([clear[len - 2], clear[len - 1]]);
+            if crc16_ccitt_false(&clear[..len - 2]) != expected {
                 self.dropped += 1;
-                return;
+                return (used, ());
             }
-        };
-        let expected = u16::from_le_bytes([clear[len - 2], clear[len - 1]]);
-        if crc16_ccitt_false(&clear[..len - 2]) != expected {
-            self.dropped += 1;
-            return;
-        }
-        let ty = clear[0];
-        match ty {
-            TYPE_HELLO => self.on_hello(&clear[1..len - 2]),
-            TYPE_RX | TYPE_TX_REQ | TYPE_TX_RESULT | TYPE_PING | TYPE_PONG => {
-                self.on_sealed(ty, &mut clear, len);
+            let ty = clear[0];
+            match ty {
+                TYPE_HELLO => self.on_hello(&clear[1..len - 2]),
+                TYPE_RX | TYPE_TX_REQ | TYPE_TX_RESULT | TYPE_PING | TYPE_PONG => {
+                    self.on_sealed(ty, clear, len);
+                }
+                _ => self.dropped += 1,
             }
-            _ => self.dropped += 1,
-        }
+            (used, ())
+        });
     }
 
     /// Routes one CRC-valid HELLO (`nonce[16] ‖ kind[1]`) through the

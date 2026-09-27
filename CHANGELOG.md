@@ -58,6 +58,15 @@ and this project adheres to semantic versioning.
 
 ### Changed
 
+- `usbserial`: the remaining staging buffers that hold unencrypted
+  plaintext are now wiped on exit — the plain-profile clear-frame encode
+  and decode buffers, the secure channel's decrypted receive buffer (on
+  every exit, error drops included), and `seal`'s wire block on an error
+  abort (on success the block holds ciphertext + tag, which are not
+  secret). The wipe runs through one shared wipe-on-return helper, so no
+  plaintext residue survives a failed operation on the stack; the HELLO
+  frame buffer is untouched (public nonce + CRC, no secret).
+
 - `usbserial`: the module-local error enum `Error` is renamed to
   `UsbserialError` for consistency with the `OtaError` naming precedent of
   `src/core/ota`. No `Error` alias is kept: downstream code must switch to the
