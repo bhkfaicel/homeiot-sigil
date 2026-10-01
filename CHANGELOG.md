@@ -7,6 +7,15 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- The embedded-target cross-checks in `scripts/test.sh` now install a missing
+  std target only when it is absent. The shared CI image ships
+  `thumbv6m-none-eabi` and `armv7-unknown-linux-gnueabihf`; its jobs run
+  unprivileged and cannot install targets into the root-owned `RUSTUP_HOME`,
+  so the previous unconditional `rustup target add` failed the CI job with
+  `error opening file for download`.
+
 ## [2.0.0] - 2026-09-27
 
 ### Added

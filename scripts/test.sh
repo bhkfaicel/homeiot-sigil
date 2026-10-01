@@ -24,9 +24,13 @@ cargo clippy --locked --no-default-features --features gateway -- -D warnings
 bash scripts/test-feature-matrix.sh
 # Strict documentation gate: broken intra-doc links fail the release docs.
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
-# Embedded-target cross-checks (locked for reproducibility). The CI container
-# image may ship without these std targets; rustup target add is idempotent.
-rustup target add thumbv6m-none-eabi armv7-unknown-linux-gnueabihf
+# Embedded-target cross-checks (locked for reproducibility). The CI image
+# ships these std targets (its jobs run unprivileged and cannot install into
+# the root-owned RUSTUP_HOME); a local machine missing one adds it on first
+# use only.
+for target in thumbv6m-none-eabi armv7-unknown-linux-gnueabihf; do
+  rustup target list --installed | grep -qx "$target" || rustup target add "$target"
+done
 cargo check --locked --target thumbv6m-none-eabi --no-default-features --features sensor
 cargo check --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features gateway
 # OTA tiers on their real targets: the constrained sensor build must carry NO
