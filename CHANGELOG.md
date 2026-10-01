@@ -7,6 +7,177 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-01
+
+### Changed
+
+- The embedded-target cross-checks in `scripts/test.sh` now install a missing
+  std target only when it is absent. The shared CI image ships
+  `thumbv6m-none-eabi` and `armv7-unknown-linux-gnueabihf`; its jobs run
+  unprivileged and cannot install targets into the root-owned `RUSTUP_HOME`,
+  so the previous unconditional `rustup target add` failed the CI job with
+  `error opening file for download`.
+
+## [2.0.0] - 2026-09-27
+
+### Added
+
+- Document the `usbserial` tier across the integration docs (documentation
+  only): the README gains the `usbserial` feature paragraph (plain + secure
+  profiles, the PSK/HELLO model, and the honest no-forward-secrecy
+  statement), radio-head (`usbserial`) and gateway-host
+  (`gateway,usbserial`) dependency snippets with the stale example version
+  pins bumped to the current release, the bidirectional host bridge
+  contract (head→host `Msg::Rx` payloads into
+  `SessionManager::process_incoming_packet`; session egress
+  (`SigilAction::Transmit`) sealed as `Msg::TxReq`; never a whole `Msg` as
+  engine input), and the host duties (32-byte link PSK from the OS CSPRNG,
+  never reusing `resume_psk`/session keys as the link PSK, HELLO nonce
+  uniqueness, plain-profile manufacturing/bench-only exposure, answering
+  `take_peer_hello_seen` with `hello_frame`, prompt `pop()` draining).
+  CLAUDE.md gains the `src/usbserial/` module entry (profiles, framing,
+  RAM bounds, CRC→tag→watermark ordering, `UsbserialError` taxonomy) and
+  the second-top-level-tier architecture note. The feature-contract
+  wordings in the `Cargo.toml` comment, `src/lib.rs`, and the README now
+  state one supported set — standalone `usbserial` and `gateway,usbserial`
+  are contractual, `sensor,usbserial` compiles but is not contractual or
+  gated. The README references the empty-feature diagnostic in
+  `src/lib.rs` instead of quoting it, and its long horizontal rules are
+  gone. The README security duties now pin one independent link PSK per
+  host-head pair with its explicit compromise domain, and a secure-profile
+  protocol block documents the staged-rekey surface (HELLO kind byte,
+  host-only `begin_rekey`, transient TX unavailability, host-owned retry
+  policy); `docs/anti-replay-design.md` gains an appendix cross-referencing
+  the usbserial replay discipline (activation on PSK-possession proof,
+  monotonic nonce rotation, watermark ordering, receive gap window).
+- `usbserial`: hosts can now drive an explicit channel rekey with
+  `SecureChannel::begin_rekey` (advance the local nonce, emit a HELLO INIT,
+  consume the peer RESP into a TX-switched staged pair). Rekey initiation
+  is normatively host-only — the radio head rekeys solely by rebooting —
+  so a head call returns the new `UsbserialError::WrongRole` variant with
+  no state change, and a not-yet-established host gets `NotEstablished`.
+  Active keys keep working until the peer proves the staged epoch; a
+  host-owned response timeout plus one retry converges even when a hostile
+  INIT overwrote the staged slot. `WrongRole` is a new member of the plain
+  `pub enum` `usbserial::UsbserialError` (no `#[non_exhaustive]`):
+  downstream exhaustive matches must gain an arm, which is a breaking
+  change to ship with a major version bump.
+- The project gate (`scripts/test.sh`) now cross-compiles the `usbserial`
+  tier for its real targets: the SAMD21 head build (`--features usbserial`
+  on `thumbv6m-none-eabi`) and the gateway host build
+  (`--features gateway,usbserial` on `armv7-unknown-linux-gnueabihf`),
+  so a future `no_std` or host-build regression surfaces in this crate's
+  gate instead of only in the consuming firmware repositories.
+- A dev-only `usbserial` performance-measurement test module mirrors the
+  existing `core` AEAD harness: deterministic payloads, best-of-N host
+  timing for the plain and sealed frame round-trips, and printed `size_of`
+  source facts. It changes no production code.
+
+### Changed
+
+- `usbserial`: the remaining staging buffers that hold unencrypted
+  plaintext are now wiped on exit — the plain-profile clear-frame encode
+  and decode buffers, the secure channel's decrypted receive buffer (on
+  every exit, error drops included), and `seal`'s wire block on an error
+  abort (on success the block holds ciphertext + tag, which are not
+  secret). The wipe runs through one shared wipe-on-return helper, so no
+  plaintext residue survives a failed operation on the stack; the HELLO
+  frame buffer is untouched (public nonce + CRC, no secret).
+- `usbserial`: the module-local error enum `Error` is renamed to
+  `UsbserialError` for consistency with the `OtaError` naming precedent of
+  `src/core/ota`. No `Error` alias is kept: downstream code must switch to the
+  new name, which is a breaking change to ship with a major version bump.
+- `usbserial`: `Decoder` and `SecureChannel` now share one private block
+  accumulator (byte loop until the `0x00` delimiter, oversize discard and
+  delimiter resync) instead of two hand-synced copies of the same state
+  machine. The accumulator only reports closed-block, oversize-block and
+  idle-delimiter events; each type keeps its single drop counter and its own
+  frame routing, so behavior is unchanged. The secure receive capacity is now
+  declared as an alias of the sealed-frame block bound instead of re-deriving
+  the same worst-case formula.
+- `usbserial`: `SecureChannel::seal` now refuses to seal once its send counter
+  reaches `u64::MAX` with the new `UsbserialError::CounterExhausted` variant instead of
+  silently wrapping into AEAD nonce reuse, and commits the counter only after
+  the frame is fully sealed, so a failed seal leaves the channel untouched.
+  This variant is a new member of the plain `pub enum` `usbserial::UsbserialError`
+  (no `#[non_exhaustive]`): downstream exhaustive matches must gain an arm,
+  which is a breaking change to ship with a major version bump.
+- `usbserial`: the `TX_RESULT` message now enforces an exact one-byte body
+  like every other message type. Frames with trailing bytes are dropped as
+  malformed instead of silently accepted; no legitimate peer emits them (the
+  encoder always writes exactly one status byte) and the wire format is
+  unchanged.
+- `usbserial`: the feature no longer activates the optional `subtle`
+  dependency, which no usbserial code uses. `subtle` still reaches those
+  builds transitively via `chacha20poly1305` and remains a direct dependency
+  of the `session` feature, so all builds are unchanged.
+- `usbserial`: `SecureChannel::seal` now writes the message body directly
+  into the outgoing wire block instead of staging it in a second 287-byte
+  buffer and copying it in, removing 287 bytes of transient stack and one
+  full-body copy per sealed frame on the hot TX path. The frame layout and
+  wire format are unchanged, so every sealed frame stays bit-identical.
+- `usbserial`: the HELLO wire format carries a one-byte kind discriminator
+  (`nonce[16] ‖ kind[1]`, `0x00` INIT / `0x01` RESP, other values dropped),
+  growing the clear HELLO from 19 to 20 bytes and `HELLO_FRAME_MAX` from 22
+  to 23. `SecureChannel::hello_frame` now requires `&mut self` and emits
+  RESP when a peer HELLO still awaits its answer, INIT otherwise;
+  `SecureChannel::take_peer_hello_seen` reports that pending answer without
+  clearing it — the emission of the RESP is what discharges it. Until the
+  peer proves a staged epoch, the initiator's emissions stay on the staged
+  half (no automatic active fallback): a dead staged pair means transient
+  TX unavailability recovered by one host-timed rekey retry, while RX keeps
+  accepting old-epoch traffic throughout.
+- `usbserial`: sealed-frame receive counters are now bounded by a replay-gap
+  window like the core AEAD path: a frame is accepted only when its counter
+  is strictly ahead of the receive watermark and at most
+  `RX_COUNTER_MAX_GAP` (256) beyond it, computed overflow-safely with
+  `checked_sub` so the comparison stays correct near `u64::MAX`. A frame
+  beyond the window is dropped with the watermark untouched, so an
+  authenticated but buggy or hostile peer can no longer wedge reception
+  with a huge counter jump. As the watermark approaches `u64::MAX` the
+  window truncates; once reception is exhausted the documented recovery is
+  a re-HELLO/rekey (fresh epoch, fresh counters), never a wrap.
+
+### Fixed
+
+- `usbserial`: closed the replay blocker in the secure profile. A HELLO
+  replayed against an ESTABLISHED channel used to re-derive the identical
+  keys and reset the replay watermark, letting an attacker with link access
+  but no PSK inject stale sealed frames. A HELLO received while established
+  now only stages CANDIDATE keys that activate on the first tag-valid
+  sealed frame (a PSK-possession proof), and the local HELLO nonce rotates
+  monotonically on every answer and rekey initiation, so a recorded HELLO
+  can re-derive neither the active keys nor any past epoch's keys
+  (same-epoch replay and cross-epoch resurrection both fail). The HELLO
+  dialogue is acyclic (INIT answered by at most one RESP, a RESP never
+  answered), so no exchange can loop, and unauthenticated HELLOs consume no
+  irreversible resource.
+- `usbserial`: corrected the `TX_RESULT` type-constant doc comment — the
+  completion report flows head → host, matching the message-types table.
+
+## [1.3.0] - 2026-09-24
+
+- Add the USB-serial link tier (`src/usbserial`) behind the new `usbserial`
+  cargo feature (off by default; never implied by another feature, following
+  the `ota` precedent). The tier frames the byte stream between the gateway
+  host and the SAMD21 radio head:
+  - Plain profile: COBS blocks with a `0x00` delimiter, CRC-16/CCITT-FALSE
+    over type + body, link message types RX / TX_REQ / TX_RESULT / PING /
+    PONG (0x01..0x05), 255-byte radio payload bound (SX1278 8-bit length
+    register), streaming `Decoder` with bounded queue, drop counters and
+    delimiter resync.
+  - Secure profile: HELLO handshake (clear 16-byte nonces both directions,
+    last HELLO wins), HKDF-SHA256 over a 32-byte PSK with
+    `salt = host_nonce || head_nonce` and fixed directional OKM split
+    (key + 4-byte nonce prefix per direction), ChaCha20-Poly1305 sealing
+    with the clear counter and type byte bound as AAD, strictly increasing
+    receive counters with the watermark advanced only after tag
+    verification, PSK/keys zeroized on drop and redacted from `Debug`.
+- Feature contract: the standalone `usbserial` configuration (and its
+  combinations `gateway,usbserial`, `--all-features`) is now supported and
+  exercised by `scripts/test-feature-matrix.sh`; the `compile_error!` guard
+  accepts the new tier.
+
 ## [1.2.2] - 2026-09-05
 
 - Update link on readme

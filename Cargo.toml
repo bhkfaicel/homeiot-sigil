@@ -1,6 +1,6 @@
 [package]
 name = "sigil"
-version = "1.2.2"
+version = "2.0.1"
 edition = "2024"
 rust-version = "1.85"
 license-file = "LICENSE"
@@ -20,6 +20,13 @@ repository = "https://code.bhk-itsolutions.com/homeiot/sigil"
 #                     digest) without any engine.
 #   - sensor,ota:     SUPPORTED. Adds the OTA receive half.
 #   - gateway,ota:    SUPPORTED. Adds the OTA send half.
+#   - usbserial:      SUPPORTED. Standalone USB-serial link tier (the radio
+#                     head firmware build shape).
+#   - gateway,usbserial:
+#                     SUPPORTED. Gateway host build consuming the head link.
+#   `sensor,usbserial` compiles (features are additive) but is neither
+#   contractual nor gated: a sensor is a battery LoRa device with no USB
+#   link to the gateway host.
 # Safe smallest default for sensor firmware. Gateways must disable defaults and
 # select `gateway`; pairwise development uses `--all-features` explicitly.
 default = ["sensor"]
@@ -47,6 +54,19 @@ gateway = ["session"]
 # It is never implied by another feature, so plain `sensor` or `gateway`
 # builds carry zero OTA code.
 ota = ["dep:sha2"]
+#
+# `usbserial` enables the USB-serial link tier between the gateway host and
+# the SAMD21 radio head: plain COBS+CRC framing plus the PSK-secured channel.
+# Like `ota`, it is never implied by another feature, so plain role builds
+# carry zero usbserial code; `usbserial` alone is a supported build shape
+# (that is what the head firmware compiles).
+usbserial = [
+    "dep:chacha20poly1305",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:zeroize",
+    "dep:heapless",
+]
 
 [dependencies]
 # Cryptographic primitives
