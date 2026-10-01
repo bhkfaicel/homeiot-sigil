@@ -7,6 +7,8 @@ and this project adheres to semantic versioning.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-01
+
 ### Changed
 
 - The embedded-target cross-checks in `scripts/test.sh` now install a missing
@@ -38,16 +40,16 @@ and this project adheres to semantic versioning.
   the second-top-level-tier architecture note. The feature-contract
   wordings in the `Cargo.toml` comment, `src/lib.rs`, and the README now
   state one supported set — standalone `usbserial` and `gateway,usbserial`
-are contractual, `sensor,usbserial` compiles but is not contractual or
-gated. The README references the empty-feature diagnostic in
-`src/lib.rs` instead of quoting it, and its long horizontal rules are
-gone. The README security duties now pin one independent link PSK per
-host-head pair with its explicit compromise domain, and a secure-profile
-protocol block documents the staged-rekey surface (HELLO kind byte,
-host-only `begin_rekey`, transient TX unavailability, host-owned retry
-policy); `docs/anti-replay-design.md` gains an appendix cross-referencing
-the usbserial replay discipline (activation on PSK-possession proof,
-monotonic nonce rotation, watermark ordering, receive gap window).
+  are contractual, `sensor,usbserial` compiles but is not contractual or
+  gated. The README references the empty-feature diagnostic in
+  `src/lib.rs` instead of quoting it, and its long horizontal rules are
+  gone. The README security duties now pin one independent link PSK per
+  host-head pair with its explicit compromise domain, and a secure-profile
+  protocol block documents the staged-rekey surface (HELLO kind byte,
+  host-only `begin_rekey`, transient TX unavailability, host-owned retry
+  policy); `docs/anti-replay-design.md` gains an appendix cross-referencing
+  the usbserial replay discipline (activation on PSK-possession proof,
+  monotonic nonce rotation, watermark ordering, receive gap window).
 - `usbserial`: hosts can now drive an explicit channel rekey with
   `SecureChannel::begin_rekey` (advance the local nonce, emit a HELLO INIT,
   consume the peer RESP into a TX-switched staged pair). Rekey initiation
